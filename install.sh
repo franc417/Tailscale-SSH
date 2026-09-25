@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # tailscale-ssh installer
 #
-#   curl -fsSL https://raw.githubusercontent.com/franc417/Tailscale-SSH/main/install.sh \
-#     | TSSH_TOKEN=ghp_xxx bash
+#   curl -fsSL https://raw.githubusercontent.com/franc417/Tailscale-SSH/main/install.sh | bash
 #
 # Installs one command (default name: mesh — override with TSSH_NAME=whatever).
 # Install it under the same name on every device so the habit stays consistent,
 # though the name is purely cosmetic: any install can talk to any device.
 #
-# The repo is private, so a GitHub token with read access is required the first time
-# (TSSH_TOKEN or GITHUB_TOKEN env var, or `gh` already logged in). Not needed if you're
-# running this from a local clone of the repo.
+# If the repo is private, add a GitHub token with read access:
+#   curl -fsSL https://raw.githubusercontent.com/franc417/Tailscale-SSH/main/install.sh \
+#     | TSSH_TOKEN=ghp_xxx bash
+# (TSSH_TOKEN or GITHUB_TOKEN env var, or an already-logged-in `gh` also work.)
 set -euo pipefail
 
 REPO="franc417/Tailscale-SSH"
@@ -46,11 +46,11 @@ detect_platform() {
   esac
 }
 
-fetch() {  # fetch <url-with-headers-baked-in> <dest>
+fetch() {  # fetch <url> <dest> -- uses AUTH_HEADER/AUTH_HEADER_WGET if set (empty is fine: public repo)
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "${AUTH_HEADER[@]}" -H "Accept: application/vnd.github.raw+json" "$1" -o "$2"
+    curl -fsSL "${AUTH_HEADER[@]}" "$1" -o "$2"
   elif command -v wget >/dev/null 2>&1; then
-    wget -q "${AUTH_HEADER_WGET[@]}" --header="Accept: application/vnd.github.raw+json" "$1" -O "$2"
+    wget -q "${AUTH_HEADER_WGET[@]}" "$1" -O "$2"
   else
     err "Need curl or wget to download the engine. On Termux: pkg install curl"
   fi
@@ -66,13 +66,16 @@ fetch_engine() {
   if [ -n "$token" ]; then
     AUTH_HEADER=(-H "Authorization: Bearer $token")
     AUTH_HEADER_WGET=(--header="Authorization: Bearer $token")
-  else
-    err "This repo is private — a GitHub token is needed the first time." \
-        "Re-run as: curl -fsSL https://raw.githubusercontent.com/$REPO/$REF/install.sh | TSSH_TOKEN=ghp_xxx bash"
   fi
   info "Downloading tailscale-ssh engine..."
-  fetch "https://api.github.com/repos/$REPO/contents/tailscale_ssh.py?ref=$REF" "$dest" \
-    || err "Download failed. Check the token and your network connection."
+  if ! fetch "https://raw.githubusercontent.com/$REPO/$REF/tailscale_ssh.py" "$dest"; then
+    if [ -z "$token" ]; then
+      err "Download failed." \
+          "If the repo is private, re-run with a token: curl -fsSL <url> | TSSH_TOKEN=ghp_xxx bash"
+    else
+      err "Download failed. Check your token and network connection."
+    fi
+  fi
   python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$dest" \
     || err "Downloaded file failed a sanity check — not installing it."
 }

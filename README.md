@@ -24,18 +24,19 @@ this device: arch  ·  100.101.102.1
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/franc417/Tailscale-SSH/main/install.sh \
-  | TSSH_TOKEN=<a github token with repo read access> bash
+curl -fsSL https://raw.githubusercontent.com/franc417/Tailscale-SSH/main/install.sh | bash
 ```
 
-The repo is private, so the token is only needed for that first download (or use `gh`
-if you're already logged in — the installer picks up `gh auth token` automatically).
-It installs one Python file to `~/.local/share/tailscale-ssh/` (`$PREFIX/share` on
+Run that exact command on every device (laptop, phone, another laptop, whatever). It
+installs one Python file to `~/.local/share/tailscale-ssh/` (`$PREFIX/share` on
 Termux) and one thin wrapper command, `mesh`, to `~/.local/bin` (`$PREFIX/bin` on
-Termux). Install it under the same name on every device — the name is purely cosmetic
-(every install runs the identical picker), but a shared name keeps the habit simple.
-Want a different word? `TSSH_NAME=hop bash install.sh` — every help string and hint
-in the tool adapts to whatever name it's invoked as.
+Termux). The name is purely cosmetic — every install runs the identical picker — but a
+shared name keeps the habit simple. Want a different word? `TSSH_NAME=hop bash
+install.sh` — every help string and hint in the tool adapts to whatever name it's
+invoked as.
+
+*(If you ever make the repo private again: add `| TSSH_TOKEN=<a github token with
+read access> bash` — or an already-logged-in `gh` works too.)*
 
 First run walks new devices through setup automatically (or run `mesh setup` any
 time):
@@ -108,7 +109,7 @@ through a real pseudo-terminal — runs for real without needing an actual tailn
 ## Notes on the token you gave Claude
 
 The grained PAT you shared was used only to push this code and is not stored anywhere
-in the repo or in the installer. For `install.sh`/`mesh update` to pull from a private
-repo going forward, whoever runs them needs their own token (`TSSH_TOKEN`/`GITHUB_TOKEN`
-env var, or a logged-in `gh` CLI) — consider rotating the one you shared here once
-you've reviewed the code, since pasted tokens are best treated as burned.
+in the repo or in the installer. Now that the repo is public, `install.sh`/`mesh
+update` don't need a token at all. Still worth rotating the one you pasted here once
+you've reviewed the code — a token that's appeared in plaintext chat is best treated
+as burned, regardless of whether it's still needed for anything.
