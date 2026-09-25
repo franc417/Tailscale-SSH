@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+"""Test double for the `tailscale` CLI: `tailscale status --json` prints $MOCK_TS_JSON."""
+import os, sys
+if sys.argv[1:3] == ["status", "--json"]:
+    sys.stdout.write(open(os.environ["MOCK_TS_JSON"]).read())
+sys.exit(0)

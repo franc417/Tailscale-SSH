@@ -1,0 +1,5 @@
+#!/usr/bin/env python3
+"""Test double for `ssh`: records its argv to $MOCK_SSH_OUT."""
+import os, sys
+open(os.environ["MOCK_SSH_OUT"], "w").write("\n".join(sys.argv[1:]))
+print("MOCK-SSH")
