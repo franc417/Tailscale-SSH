@@ -50,4 +50,14 @@ how devices, users and ports are discovered and remembered instead.
 
 The rest of the original wishlist carried forward as-is: a private GitHub repo, a
 one-line installer, self-update, multiple-device support, and post-connect commands
-(`tarch tmux`, `tarch ubt`, etc. — done here as `tarch <name> -- <command>`).
+(`tarch tmux`, `tarch ubt`, etc. — done here as `<command> <device> -- <remote command>`).
+
+**Second change: one command name instead of two.** `sshph`/`tarch` made sense when
+they were two different asymmetric scripts pointed at two specific machines. Once the
+tool became symmetric — every device runs the identical picker and sees the identical
+live list — the two-name split stopped meaning anything (what would a third device, a
+Mint desktop say, even call itself: `sshph`? `tarch`? neither fits). So the installer
+now creates a single command, named whatever you like (`install.sh` defaults to
+`mesh`, override with `TSSH_NAME=whatever`). Every hint and help string in the tool
+adapts to whatever name it was invoked as — there's nothing hardcoded to `sshph` or
+`tarch` left anywhere.

@@ -4,6 +4,10 @@
 #   curl -fsSL https://raw.githubusercontent.com/franc417/Tailscale-SSH/main/install.sh \
 #     | TSSH_TOKEN=ghp_xxx bash
 #
+# Installs one command (default name: mesh — override with TSSH_NAME=whatever).
+# Install it under the same name on every device so the habit stays consistent,
+# though the name is purely cosmetic: any install can talk to any device.
+#
 # The repo is private, so a GitHub token with read access is required the first time
 # (TSSH_TOKEN or GITHUB_TOKEN env var, or `gh` already logged in). Not needed if you're
 # running this from a local clone of the repo.
@@ -11,6 +15,7 @@ set -euo pipefail
 
 REPO="franc417/Tailscale-SSH"
 REF="${TSSH_REF:-main}"
+NAME="${TSSH_NAME:-mesh}"
 
 info() { printf '\033[38;5;80m%s\033[0m\n' "$*"; }
 warn() { printf '\033[38;5;215m%s\033[0m\n' "$*" >&2; }
@@ -95,14 +100,16 @@ main() {
   fi
   chmod +x "$engine"
 
-  for name in sshph tarch tailscale-ssh; do
-    cat > "$bindir/$name" <<WRAP
+  cat > "$bindir/$NAME" <<WRAP
 #!/usr/bin/env bash
-exec env TSSH_BRAND="$name" python3 "$engine" "\$@"
+exec env TSSH_BRAND="$NAME" python3 "$engine" "\$@"
 WRAP
-    chmod +x "$bindir/$name"
-  done
-  info "Installed: sshph, tarch, tailscale-ssh  ->  $bindir"
+  chmod +x "$bindir/$NAME"
+  info "Installed: $NAME  ->  $bindir/$NAME"
+  if command -v "$NAME" >/dev/null 2>&1 && [ "$(command -v "$NAME")" != "$bindir/$NAME" ]; then
+    warn "Heads up: another '$NAME' already exists on your PATH at $(command -v "$NAME")."
+    warn "Pick a different name next time with: TSSH_NAME=something $0"
+  fi
 
   case ":$PATH:" in
     *":$bindir:"*) : ;;
@@ -117,7 +124,7 @@ WRAP
   esac
 
   echo
-  info "Next: run 'sshph' (or 'tarch' on your phone) — first run walks you through Tailscale, SSH, and a key."
+  info "Next: run '$NAME' — first run walks you through Tailscale, SSH, and a key."
 }
 
 main "$@"

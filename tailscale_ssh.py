@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """tailscale-ssh: browse your tailnet and SSH into any device, from any network.
 
-One engine, three names (the installer creates all of them):
-
-    sshph  ·  tarch  ·  tailscale-ssh
+One engine, one command, installed under whatever name you pick (default: mesh).
+Every device on your tailnet runs the identical picker — there's no per-device
+role to remember.
 
 No IPs or ports are hardcoded anywhere. Every run asks Tailscale who is on your
 tailnet right now, probes which of them answer SSH, and lets you pick one.
@@ -40,9 +40,10 @@ try:  # POSIX only; Windows falls back to a numbered prompt
 except ImportError:  # pragma: no cover
     termios = tty = None
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 REPO = "franc417/Tailscale-SSH"
 REPO_FILE = "tailscale_ssh.py"
+BRAND = "tailscale-ssh"  # set for real in main(); module default for direct imports
 
 CONF_DIR = Path(os.environ.get("TSSH_CONFIG_DIR") or Path.home() / ".config" / "tailscale-ssh")
 CONF_FILE = CONF_DIR / "config.json"
@@ -304,9 +305,9 @@ def fetch_cli(show_all: bool):
                       "Is tailscaled running? If you get 'access denied': sudo tailscale set --operator=$USER")
     state = data.get("BackendState")
     if state in ("NeedsLogin", "NeedsMachineAuth", "NoState"):
-        raise NeedsLogin(f"Tailscale isn't signed in ({state})", "Run: sshph setup")
+        raise NeedsLogin(f"Tailscale isn't signed in ({state})", f"Run: {BRAND} setup")
     if state != "Running":
-        raise TSError(f"Tailscale is {state or 'not running'}", "Run: sudo tailscale up   (or: sshph setup)")
+        raise TSError(f"Tailscale is {state or 'not running'}", f"Run: sudo tailscale up   (or: {BRAND} setup)")
     return parse_cli(data, show_all)
 
 
@@ -321,7 +322,7 @@ def api_get_devices(key: str) -> list:
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
             raise TSError("Tailscale API key was rejected or has expired",
-                          "Make a new one at https://login.tailscale.com/admin/settings/keys, then run: sshph setup")
+                          f"Make a new one at https://login.tailscale.com/admin/settings/keys, then run: {BRAND} setup")
         raise TSError(f"Tailscale API error {e.code}")
     except (urllib.error.URLError, OSError, ValueError) as e:
         raise TSError(f"Can't reach the Tailscale API ({getattr(e, 'reason', e)})", "Check your internet connection")
@@ -365,7 +366,7 @@ def fetch_nodes(cfg: dict, show_all: bool):
         return fetch_cli(show_all)
     if cfg.get("api_key"):
         return fetch_api(cfg["api_key"], show_all)
-    raise TSError("Tailscale isn't set up on this device yet", "Run: sshph setup")
+    raise TSError("Tailscale isn't set up on this device yet", f"Run: {BRAND} setup")
 
 
 # ───────────────────────────── probing ─────────────────────────────
@@ -897,7 +898,7 @@ def cmd_list(ns, cfg, devices, brand) -> int:
 
 def cmd_watch(ns, cfg, devices, brand) -> int:
     if not (sys.stdout.isatty() and termios):
-        die("watch needs a terminal.", "Use: sshph list --json")
+        die("watch needs a terminal.", f"Use: {BRAND} list --json")
     mon = Monitor(cfg, devices, ns.all)
     mon.start()
     out, last = sys.stdout, None
@@ -1012,7 +1013,7 @@ def cmd_doctor(cfg, devices) -> int:
     elif cfg.get("api_key"):
         ok("no CLI here, using the Tailscale API key")
     else:
-        bad("no tailscale CLI and no API key. Run: sshph setup")
+        bad(f"no tailscale CLI and no API key. Run: {BRAND} setup")
     ip = local_tailscale_ip()
     ok(f"this device is on the tailnet ({ip})") if ip else warn("this device has no tailnet address right now")
     local = probe_ssh("127.0.0.1", cfg["probe_ports"])
@@ -1049,7 +1050,7 @@ def step_termux_tailscale(ns, cfg) -> None:
         print()
         info("Android has no `tailscale` command, so the device list comes from Tailscale's API.")
         info("Create a key: https://login.tailscale.com/admin/settings/keys  →  Generate access token")
-        info("(keys expire after at most 90 days; run `sshph setup` again to replace it)")
+        info(f"(keys expire after at most 90 days; run `{BRAND} setup` again to replace it)")
         key = ask("Paste your API key (hidden)", secret=True)
     if key:
         try:
@@ -1101,7 +1102,7 @@ def step_linux_tailscale(ns, cfg, plat: str) -> None:
             ok("Connected to your tailnet")
             return
         time.sleep(1)
-    bad("Not connected yet. Finish the sign-in in your browser, then run: sshph setup")
+    bad(f"Not connected yet. Finish the sign-in in your browser, then run: {BRAND} setup")
 
 
 def ensure_sshd(plat: str, cfg: dict) -> None:
@@ -1133,7 +1134,7 @@ def ensure_sshd(plat: str, cfg: dict) -> None:
         return
     time.sleep(1)
     r = probe_ssh("127.0.0.1", cfg["probe_ports"])
-    ok(f"SSH server is up on port {r[0]}") if r else warn("Couldn't confirm it started; check `sshph doctor`")
+    ok(f"SSH server is up on port {r[0]}") if r else warn(f"Couldn't confirm it started; check `{BRAND} doctor`")
 
 
 def cmd_setup(ns, cfg, devices, brand) -> int:
@@ -1199,8 +1200,9 @@ def main(argv=None) -> int:
         i = argv.index("--")
         argv, remote_cmd = argv[:i], argv[i + 1:]
 
-    prog = os.environ.get("TSSH_BRAND") or Path(sys.argv[0]).name
-    brand = prog if prog in ("sshph", "tarch") else "tailscale-ssh"
+    global BRAND
+    brand = os.environ.get("TSSH_BRAND") or Path(sys.argv[0]).stem
+    BRAND = brand
 
     p = argparse.ArgumentParser(prog=brand, add_help=False)
     p.add_argument("words", nargs="*")
