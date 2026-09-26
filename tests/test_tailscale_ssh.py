@@ -294,6 +294,38 @@ class TestApiBackend(unittest.TestCase):
             ts.API_BASE, ts.ts_cli = old_api_base, old_ts_cli
             os.environ.pop("TSSH_LOCAL_IP", None)
 
+    def _connect_subprocess_env(self, extra=None):
+        t = Path(tempfile.mkdtemp())
+        (t / "conf").mkdir()
+        (t / "conf" / "config.json").write_text(json.dumps({"api_key": "tskey-api-good", "probe_ports": [22]}))
+        env = dict(os.environ, HOME=str(t), TSSH_CONFIG_DIR=str(t / "conf"),
+                   PATH=f"{MOCKBIN}:{os.environ['PATH']}", MOCK_SSH_OUT=str(t / "ssh_args.txt"),
+                   TSSH_API_BASE=self.base, TSSH_LOCAL_IP="100.64.0.10", NO_COLOR="1")
+        env.update(extra or {})
+        return t, env
+
+    def test_no_username_default_from_termux_to_non_android(self):
+        """Regression: calling from Termux, our own username (u0_a123-style) must never be
+        offered as a default for a non-Android target ('arch' here) -- it's meaningless there.
+        With no default and no stdin to answer the prompt, this must fail loudly, not silently
+        guess a wrong username."""
+        t, env = self._connect_subprocess_env({"TERMUX_VERSION": "0.118",
+                                                "PREFIX": "/data/data/com.termux/files/usr"})
+        r = subprocess.run([sys.executable, str(ROOT / "tailscale_ssh.py"), "arch"],
+                           capture_output=True, text=True, env=env, timeout=30, stdin=subprocess.DEVNULL)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("username is required", (r.stdout + r.stderr).lower())
+
+    def test_username_default_still_offered_outside_termux(self):
+        """Same scenario without Termux in the picture: defaulting to the local username is a
+        reasonable convenience between two normal machines, so it must still work."""
+        t, env = self._connect_subprocess_env()
+        r = subprocess.run([sys.executable, str(ROOT / "tailscale_ssh.py"), "arch"],
+                           capture_output=True, text=True, env=env, timeout=30, stdin=subprocess.DEVNULL)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        args = (t / "ssh_args.txt").read_text()
+        self.assertIn("@100.64.0.11", args)
+
 
 class TestCommands(unittest.TestCase):
     @classmethod
@@ -368,6 +400,8 @@ class TestCommands(unittest.TestCase):
         r = e.run("u0_a327@pix")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("u0_a327@127.0.0.2", e.ssh_out.read_text())
+
+
 
     def test_ambiguous_and_missing(self):
         r = self.e.run("zzz")

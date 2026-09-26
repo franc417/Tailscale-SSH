@@ -76,3 +76,26 @@ Termux, so device discovery there only ever goes through the API/local-IP path,
 regardless of what happens to be on PATH. (As a second layer of defense for other
 platforms too, `fetch_nodes()` now also falls back to the API if the CLI path exists but
 errors and an API key is configured, rather than hard-failing.)
+
+**Fourth fix: the API key prompt echoed the real key to the screen.** The Termux
+clipboard-shortcut flow asked the person to "press Enter once it's copied" before
+reading the system clipboard -- but that prompt was a plain, visible `input()`, and its
+return value was simply discarded. In practice, people naturally paste the key directly
+into whatever prompt is on screen right after copying it, rather than reading the
+instructions closely -- and when they did, the real key got echoed in full, in
+plaintext, to the terminal (and into anything that captured that terminal, like a
+screenshot). Fixed two ways: that prompt now uses `getpass` like every other secret
+entry here, so nothing typed into it is ever echoed regardless of what the person types;
+and if what they typed looks like a real key (starts with `tskey`), it's used directly
+instead of being discarded, which also means a person who pastes there no longer has to
+paste a second time at the following hidden prompt.
+
+**Fifth fix: the suggested SSH username made sense for laptop-to-laptop but not
+phone-to-laptop.** When no username is known for a target yet, the tool suggests the
+account running it as a reasonable guess (people often use the same username across
+their own machines). But that guess was based on `getpass.getuser()` unconditionally
+whenever the *target* wasn't Android -- which on Termux returns an Android app UID
+string like `u0_a327`, meaningless as a suggestion for an unrelated Linux or macOS
+target. Fixed: that default is now only offered when the *calling* device isn't Termux
+either; calling from Termux toward a non-Android target now asks with no default at all
+rather than suggesting something that's certain to be wrong.

@@ -40,7 +40,7 @@ try:  # POSIX only; Windows falls back to a numbered prompt
 except ImportError:  # pragma: no cover
     termios = tty = None
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 REPO = "franc417/Tailscale-SSH"
 REPO_FILE = "tailscale_ssh.py"
 BRAND = "tailscale-ssh"  # set for real in main(); module default for direct imports
@@ -760,14 +760,16 @@ def read_termux_clipboard() -> str | None:
 def prompt_api_key(plat: str) -> str | None:
     """Get a Tailscale API key interactively. A hidden getpass prompt gives zero feedback on
     whether a paste actually landed, which is exactly the confusing part -- so every path here
-    ends by showing a masked preview + length of whatever was captured, and Termux gets a
-    clipboard-read shortcut that sidesteps paste-into-hidden-field entirely."""
+    ends by showing a masked preview + length of whatever was captured. Termux additionally
+    gets a clipboard-read shortcut. Every prompt here uses getpass, including the "press
+    enter" one -- someone pasting the real key by habit into ANY of these prompts (very easy
+    to do right after copying it) must never have it echoed to the screen."""
     if plat == "termux" and shutil.which("termux-clipboard-get"):
         info("Copy your API key (long-press it on the Tailscale page → Copy), then come back here.")
-        try:
-            input(f"{paint('?', 'accent')} Press Enter once it's copied: ")
-        except EOFError:
-            pass
+        typed = ask("Press Enter once it's copied (or paste it here instead)", secret=True) or ""
+        if typed.startswith("tskey"):
+            print(paint(f"    Got it: {mask_secret(typed)}  ({len(typed)} chars)", "dim"))
+            return typed
         clip = read_termux_clipboard()
         if clip:
             print(paint(f"    Clipboard: {mask_secret(clip)}  ({len(clip)} chars)", "dim"))
@@ -896,9 +898,14 @@ def connect(node: Node, ns, cfg: dict, devices: dict, remote_cmd: list) -> int:
     user = ns.user or rec.get("user")
     new_device = not rec.get("user")
     if not user:
+        default_user = None
         if android:
             info("Termux usernames look like u0_a123. Run `whoami` in Termux to see yours.")
-        user = ask(f"SSH username on {node.name}", None if android else getpass.getuser())
+        elif detect_platform() != "termux":
+            # A same-username guess only makes sense between two "normal" machines -- our own
+            # Termux username (u0_a123) has nothing to do with a remote Linux/macOS account.
+            default_user = getpass.getuser()
+        user = ask(f"SSH username on {node.name}", default_user)
         if not user:
             die("A username is required.")
     port = ns.port or node.ssh_port or rec.get("port")
