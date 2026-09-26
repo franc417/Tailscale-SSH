@@ -40,7 +40,7 @@ try:  # POSIX only; Windows falls back to a numbered prompt
 except ImportError:  # pragma: no cover
     termios = tty = None
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 REPO = "franc417/Tailscale-SSH"
 REPO_FILE = "tailscale_ssh.py"
 BRAND = "tailscale-ssh"  # set for real in main(); module default for direct imports
@@ -875,6 +875,34 @@ def ensure_key() -> Path | None:
     return key if rc == 0 and key.exists() else None
 
 
+def install_pubkey(pubkey_path: Path, ssh_base: list, user: str, ip: str) -> bool:
+    """Append our public key to the target's authorized_keys over a plain ssh connection.
+    Deliberately doesn't shell out to ssh-copy-id: Termux's build has a long-standing bug --
+    a broken scratch-dir check for which keys are already installed -- that hangs or errors
+    out ("Assertion failure: in filter_ids()...") instead of actually copying the key. This
+    does the same job directly (still skipping a key that's already there) and needs nothing
+    but ssh itself, so it works the same on every platform."""
+    try:
+        pubkey = pubkey_path.read_text().strip()
+    except OSError as e:
+        bad(f"couldn't read {pubkey_path}: {e}")
+        return False
+    if not pubkey:
+        bad(f"{pubkey_path} is empty")
+        return False
+    remote = ('key="$(cat)"; umask 077; mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys && '
+              'chmod 600 ~/.ssh/authorized_keys && '
+              'grep -qxF "$key" ~/.ssh/authorized_keys || echo "$key" >> ~/.ssh/authorized_keys')
+    print(paint(f"    $ ssh ... {user}@{ip}  (installing {pubkey_path.name})", "dim"))
+    try:
+        p = subprocess.run(["ssh", *ssh_base, f"{user}@{ip}", remote], input=pubkey + "\n",
+                           text=True, timeout=30)
+        return p.returncode == 0
+    except (subprocess.TimeoutExpired, OSError) as e:
+        bad(f"couldn't install the key: {e}")
+        return False
+
+
 def connect(node: Node, ns, cfg: dict, devices: dict, remote_cmd: list) -> int:
     if node.is_self:
         die("That's this device.")
@@ -914,11 +942,15 @@ def connect(node: Node, ns, cfg: dict, devices: dict, remote_cmd: list) -> int:
 
     alias = f"ts-{node.name}"
     base = ["-p", str(port), "-o", "StrictHostKeyChecking=accept-new", "-o", f"HostKeyAlias={alias}"]
-    if new_device and ns.user is None and shutil.which("ssh-copy-id") and node.online:
+    if new_device and ns.user is None and node.online:
         if confirm(f"Install your SSH key on {node.name} for password-less logins?", True):
             key = ensure_key()
             if key:
-                run(["ssh-copy-id", "-i", str(key) + ".pub", *base, f"{user}@{node.ip}"])
+                pubkey = Path(str(key) + ".pub")
+                if install_pubkey(pubkey, base, user, node.ip):
+                    ok(f"Key installed on {node.name}")
+                else:
+                    warn(f"Couldn't install the key automatically -- you may be asked for {node.name}'s password.")
     identity = ns.identity or cfg.get("identity")
 
     devices[node.name] = {"user": user, "port": int(port), "last_used": time.time()}

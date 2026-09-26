@@ -327,6 +327,112 @@ class TestApiBackend(unittest.TestCase):
         self.assertIn("@100.64.0.11", args)
 
 
+@unittest.skipUnless(shutil.which("sshd") and shutil.which("ssh-keygen"), "no local sshd available")
+class TestInstallPubkey(unittest.TestCase):
+    """Regression test for a real bug: Termux's ssh-copy-id has a long-standing scratch-dir
+    bug that hangs/errors instead of installing the key. install_pubkey() replaces it with a
+    plain ssh round-trip, verified here against a real local sshd rather than a mock -- a fake
+    'ssh' can't tell us whether the remote shell pipeline (the actual bug-prone part) works."""
+
+    TESTUSER = "tsshtest"
+
+    @classmethod
+    def setUpClass(cls):
+        Path("/run/sshd").mkdir(parents=True, exist_ok=True)  # sshd's privsep dir; not always pre-created
+        subprocess.run(["userdel", "-r", cls.TESTUSER], capture_output=True)  # in case a prior run left it
+        r = subprocess.run(["useradd", "-m", "-s", "/bin/bash", cls.TESTUSER], capture_output=True, text=True)
+        cls.have_user = r.returncode == 0
+        if not cls.have_user:
+            return  # environment can't create local users (e.g. no root) -- test will skip itself
+        cls.home = Path(f"/home/{cls.TESTUSER}")
+        # useradd -m leaves the account password-locked, and sshd refuses ANY login (pubkey
+        # included) for a locked account regardless of PasswordAuthentication -- give it a
+        # throwaway password just to unlock it; it's never actually usable for login since
+        # password auth stays off in sshd_config below.
+        subprocess.run(["chpasswd"], input=f"{cls.TESTUSER}:not-used-{os.urandom(8).hex()}\n",
+                       text=True, check=True)
+
+        cls.tmp = tempfile.TemporaryDirectory()
+        t = Path(cls.tmp.name)
+        hostkey = t / "hostkey"
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(hostkey)], check=True)
+        cls.bootstrap = t / "bootstrap"
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(cls.bootstrap)], check=True)
+        # Set up ~testuser/.ssh as that user, via su, so ownership matches what sshd/StrictModes expect --
+        # not just what a root-owned mkdir would produce -- and so the real login shell's own ~ (which
+        # the remote script in install_pubkey() relies on) is exactly what we're inspecting afterward.
+        subprocess.run(["su", cls.TESTUSER, "-c",
+                        "mkdir -m 700 -p ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"],
+                       check=True)
+        (cls.home / ".ssh" / "authorized_keys").write_text(cls.bootstrap.with_suffix(".pub").read_text())
+
+        cls.sock = socket.socket()
+        cls.sock.bind(("127.0.0.1", 0))
+        cls.port = cls.sock.getsockname()[1]
+        cls.sock.close()  # just claiming a free port; sshd binds it next
+
+        cfg = t / "sshd_config"
+        cfg.write_text(
+            f"Port {cls.port}\nListenAddress 127.0.0.1\nHostKey {hostkey}\n"
+            f"PubkeyAuthentication yes\nPasswordAuthentication no\nUsePAM no\n"
+            f"PidFile {t}/sshd.pid\nLogLevel ERROR\n"
+        )
+        cls.proc = subprocess.Popen(["/usr/sbin/sshd", "-f", str(cfg), "-D", "-e"],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        end = time.time() + 10
+        cls.up = False
+        while time.time() < end:
+            try:
+                socket.create_connection(("127.0.0.1", cls.port), timeout=0.5).close()
+                cls.up = True
+                break
+            except OSError:
+                time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        if not cls.have_user:
+            return
+        cls.proc.terminate()
+        try:
+            cls.proc.wait(5)
+        except subprocess.TimeoutExpired:
+            cls.proc.kill()
+        cls.tmp.cleanup()
+        subprocess.run(["userdel", "-r", cls.TESTUSER], capture_output=True)
+
+    def _base_args(self):
+        return ["-p", str(self.port), "-i", str(self.bootstrap), "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null", "-o", "BatchMode=yes"]
+
+    def test_installs_key_and_is_idempotent(self):
+        if not self.have_user:
+            self.skipTest("can't create a local test user in this environment")
+        self.assertTrue(self.up, "local sshd never came up")
+        new_key = Path(self.tmp.name) / "new_key"
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(new_key)], check=True)
+        pub = new_key.with_suffix(".pub")
+
+        ok1 = ts.install_pubkey(pub, self._base_args(), self.TESTUSER, "127.0.0.1")
+        self.assertTrue(ok1)
+        auth_text = (self.home / ".ssh" / "authorized_keys").read_text()
+        self.assertEqual(auth_text.count(pub.read_text().strip()), 1)
+        self.assertIn(self.bootstrap.with_suffix(".pub").read_text().strip(), auth_text)  # untouched
+
+        # the newly-installed key must itself now be able to log in, unassisted
+        r = subprocess.run(["ssh", "-p", str(self.port), "-i", str(new_key), "-o", "StrictHostKeyChecking=no",
+                            "-o", "UserKnownHostsFile=/dev/null", "-o", "BatchMode=yes",
+                            f"{self.TESTUSER}@127.0.0.1", "echo", "logged-in-with-new-key"],
+                           capture_output=True, text=True, timeout=10)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("logged-in-with-new-key", r.stdout)
+
+        ok2 = ts.install_pubkey(pub, self._base_args(), self.TESTUSER, "127.0.0.1")  # again: no duplicate
+        self.assertTrue(ok2)
+        auth_text2 = (self.home / ".ssh" / "authorized_keys").read_text()
+        self.assertEqual(auth_text2.count(pub.read_text().strip()), 1)
+
+
 class TestCommands(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

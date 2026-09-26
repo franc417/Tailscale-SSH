@@ -99,3 +99,16 @@ string like `u0_a327`, meaningless as a suggestion for an unrelated Linux or mac
 target. Fixed: that default is now only offered when the *calling* device isn't Termux
 either; calling from Termux toward a non-Android target now asks with no default at all
 rather than suggesting something that's certain to be wrong.
+
+**Sixth fix: `ssh-copy-id` doesn't work on Termux.** Its build there has a long-standing
+bug in the step that checks which keys are already installed (a "scratch directory"
+setup that fails on Android's filesystem), causing it to either hang or exit with
+`Assertion failure: in filter_ids()...` -- so the tool's own "install your key for
+password-less logins?" step just didn't work on the device it matters most for. Fixed
+by dropping the dependency on `ssh-copy-id` entirely: `install_pubkey()` does the same
+job directly over a plain `ssh` connection (read the local pubkey, ssh over, `mkdir -p
+~/.ssh`, append the key if it's not already there, fix permissions), which needs
+nothing but `ssh` itself and so works identically on every platform. Verified against a
+real local `sshd` and a real throwaway system account (not a mock) -- confirms the key
+actually gets appended, that installing it twice doesn't duplicate the line, and that
+the newly-installed key can genuinely log in unassisted afterward.
