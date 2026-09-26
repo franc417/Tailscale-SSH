@@ -9,6 +9,7 @@ import os
 import pty
 import re
 import select
+import shutil
 import socket
 import struct
 import fcntl
@@ -176,6 +177,49 @@ class TestProbe(unittest.TestCase):
         self.assertIsNone(ts.probe_ssh("", [22]))
 
 
+class TestTermuxCliGuard(unittest.TestCase):
+    """Regression test for a real bug: `pkg install tailscale` in Termux creates a separate,
+    never-signed-in tailscale instance with no relation to the Android Tailscale app. Finding
+    that binary on PATH must never be treated as this device's real tailnet status."""
+
+    def _termux_env(self, path_extra=None):
+        saved = {k: os.environ.get(k) for k in ("PATH", "PREFIX", "TERMUX_VERSION")}
+        os.environ["PATH"] = f"{path_extra}:{saved['PATH']}" if path_extra else saved["PATH"]
+        os.environ["PREFIX"] = "/data/data/com.termux/files/usr"
+        os.environ["TERMUX_VERSION"] = "0.118"
+        return saved
+
+    def _restore_env(self, saved):
+        for k, v in saved.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+    def test_stray_termux_binary_is_ignored(self):
+        saved = self._termux_env(path_extra=str(MOCKBIN))  # mockbin/tailscale is right there on PATH
+        try:
+            self.assertIsNotNone(shutil.which("tailscale"))   # sanity: it really is findable
+            self.assertIsNone(ts.ts_cli())                    # ...but ts_cli() must refuse it on Termux
+        finally:
+            self._restore_env(saved)
+
+    def test_non_termux_still_finds_it(self):
+        saved = {k: os.environ.get(k) for k in ("PATH", "PREFIX", "TERMUX_VERSION")}
+        os.environ["PATH"] = f"{MOCKBIN}:{saved['PATH']}"
+        os.environ.pop("PREFIX", None)
+        os.environ.pop("TERMUX_VERSION", None)
+        try:
+            self.assertIsNotNone(ts.ts_cli())
+        finally:
+            self._restore_env(saved)
+
+    def test_mask_secret(self):
+        s = "tskey-api-abcdefghij-0123456789"
+        m = ts.mask_secret(s)
+        self.assertEqual(len(m), len(s))
+        self.assertTrue(m.startswith("tske") and m.endswith("6789"))
+        self.assertNotIn(s[5:-4], m)                       # the middle is actually hidden
+        self.assertEqual(len(ts.mask_secret("short")), 5)  # too short to partially reveal -> fully masked
+
+
 class TestApiBackend(unittest.TestCase):
     """The Termux path: no CLI, device list from the Tailscale HTTP API."""
 
@@ -229,6 +273,25 @@ class TestApiBackend(unittest.TestCase):
             os.environ.pop("TSSH_LOCAL_IP")
         finally:
             ts.API_BASE = old
+            os.environ.pop("TSSH_LOCAL_IP", None)
+
+    def test_fetch_nodes_falls_back_to_api_when_cli_is_broken(self):
+        """Defense in depth beyond the Termux-specific fix: if a `tailscale` binary exists but
+        can't actually produce a status (crashed daemon, broken install, etc.) and an API key
+        is configured, fetch_nodes should still return a usable list via the API instead of
+        hard-failing with the CLI's error."""
+        old_api_base, old_ts_cli = ts.API_BASE, ts.ts_cli
+        ts.API_BASE = self.base
+        ts.ts_cli = lambda: "/nonexistent/tailscale"  # "found" on PATH, but running it will fail
+        os.environ["TSSH_LOCAL_IP"] = "100.64.0.10"
+        try:
+            with self.assertRaises(ts.TSError):
+                ts.fetch_cli(False)  # confirm the CLI path really is broken on its own
+            nodes, meta = ts.fetch_nodes({"api_key": "tskey-api-good"}, False)
+            self.assertEqual(meta["backend"], "api")
+            self.assertEqual(sorted(n.name for n in nodes), ["arch", "nas"])
+        finally:
+            ts.API_BASE, ts.ts_cli = old_api_base, old_ts_cli
             os.environ.pop("TSSH_LOCAL_IP", None)
 
 

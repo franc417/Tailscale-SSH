@@ -40,7 +40,7 @@ try:  # POSIX only; Windows falls back to a numbered prompt
 except ImportError:  # pragma: no cover
     termios = tty = None
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 REPO = "franc417/Tailscale-SSH"
 REPO_FILE = "tailscale_ssh.py"
 BRAND = "tailscale-ssh"  # set for real in main(); module default for direct imports
@@ -254,6 +254,11 @@ class NeedsLogin(TSError):
 
 
 def ts_cli() -> str | None:
+    if detect_platform() == "termux":
+        # A `tailscale` binary can exist here (`pkg install tailscale`), but it's a separate,
+        # disconnected instance from the Android Tailscale app -- it has no bearing on whether
+        # this device is actually on the tailnet, so never trust it for status.
+        return None
     return shutil.which("tailscale")
 
 
@@ -363,7 +368,11 @@ def fetch_api(key: str, show_all: bool):
 
 def fetch_nodes(cfg: dict, show_all: bool):
     if ts_cli():
-        return fetch_cli(show_all)
+        try:
+            return fetch_cli(show_all)
+        except TSError:
+            if not cfg.get("api_key"):
+                raise  # no fallback available -- surface the real CLI error
     if cfg.get("api_key"):
         return fetch_api(cfg["api_key"], show_all)
     raise TSError("Tailscale isn't set up on this device yet", f"Run: {BRAND} setup")
@@ -732,6 +741,57 @@ def ask(prompt: str, default: str | None = None, secret: bool = False) -> str | 
     return ans or default
 
 
+def mask_secret(s: str) -> str:
+    if len(s) <= 8:
+        return "•" * len(s)
+    return s[:4] + "•" * (len(s) - 8) + s[-4:]
+
+
+def read_termux_clipboard() -> str | None:
+    if not shutil.which("termux-clipboard-get"):
+        return None
+    try:
+        out = subprocess.run(["termux-clipboard-get"], capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() or None
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
+def prompt_api_key(plat: str) -> str | None:
+    """Get a Tailscale API key interactively. A hidden getpass prompt gives zero feedback on
+    whether a paste actually landed, which is exactly the confusing part -- so every path here
+    ends by showing a masked preview + length of whatever was captured, and Termux gets a
+    clipboard-read shortcut that sidesteps paste-into-hidden-field entirely."""
+    if plat == "termux" and shutil.which("termux-clipboard-get"):
+        info("Copy your API key (long-press it on the Tailscale page → Copy), then come back here.")
+        try:
+            input(f"{paint('?', 'accent')} Press Enter once it's copied: ")
+        except EOFError:
+            pass
+        clip = read_termux_clipboard()
+        if clip:
+            print(paint(f"    Clipboard: {mask_secret(clip)}  ({len(clip)} chars)", "dim"))
+            if not clip.startswith("tskey"):
+                warn("That doesn't look like a Tailscale key (expected to start with 'tskey-').")
+            if confirm("Use this?", clip.startswith("tskey")):
+                return clip
+            info("OK, you can paste it manually instead.")
+
+    for attempt in range(3):
+        key = ask("Paste your API key (hidden)", secret=True)
+        if key:
+            print(paint(f"    Got it: {mask_secret(key)}  ({len(key)} chars)", "dim"))
+            if not key.startswith("tskey"):
+                warn("That doesn't look like a Tailscale key (expected to start with 'tskey-') -- using it anyway.")
+            return key
+        warn("Nothing came through." if attempt == 0 else "Still nothing.")
+        if attempt < 2:
+            info("In Termux: long-press the input line → Paste, then press Enter.")
+    warn("Couldn't get a key this way.")
+    info(f"Add one later without retyping it here: {BRAND} setup --api-key <key>")
+    return None
+
+
 def confirm(prompt: str, default: bool = True) -> bool:
     if ASSUME_YES:
         return True
@@ -1051,14 +1111,21 @@ def step_termux_tailscale(ns, cfg) -> None:
         info("Android has no `tailscale` command, so the device list comes from Tailscale's API.")
         info("Create a key: https://login.tailscale.com/admin/settings/keys  →  Generate access token")
         info(f"(keys expire after at most 90 days; run `{BRAND} setup` again to replace it)")
-        key = ask("Paste your API key (hidden)", secret=True)
-    if key:
+        key = prompt_api_key("termux")
+
+    while key:
         try:
             n = len(api_get_devices(key))
             cfg["api_key"] = key
             ok(f"API key works ({n} devices on your tailnet)")
+            break
         except TSError as e:
             bad(str(e))
+            key = prompt_api_key("termux") if confirm("Try a different key?", True) else None
+
+    if not cfg.get("api_key"):
+        warn("No working API key -- this phone won't be able to list other devices yet.")
+        info(f"Run `{BRAND} setup --api-key <key>` any time to add one.")
 
 
 def step_linux_tailscale(ns, cfg, plat: str) -> None:

@@ -61,3 +61,18 @@ now creates a single command, named whatever you like (`install.sh` defaults to
 `mesh`, override with `TSSH_NAME=whatever`). Every hint and help string in the tool
 adapts to whatever name it was invoked as — there's nothing hardcoded to `sshph` or
 `tarch` left anywhere.
+
+**Third fix: a stray local `tailscale` binary on Termux was treated as authoritative.**
+Termux's Android Tailscale app has no CLI at all — it's a VPN service, not a shell
+command — which is exactly why device discovery there uses the Tailscale HTTP API
+instead (see the README). But it's possible to separately `pkg install tailscale`
+*inside* Termux, which gets you a real `tailscale`/`tailscaled` pair — except that
+instance lives entirely inside Termux's own sandbox, has never been signed in, and has
+nothing to do with the Android app that's actually connected. The engine's detection
+logic only checked "does a `tailscale` binary exist on PATH", found that stray unrelated
+binary, and used it — producing "Can't read Tailscale status" even while the real
+(Android app) connection was fine. Fix: `ts_cli()` now unconditionally returns `None` on
+Termux, so device discovery there only ever goes through the API/local-IP path,
+regardless of what happens to be on PATH. (As a second layer of defense for other
+platforms too, `fetch_nodes()` now also falls back to the API if the CLI path exists but
+errors and an API key is configured, rather than hard-failing.)
