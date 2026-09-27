@@ -287,7 +287,8 @@ class TestApiBackend(unittest.TestCase):
         try:
             with self.assertRaises(ts.TSError):
                 ts.fetch_cli(False)  # confirm the CLI path really is broken on its own
-            nodes, meta = ts.fetch_nodes({"api_key": "tskey-api-good"}, False)
+            cfg = {"accounts": {"default": {"api_key": "tskey-api-good"}}, "active_account": "default"}
+            nodes, meta = ts.fetch_nodes(cfg, False)
             self.assertEqual(meta["backend"], "api")
             self.assertEqual(sorted(n.name for n in nodes), ["arch", "nas"])
         finally:
@@ -431,6 +432,151 @@ class TestInstallPubkey(unittest.TestCase):
         self.assertTrue(ok2)
         auth_text2 = (self.home / ".ssh" / "authorized_keys").read_text()
         self.assertEqual(auth_text2.count(pub.read_text().strip()), 1)
+
+
+class TestAccounts(unittest.TestCase):
+    """Multiple Tailscale accounts on one device: real `tailscale switch` passthrough where a
+    CLI exists, named API-key profiles (our own bookkeeping) where it doesn't (Termux)."""
+
+    def test_active_api_key_resolution(self):
+        self.assertIsNone(ts.active_api_key({"accounts": {}, "active_account": None}))
+        cfg = {"accounts": {"work": {"api_key": "tskey-work"}, "home": {"api_key": "tskey-home"}},
+               "active_account": "home"}
+        self.assertEqual(ts.active_api_key(cfg), "tskey-home")
+        # active_account points nowhere (stale/removed) -- falls back to whatever exists
+        cfg["active_account"] = "gone"
+        self.assertIn(ts.active_api_key(cfg), ("tskey-work", "tskey-home"))
+
+    def test_legacy_config_migrates_on_load(self):
+        """load_config() is monkeypatched to point at an isolated dir here (in-process); the
+        subprocess-based tests elsewhere exercise the same migration via TSSH_CONFIG_DIR."""
+        t = Path(tempfile.mkdtemp())
+        (t / "config.json").write_text(json.dumps({"api_key": "tskey-old", "probe_ports": [22]}))
+        old_conf_dir = ts.CONF_DIR, ts.CONF_FILE, ts.DEV_FILE
+        ts.CONF_DIR = t
+        ts.CONF_FILE = t / "config.json"
+        ts.DEV_FILE = t / "devices.json"
+        try:
+            cfg = ts.load_config()
+            self.assertNotIn("api_key", cfg)
+            self.assertEqual(cfg["accounts"], {"default": {"api_key": "tskey-old"}})
+            self.assertEqual(cfg["active_account"], "default")
+            self.assertEqual(ts.active_api_key(cfg), "tskey-old")
+        finally:
+            ts.CONF_DIR, ts.CONF_FILE, ts.DEV_FILE = old_conf_dir
+
+    def _cli_env(self, t):
+        (t / "s.json").write_text(json.dumps({"BackendState": "Running", "Self": {}, "Peer": {}}))
+        (t / "conf").mkdir()
+        (t / "conf" / "config.json").write_text(json.dumps({"probe_ports": [22], "configured": True}))
+        return dict(os.environ, HOME=str(t), TSSH_CONFIG_DIR=str(t / "conf"),
+                   PATH=f"{MOCKBIN}:{os.environ['PATH']}", MOCK_TS_JSON=str(t / "s.json"),
+                   MOCK_TS_CALLS=str(t / "calls.jsonl"), NO_COLOR="1")
+
+    def _run(self, env, *args):
+        return subprocess.run([sys.executable, str(ROOT / "tailscale_ssh.py"), *args],
+                              capture_output=True, text=True, env=env, timeout=30,
+                              stdin=subprocess.DEVNULL)
+
+    def _calls(self, t):
+        p = t / "calls.jsonl"
+        return [json.loads(l) for l in p.read_text().splitlines()] if p.exists() else []
+
+    def test_cli_passthrough_list_use_add(self):
+        t = Path(tempfile.mkdtemp())
+        env = self._cli_env(t)
+
+        r = self._run(env, "accounts")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("alice@example.com", r.stdout)          # the mock's --list output came through
+        self.assertIn(["switch", "--list"], self._calls(t))
+
+        r = self._run(env, "accounts", "use", "bob@work.example.com")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(["switch", "bob@work.example.com"], self._calls(t))
+
+        r = self._run(env, "accounts", "add", "personal")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = self._calls(t)
+        self.assertIn(["login"], calls)
+        self.assertIn(["set", "--nickname=personal"], calls)
+
+        r = self._run(env, "accounts", "use")  # no name given
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("Usage", r.stderr)
+
+    def test_termux_profiles_list_use_reject_unknown(self):
+        t = Path(tempfile.mkdtemp())
+        (t / "conf").mkdir()
+        (t / "conf" / "config.json").write_text(json.dumps({
+            "probe_ports": [22], "configured": True,
+            "accounts": {"personal": {"api_key": "tskey-p"}, "work": {"api_key": "tskey-w"}},
+            "active_account": "personal",
+        }))
+        env = dict(os.environ, HOME=str(t), TSSH_CONFIG_DIR=str(t / "conf"),
+                   TERMUX_VERSION="0.118", PREFIX="/data/data/com.termux/files/usr", NO_COLOR="1")
+
+        r = self._run(env, "accounts")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("personal", r.stdout)
+        self.assertIn("work", r.stdout)
+        self.assertIn("active", r.stdout)
+
+        r = self._run(env, "accounts", "use", "work")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        saved = json.loads((t / "conf" / "config.json").read_text())
+        self.assertEqual(saved["active_account"], "work")
+
+        r = self._run(env, "accounts", "use", "nonexistent")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("No saved profile", r.stderr)
+        # a rejected switch must not have silently changed anything
+        saved2 = json.loads((t / "conf" / "config.json").read_text())
+        self.assertEqual(saved2["active_account"], "work")
+
+    def test_setup_creates_named_profile_without_disturbing_others(self):
+        """mesh setup --account NAME --api-key KEY -y adds a new profile and makes it active,
+        while leaving an existing one alone -- this is the actual two-tailnets-on-one-phone
+        scenario, end to end."""
+        calls = []
+        devices = {"devices": [{"name": "arch.tail1234.ts.net", "hostname": "arch",
+                                 "addresses": ["100.64.0.11"], "os": "linux",
+                                 "user": "franc@example.com", "connectedToControl": True}]}
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(h):
+                calls.append(h.headers.get("Authorization"))
+                body = json.dumps(devices).encode()
+                h.send_response(200); h.send_header("Content-Type", "application/json"); h.end_headers()
+                h.wfile.write(body)
+
+            def log_message(h, *a):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        try:
+            t = Path(tempfile.mkdtemp())
+            (t / "conf").mkdir()
+            (t / "conf" / "config.json").write_text(json.dumps({
+                "probe_ports": [22], "configured": True,
+                "accounts": {"personal": {"api_key": "tskey-existing"}},
+                "active_account": "personal",
+            }))
+            env = dict(os.environ, HOME=str(t), TSSH_CONFIG_DIR=str(t / "conf"),
+                       TERMUX_VERSION="0.118", PREFIX="/data/data/com.termux/files/usr",
+                       TSSH_API_BASE=base, TSSH_LOCAL_IP="100.64.0.11", NO_COLOR="1")
+            r = self._run(env, "setup", "--account", "work", "--api-key", "tskey-api-new", "-y")
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("Bearer tskey-api-new", calls)
+
+            saved = json.loads((t / "conf" / "config.json").read_text())
+            self.assertEqual(saved["accounts"]["work"]["api_key"], "tskey-api-new")
+            self.assertEqual(saved["accounts"]["personal"]["api_key"], "tskey-existing")  # untouched
+            self.assertEqual(saved["active_account"], "work")
+        finally:
+            srv.shutdown()
 
 
 class TestCommands(unittest.TestCase):

@@ -40,7 +40,7 @@ try:  # POSIX only; Windows falls back to a numbered prompt
 except ImportError:  # pragma: no cover
     termios = tty = None
 
-__version__ = "0.2.3"
+__version__ = "0.3.0"
 REPO = "franc417/Tailscale-SSH"
 REPO_FILE = "tailscale_ssh.py"
 BRAND = "tailscale-ssh"  # set for real in main(); module default for direct imports
@@ -51,7 +51,10 @@ DEV_FILE = CONF_DIR / "devices.json"
 DEFAULTS = {
     "probe_ports": [22, 8022, 2222],  # ports checked for an SSH banner on every device
     "refresh_seconds": 3,             # live-view refresh interval
-    "api_key": None,                  # only needed where no `tailscale` CLI exists (Termux)
+    "accounts": {},                   # {name: {"api_key": ...}} -- only meaningful where there's
+                                       # no `tailscale` CLI (Termux); lets more than one Tailscale
+                                       # account's API key be stored and switched between
+    "active_account": None,
     "identity": None,                 # optional path to a private key
     "configured": False,
 }
@@ -127,11 +130,25 @@ def save_json(path: Path, data, private: bool = False) -> None:
 def load_config() -> dict:
     cfg = dict(DEFAULTS)
     cfg.update(load_json(CONF_FILE, {}))
+    legacy = cfg.pop("api_key", None)  # pre-0.3 configs stored one unnamed key at the top level
+    if legacy and not cfg.get("accounts"):
+        cfg["accounts"] = {"default": {"api_key": legacy}}
+        cfg["active_account"] = "default"
     return cfg
 
 
 def save_config(cfg: dict) -> None:
-    save_json(CONF_FILE, cfg, private=True)  # may hold an API key
+    save_json(CONF_FILE, cfg, private=True)  # may hold API keys
+
+
+def active_api_key(cfg: dict) -> str | None:
+    accounts = cfg.get("accounts") or {}
+    name = cfg.get("active_account")
+    if name and name in accounts:
+        return accounts[name].get("api_key")
+    if accounts:  # active_account unset or stale -- fall back to whichever one exists
+        return next(iter(accounts.values())).get("api_key")
+    return None
 
 
 # ───────────────────────────── helpers ─────────────────────────────
@@ -367,14 +384,15 @@ def fetch_api(key: str, show_all: bool):
 
 
 def fetch_nodes(cfg: dict, show_all: bool):
+    key = active_api_key(cfg)
     if ts_cli():
         try:
             return fetch_cli(show_all)
         except TSError:
-            if not cfg.get("api_key"):
+            if not key:
                 raise  # no fallback available -- surface the real CLI error
-    if cfg.get("api_key"):
-        return fetch_api(cfg["api_key"], show_all)
+    if key:
+        return fetch_api(key, show_all)
     raise TSError("Tailscale isn't set up on this device yet", f"Run: {BRAND} setup")
 
 
@@ -1035,11 +1053,71 @@ def cmd_forget(ns, devices) -> int:
 
 def cmd_config(cfg) -> int:
     shown = dict(cfg)
-    if shown.get("api_key"):
-        shown["api_key"] = shown["api_key"][:12] + "…"
+    shown["accounts"] = {name: {**acc, "api_key": acc["api_key"][:12] + "…"} if acc.get("api_key") else acc
+                         for name, acc in (shown.get("accounts") or {}).items()}
     print(paint(str(CONF_FILE), "dim"))
     print(json.dumps(shown, indent=2, sort_keys=True))
     return 0
+
+
+def cmd_accounts(ns, cfg, brand) -> int:
+    sub = ns.words[1] if len(ns.words) > 1 else None
+    arg = ns.words[2] if len(ns.words) > 2 else None
+
+    if ts_cli():
+        # A real tailscaled is here, so these are real Tailscale accounts (fast user switching) --
+        # pass straight through to Tailscale's own CLI rather than re-parsing/re-rendering its
+        # output ourselves, which would only go stale as that output evolves.
+        if sub in (None, "list"):
+            head("Tailscale accounts on this device")
+            run(["tailscale", "switch", "--list"])
+            info(f"Switch: {brand} accounts use <name-or-nickname>")
+            info(f"Add another: {brand} accounts add [nickname]")
+        elif sub == "use":
+            if not arg:
+                die(f"Usage: {brand} accounts use <name-or-nickname>")
+            run([*sudo(), "tailscale", "switch", arg])
+        elif sub == "add":
+            info("A browser sign-in will open for the new account -- it won't disturb the one you're on.")
+            run([*sudo(), "tailscale", "login"])
+            if arg:
+                run([*sudo(), "tailscale", "set", f"--nickname={arg}"])
+            info(f"See every account: {brand} accounts")
+        else:
+            die(f"Usage: {brand} accounts [list|use <name>|add [nickname]]")
+        return 0
+
+    # No CLI here (Termux): our own named API-key profiles, since a real Tailscale account
+    # switch isn't something we can drive from here -- see the note in `accounts use` below.
+    accounts = cfg.get("accounts") or {}
+    active = cfg.get("active_account")
+    if sub in (None, "list"):
+        head("Saved API key profiles")
+        if not accounts:
+            info(f"None yet. Run: {brand} setup")
+            return 0
+        for name in accounts:
+            cur = name == active
+            dot = paint(g("dot"), "ok") if cur else paint(g("ring"), "dim")
+            print(f"    {dot} {name}" + (paint("  (active)", "dim") if cur else ""))
+        info(f"Switch: {brand} accounts use <name>")
+        info(f"Add another: {brand} setup --account <name>")
+        return 0
+    if sub == "use":
+        if not arg:
+            die(f"Usage: {brand} accounts use <name>")
+        if arg not in accounts:
+            die(f"No saved profile named '{arg}'.", f"Known: {', '.join(accounts) or 'none'}")
+        cfg["active_account"] = arg
+        save_config(cfg)
+        ok(f"Now using '{arg}' for device listing.")
+        warn("This only changes which API key mesh reads -- it doesn't switch which tailnet this")
+        warn("phone can actually reach. Make sure the Tailscale app itself is signed in to the")
+        warn("matching account if these devices need to be reachable.")
+        return 0
+    if sub == "add":
+        die(f"Use: {brand} setup --account <name>", "(setup handles creating and validating the new key)")
+    die(f"Usage: {brand} accounts [list|use <name>]", f"To add one: {brand} setup --account <name>")
 
 
 def gh_token() -> str | None:
@@ -1109,8 +1187,10 @@ def cmd_doctor(cfg, devices) -> int:
         else:
             st = data.get("BackendState")
             (ok if st == "Running" else bad)(f"tailscale state: {st}")
-    elif cfg.get("api_key"):
-        ok("no CLI here, using the Tailscale API key")
+    elif active_api_key(cfg):
+        n = len(cfg.get("accounts") or {})
+        extra = f", {n - 1} other saved" if n > 1 else ""
+        ok(f"no CLI here, using the '{cfg.get('active_account')}' API key{extra}")
     else:
         bad(f"no tailscale CLI and no API key. Run: {BRAND} setup")
     ip = local_tailscale_ip()
@@ -1144,7 +1224,16 @@ def step_termux_tailscale(ns, cfg) -> None:
         ip = local_tailscale_ip()
     ok(f"Tailscale is active on this phone ({ip})") if ip else warn("Still not detected. Continuing anyway.")
 
-    key = ns.api_key or cfg.get("api_key")
+    accounts = cfg.setdefault("accounts", {})
+    name = ns.account or cfg.get("active_account") or "default"
+    is_new = name not in accounts
+    if is_new and ns.account:
+        info(f"Setting up a new account profile: '{name}'.")
+        info("Note: this only changes which API key mesh lists devices with -- the Tailscale app")
+        info("itself still only connects to one tailnet at a time, so make sure it's signed in to")
+        info("the account this key belongs to if you want these devices to actually be reachable.")
+
+    key = ns.api_key or (None if is_new else accounts.get(name, {}).get("api_key"))
     if not key:
         print()
         info("Android has no `tailscale` command, so the device list comes from Tailscale's API.")
@@ -1155,14 +1244,15 @@ def step_termux_tailscale(ns, cfg) -> None:
     while key:
         try:
             n = len(api_get_devices(key))
-            cfg["api_key"] = key
-            ok(f"API key works ({n} devices on your tailnet)")
+            accounts[name] = {"api_key": key}
+            cfg["active_account"] = name
+            ok(f"API key works ({n} devices on the '{name}' tailnet)")
             break
         except TSError as e:
             bad(str(e))
             key = prompt_api_key("termux") if confirm("Try a different key?", True) else None
 
-    if not cfg.get("api_key"):
+    if name not in accounts:
         warn("No working API key -- this phone won't be able to list other devices yet.")
         info(f"Run `{BRAND} setup --api-key <key>` any time to add one.")
 
@@ -1188,8 +1278,16 @@ def step_linux_tailscale(ns, cfg, plat: str) -> None:
         run([*sudo(), "systemctl", "enable", "--now", "tailscaled"])
 
     data = ts_status_json() or {}
-    if data.get("BackendState") == "Running":
+    if data.get("BackendState") == "Running" and not ns.account:
         ok("Already signed in and connected")
+        return
+    if data.get("BackendState") == "Running" and ns.account:
+        info("Already signed in on this device. Adding another account...")
+        info("A browser sign-in will open for the new account -- it won't disturb the one you're on.")
+        run([*sudo(), "tailscale", "login"])
+        print()
+        info(f"To give it a memorable name: sudo tailscale set --nickname={ns.account}")
+        info(f"See every account and switch between them any time: {BRAND} accounts")
         return
     print()
     info("Signing in creates your Tailscale account the first time (Google, Microsoft, GitHub or Apple).")
@@ -1285,7 +1383,8 @@ HELP = """\
 
   list [--json] [-a]          show devices once
   watch                       live view without connecting
-  setup [--authkey K]         first-run wizard: Tailscale, SSH server, key
+  setup [--account NAME]      first-run wizard: Tailscale, SSH server, key
+  accounts [use <name>|add]   list/switch/add Tailscale accounts on this device
   doctor                      diagnose problems
   update                      update from GitHub
   forget <device>             drop the saved user/port for a device
@@ -1295,7 +1394,7 @@ options: -u USER  -p PORT  -i KEYFILE  -a/--all (include devices shared with you
          -y (assume yes)  --plain (no colour)  -V/--version
 """
 
-SUBS = {"list", "ls", "watch", "setup", "doctor", "update", "forget", "config", "version", "help"}
+SUBS = {"list", "ls", "watch", "setup", "accounts", "doctor", "update", "forget", "config", "version", "help"}
 
 
 def main(argv=None) -> int:
@@ -1321,6 +1420,7 @@ def main(argv=None) -> int:
     p.add_argument("-y", "--yes", action="store_true")
     p.add_argument("--authkey")
     p.add_argument("--api-key")
+    p.add_argument("--account")
     p.add_argument("-h", "--help", action="store_true")
     p.add_argument("-V", "--version", action="store_true")
     ns = p.parse_intermixed_args(argv)
@@ -1348,6 +1448,8 @@ def main(argv=None) -> int:
         return cmd_config(cfg)
     if cmd == "forget":
         return cmd_forget(ns, devices)
+    if cmd == "accounts":
+        return cmd_accounts(ns, cfg, brand)
 
     if not cfg.get("configured") and sys.stdin.isatty() and sys.stdout.isatty() and not ns.json:
         print(paint(f"\nFirst run: let's get this device ready.", "accent"))

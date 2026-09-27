@@ -68,6 +68,29 @@ Every device shows the identical picker — a laptop and a phone see each other
 symmetrically. Add a third device (a Mint desktop, say) and it just appears in
 everyone's list once it's signed in to the same Tailscale account.
 
+## More than one Tailscale account on the same device
+
+```
+mesh accounts             # see the accounts set up on this device
+mesh accounts use work    # switch to one
+mesh accounts add [nickname]   # sign in to another, without disturbing the current one
+```
+
+On a machine with the real Tailscale CLI (Arch, other Linux, macOS), this is a thin
+wrapper around Tailscale's own [fast user switching](https://tailscale.com/kb/1225/fast-user-switching)
+(`tailscale switch`) — `mesh accounts` really does change which tailnet this device can
+reach.
+
+Fast user switching isn't available on Android, so on Termux there's no CLI to switch
+in the first place. `mesh setup --account <name>` stores an additional named API key
+instead, and `mesh accounts use <name>` switches which one `mesh` reads for its device
+list. Important distinction: **this only changes which devices `mesh` shows you — it
+doesn't change which tailnet the phone can actually reach.** A device can only ever be
+routing packets on one tailnet at a time (true on every platform — Tailscale's own
+docs are explicit about this), and on Android that's whichever account the Tailscale
+app itself is signed in to. So switching profiles here only shows a usefully different
+device list if the Tailscale app is *also* signed in to that account.
+
 ## Why there's no config file to edit
 
 The original design (see `docs/DESIGN-NOTES.md`) used `sshph.conf` / `tarch.conf` files

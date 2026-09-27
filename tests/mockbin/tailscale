@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
-"""Test double for the `tailscale` CLI: `tailscale status --json` prints $MOCK_TS_JSON."""
-import os, sys
+"""Test double for the `tailscale` CLI: `tailscale status --json` prints $MOCK_TS_JSON.
+Every invocation's argv is appended (one JSON line) to $MOCK_TS_CALLS if set, so tests can
+assert exactly what was run for switch/login/set etc."""
+import json, os, sys
+
+if os.environ.get("MOCK_TS_CALLS"):
+    with open(os.environ["MOCK_TS_CALLS"], "a") as f:
+        f.write(json.dumps(sys.argv[1:]) + "\n")
+
 if sys.argv[1:3] == ["status", "--json"]:
     sys.stdout.write(open(os.environ["MOCK_TS_JSON"]).read())
+elif sys.argv[1:3] == ["switch", "--list"]:
+    print("* alice@example.com (this-device)\n  bob@work.example.com")
 sys.exit(0)

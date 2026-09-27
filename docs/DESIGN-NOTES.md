@@ -112,3 +112,23 @@ nothing but `ssh` itself and so works identically on every platform. Verified ag
 real local `sshd` and a real throwaway system account (not a mock) -- confirms the key
 actually gets appended, that installing it twice doesn't duplicate the line, and that
 the newly-installed key can genuinely log in unassisted afterward.
+
+**New in 0.3.0: more than one Tailscale account on the same device.** Real Tailscale
+already has "fast user switching" (`tailscale switch`) for this on Linux/macOS -- one
+account active at a time, switch on demand -- so `mesh accounts` is mostly a thin,
+consistently-named wrapper around that (`list`, `use <name>`, `add [nickname]`) rather
+than a reimplementation. Android isn't in Tailscale's supported platform list for fast
+user switching, and Termux has no CLI to switch in the first place, so the same `mesh
+accounts` command does something different there under the hood: named API-key
+profiles of our own, stored in config (`mesh setup --account <name>` adds one, `mesh
+accounts use <name>` switches which one `mesh` reads for its device list). The config
+schema changed from one flat `api_key` to `accounts: {name: {api_key}}` +
+`active_account`; existing configs migrate automatically on next load.
+
+The one thing this can't paper over: a device can only ever route packets on one
+tailnet at a time, on every platform -- switching which named profile `mesh` reads on
+Termux only shows a *usefully different* device list if the Tailscale app itself is
+also signed in to that same account, since our profile switch and the Android app's
+active session are two independent things. Real network-level switching only exists
+where Tailscale's own fast user switching exists (Linux, macOS, iOS, Windows -- not
+Android), which is why the CLI-based path can honestly claim more than the Termux path.
