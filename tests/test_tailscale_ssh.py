@@ -434,6 +434,270 @@ class TestInstallPubkey(unittest.TestCase):
         self.assertEqual(auth_text2.count(pub.read_text().strip()), 1)
 
 
+@unittest.skipUnless(shutil.which("sshd") and shutil.which("ssh-keygen"), "no local sshd available")
+class TestGui(unittest.TestCase):
+    """mesh gui's remote-orchestration plumbing (check_sunshine, remote_platform), tested
+    against a real local sshd and a real throwaway account -- same reasoning as
+    TestInstallPubkey: a fake `ssh` can't tell us whether the actual remote shell pipeline
+    (the part with real bugs) works. What this class can't test -- Sunshine's actual screen
+    capture, or Moonlight's actual rendering -- isn't ours to test; that's mesh's own
+    orchestration of them, which is what's covered here."""
+
+    TESTUSER = "tsshtest2"
+
+    @classmethod
+    def setUpClass(cls):
+        Path("/run/sshd").mkdir(parents=True, exist_ok=True)
+        subprocess.run(["pkill", "-KILL", "-u", cls.TESTUSER], capture_output=True)
+        subprocess.run(["userdel", "-r", cls.TESTUSER], capture_output=True)
+        r = subprocess.run(["useradd", "-m", "-s", "/bin/bash", cls.TESTUSER], capture_output=True, text=True)
+        cls.have_user = r.returncode == 0
+        if not cls.have_user:
+            return
+        cls.home = Path(f"/home/{cls.TESTUSER}")
+        subprocess.run(["chpasswd"], input=f"{cls.TESTUSER}:not-used-{os.urandom(8).hex()}\n",
+                       text=True, check=True)  # unlock the account; see TestInstallPubkey for why
+
+        cls.tmp = tempfile.TemporaryDirectory()
+        t = Path(cls.tmp.name)
+        hostkey = t / "hostkey"
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(hostkey)], check=True)
+        cls.key = t / "key"
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(cls.key)], check=True)
+        subprocess.run(["su", cls.TESTUSER, "-c",
+                        "mkdir -m 700 -p ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"],
+                       check=True)
+        (cls.home / ".ssh" / "authorized_keys").write_text(cls.key.with_suffix(".pub").read_text())
+
+        cls.sock = socket.socket()
+        cls.sock.bind(("127.0.0.1", 0))
+        cls.port = cls.sock.getsockname()[1]
+        cls.sock.close()
+        cfg = t / "sshd_config"
+        cfg.write_text(f"Port {cls.port}\nListenAddress 127.0.0.1\nHostKey {hostkey}\n"
+                       f"PubkeyAuthentication yes\nPasswordAuthentication no\nUsePAM no\n"
+                       f"PidFile {t}/sshd.pid\nLogLevel ERROR\n")
+        cls.proc = subprocess.Popen(["/usr/sbin/sshd", "-f", str(cfg), "-D", "-e"],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        end = time.time() + 10
+        cls.up = False
+        while time.time() < end:
+            try:
+                socket.create_connection(("127.0.0.1", cls.port), timeout=0.5).close()
+                cls.up = True
+                break
+            except OSError:
+                time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        if not cls.have_user:
+            return
+        cls.proc.terminate()
+        try:
+            cls.proc.wait(5)
+        except subprocess.TimeoutExpired:
+            cls.proc.kill()
+        cls.tmp.cleanup()
+        subprocess.run(["rm", "-f", "/usr/local/bin/sunshine"])
+        # the fake sunshine spawns a `sleep` that outlives `pkill -x sunshine`; userdel refuses a
+        # user that still owns a process, which would leave the account behind and make the next
+        # run's useradd fail (and these tests silently skip)
+        subprocess.run(["pkill", "-KILL", "-u", cls.TESTUSER], capture_output=True)
+        time.sleep(0.3)
+        subprocess.run(["userdel", "-r", cls.TESTUSER], capture_output=True)
+
+    def _base(self):
+        return ["-p", str(self.port), "-i", str(self.key), "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null", "-o", "BatchMode=yes"]
+
+    def test_check_sunshine_transitions_through_real_ssh(self):
+        if not self.have_user:
+            self.skipTest("can't create a local test user in this environment")
+        self.assertTrue(self.up, "local sshd never came up")
+        base = self._base()
+
+        installed, running = ts.check_sunshine(base, self.TESTUSER, "127.0.0.1")
+        self.assertEqual((installed, running), (False, False))
+
+        sunshine_bin = Path("/usr/local/bin/sunshine")
+        sunshine_bin.write_text("#!/bin/bash\nsleep 30\n")
+        sunshine_bin.chmod(0o755)
+        try:
+            installed, running = ts.check_sunshine(base, self.TESTUSER, "127.0.0.1")
+            self.assertEqual((installed, running), (True, False))
+
+            r = subprocess.run(["ssh", *base, f"{self.TESTUSER}@127.0.0.1",
+                                "nohup sunshine >/dev/null 2>&1 & disown; sleep 0.3; echo started"],
+                               capture_output=True, text=True, timeout=10)
+            self.assertIn("started", r.stdout, r.stderr)
+
+            installed, running = ts.check_sunshine(base, self.TESTUSER, "127.0.0.1")
+            self.assertEqual((installed, running), (True, True))
+        finally:
+            subprocess.run(["ssh", *base, f"{self.TESTUSER}@127.0.0.1", "pkill", "-x", "sunshine"],
+                           capture_output=True, timeout=10)
+            sunshine_bin.unlink(missing_ok=True)
+
+    def test_check_sunshine_unreachable_host(self):
+        r = ts.check_sunshine(["-p", "1", "-o", "BatchMode=yes", "-o", "ConnectTimeout=1"], "nobody", "127.0.0.1")
+        self.assertEqual(r, (None, None))
+
+    def test_remote_platform_real_ssh(self):
+        if not self.have_user:
+            self.skipTest("can't create a local test user in this environment")
+        self.assertTrue(self.up, "local sshd never came up")
+        # this sandbox really is Debian-based -- a genuine assertion, not a fake /etc/os-release
+        self.assertEqual(ts.remote_platform(self._base(), self.TESTUSER, "127.0.0.1"), "debian")
+
+    def test_arch_install_script_is_valid_bash(self):
+        r = subprocess.run(["bash", "-n"], input=ts.ARCH_SUNSHINE_INSTALL, text=True, capture_output=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("lizardbyte/sunshine", ts.ARCH_SUNSHINE_INSTALL)
+        self.assertIn("pacman-repo/releases/latest/download", ts.ARCH_SUNSHINE_INSTALL)
+
+
+class TestGuiFlow(unittest.TestCase):
+    """cmd_gui's decision logic -- which remote commands run, in what order, and when it gives
+    up -- with the plumbing (ssh, device lookup) patched out. The plumbing itself is covered
+    for real in TestGui; this is about the branching."""
+
+    def _run_gui(self, checks, platform="arch", call_rcs=(0, 0), termux=False):
+        """checks: successive (installed, running) results from check_sunshine.
+        Returns (exit_code, ssh_-t_calls, handoff_ips)."""
+        import types
+        node = ts.Node("arch", ips=["100.64.0.11"], online=True, os="linux")
+        ns = types.SimpleNamespace(words=["gui", "arch"], all=False)
+        def repeating_last(items):  # state persists in reality: once it stops changing, it stays that way
+            items = list(items)
+            for x in items:
+                yield x
+            while True:
+                yield items[-1]
+
+        check_iter = repeating_last(checks)
+        ssh_calls, handoffs = [], []
+        rc_iter = iter(call_rcs)
+
+        def fake_call(cmd, *a, **kw):
+            ssh_calls.append(cmd)
+            return next(rc_iter, 0)
+
+        saved = {n: getattr(ts, n) for n in ("fetch_nodes", "resolve_connection", "check_sunshine",
+                                            "remote_platform", "termux_handoff", "detect_platform")}
+        saved_call, saved_sleep = ts.subprocess.call, ts.time.sleep
+        ts.time.sleep = lambda s: None  # the post-start poll shouldn't make the suite wait for real
+        ts.fetch_nodes = lambda cfg, show_all: ([node], {})
+        ts.resolve_connection = lambda n, ns_, cfg, devices: ("franc", 22, ["-p", "22"])
+        ts.check_sunshine = lambda base, user, ip: next(check_iter)
+        ts.remote_platform = lambda base, user, ip: platform
+        ts.termux_handoff = lambda ip: handoffs.append(ip)
+        ts.detect_platform = lambda: "termux" if termux else "arch"
+        ts.subprocess.call = fake_call
+        try:
+            rc = ts.cmd_gui(ns, {}, {}, "mesh")
+        finally:
+            for n, v in saved.items():
+                setattr(ts, n, v)
+            ts.subprocess.call, ts.time.sleep = saved_call, saved_sleep
+        return rc, ssh_calls, handoffs
+
+    def test_already_running_touches_nothing(self):
+        rc, calls, handoffs = self._run_gui([(True, True)], termux=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, [])                 # no install, no start
+        self.assertEqual(handoffs, ["100.64.0.11"])  # straight to the Moonlight handoff
+
+    def test_not_installed_on_non_arch_stops_without_installing(self):
+        rc, calls, handoffs = self._run_gui([(False, False)], platform="debian")
+        self.assertEqual(rc, 1)
+        self.assertEqual(calls, [])
+        self.assertEqual(handoffs, [])
+
+    def test_arch_installs_then_starts_then_hands_off(self):
+        # check #1: not installed. after install: installed, not running. after start: running.
+        rc, calls, handoffs = self._run_gui([(False, False), (True, False), (True, True)], termux=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][:2], ["ssh", "-t"])       # -t: sudo may need to prompt on a real tty
+        self.assertEqual(calls[0][-1], ts.ARCH_SUNSHINE_INSTALL)
+        self.assertEqual(calls[1][-1], ts.SUNSHINE_START)
+        self.assertEqual(handoffs, ["100.64.0.11"])
+
+    def test_failed_install_does_not_go_on_to_start(self):
+        rc, calls, handoffs = self._run_gui([(False, False)], call_rcs=(1,))
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(calls), 1)             # only the install attempt
+        self.assertEqual(handoffs, [])
+
+    def test_install_that_exits_cleanly_but_leaves_nothing_is_not_blamed_on_the_display(self):
+        rc, calls, handoffs = self._run_gui([(False, False)])   # still not installed after the install ran
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(calls), 1)             # the install only -- never tries to start what isn't there
+        self.assertEqual(handoffs, [])
+
+    def test_service_that_takes_a_moment_to_appear_is_still_caught(self):
+        # not running for the first two polls after start, then up -- must not be reported as a failure
+        rc, calls, handoffs = self._run_gui([(True, False), (True, False), (True, False), (True, True)],
+                                            termux=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(handoffs, ["100.64.0.11"])
+
+    def test_start_that_does_not_take_reports_display_hint_and_fails(self):
+        rc, calls, handoffs = self._run_gui([(True, False), (True, False)], termux=True)
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][-1], ts.SUNSHINE_START)
+        self.assertEqual(handoffs, [])              # never claims success it doesn't have
+
+
+class TestTermuxHandoff(unittest.TestCase):
+    """termux_handoff()'s command construction, against mocked termux-api/pm/monkey binaries
+    (these are Android-only tools that can't exist for real in this sandbox)."""
+
+    def _env(self, t, have_moonlight):
+        (t / "clip.txt").write_text("")
+        (t / "monkey_calls.jsonl").write_text("")
+        package = "com.limelight" if have_moonlight else "com.other"
+        (t / "pm").write_text(f"#!/usr/bin/env python3\nprint('package:{package}')\n")
+        (t / "pm").chmod(0o755)
+        (t / "termux-clipboard-set").write_text(
+            "#!/usr/bin/env python3\nimport sys\nopen(sys.argv[0].rsplit('/',1)[0]+'/clip.txt','w')"
+            ".write(sys.stdin.read())\n")
+        (t / "termux-clipboard-set").chmod(0o755)
+        (t / "monkey").write_text(
+            "#!/usr/bin/env python3\nimport json,sys,os\n"
+            "d=os.path.dirname(sys.argv[0])\n"
+            "open(d+'/monkey_calls.jsonl','a').write(json.dumps(sys.argv[1:])+'\\n')\n")
+        (t / "monkey").chmod(0o755)
+        return dict(os.environ, PATH=f"{t}:{os.environ['PATH']}")
+
+    def test_moonlight_installed_copies_clip_and_launches(self):
+        t = Path(tempfile.mkdtemp())
+        env = self._env(t, have_moonlight=True)
+        old_path = os.environ.get("PATH")
+        os.environ["PATH"] = env["PATH"]
+        try:
+            ts.termux_handoff("100.64.0.11")
+        finally:
+            os.environ["PATH"] = old_path
+        self.assertEqual((t / "clip.txt").read_text(), "100.64.0.11")
+        calls = [json.loads(l) for l in (t / "monkey_calls.jsonl").read_text().splitlines()]
+        self.assertIn(["-p", "com.limelight", "-c", "android.intent.category.LAUNCHER", "1"], calls)
+
+    def test_moonlight_missing_does_not_launch(self):
+        t = Path(tempfile.mkdtemp())
+        env = self._env(t, have_moonlight=False)
+        old_path = os.environ.get("PATH")
+        os.environ["PATH"] = env["PATH"]
+        try:
+            ts.termux_handoff("100.64.0.11")
+        finally:
+            os.environ["PATH"] = old_path
+        self.assertEqual((t / "clip.txt").read_text(), "100.64.0.11")  # still copies the address
+        self.assertEqual((t / "monkey_calls.jsonl").read_text(), "")   # but never launches
+
+
 class TestAccounts(unittest.TestCase):
     """Multiple Tailscale accounts on one device: real `tailscale switch` passthrough where a
     CLI exists, named API-key profiles (our own bookkeeping) where it doesn't (Termux)."""
@@ -670,6 +934,23 @@ class TestCommands(unittest.TestCase):
         r = self.e.run("old-laptop", "-u", "x")
         self.assertEqual(r.returncode, 1)                            # "Try anyway?" defaults to No
         self.assertIn("offline", r.stdout)
+
+    def test_gui_is_a_subcommand_not_a_device_name(self):
+        """'gui' must reach cmd_gui, not fall through to 'connect to a device called gui'. An
+        unknown device given to it should be reported by gui's own lookup, same as connect's."""
+        r = self.e.run("gui", "zzz-not-a-device")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("No device matches 'zzz-not-a-device'", r.stderr)
+        self.assertNotIn("No device matches 'gui'", r.stderr)
+        self.assertIn("gui [device]", self.e.run("--help").stdout)
+
+    def test_gui_ambiguous_device(self):
+        e = Env()
+        e.status["Peer"]["k8"] = peer("mint-laptop", "127.0.0.10")
+        e.write_status()
+        r = e.run("gui", "mint")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("ambiguous", r.stderr)
 
     def test_forget(self):
         e = Env()

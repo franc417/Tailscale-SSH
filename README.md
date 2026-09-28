@@ -91,6 +91,38 @@ docs are explicit about this), and on Android that's whichever account the Tails
 app itself is signed in to. So switching profiles here only shows a usefully different
 device list if the Tailscale app is *also* signed in to that account.
 
+## Remote desktop (experimental)
+
+```
+mesh gui            # pick a device, get its full desktop
+mesh gui arch       # or name it
+```
+
+Builds on [Sunshine](https://github.com/LizardByte/Sunshine) (a self-hosted streaming
+host) and [Moonlight](https://moonlight-stream.org) (its client). `mesh gui` does the
+part that's scriptable: over the SSH connection mesh already has, it checks whether
+Sunshine is installed and running on the target, installs it if not (**Arch only for
+now**, via LizardByte's own pacman repo -- the AUR package isn't one they support),
+starts it, and confirms it's up. On Termux it then copies the target's address to your
+clipboard and opens Moonlight. Because it all rides the tailnet, there's no relay or
+rendezvous server to run, unlike RustDesk -- Tailscale already solves that part.
+
+Two limits, both checked rather than assumed:
+
+- **The first connection to each device is a manual step inside Moonlight.** Moonlight
+  has no documented way to be launched pre-pointed at a host (someone asked its
+  maintainers exactly this; it went unanswered), so you do "+ Add PC", paste the address
+  mesh copied, and enter the PIN once. After that Moonlight remembers the device.
+- **Sunshine captures a real, logged-in display.** A closed laptop lid or no active
+  session means there's nothing to capture. A virtual/dummy display would fix that; it
+  isn't built yet.
+
+Status: the SSH orchestration is tested against a real `sshd`, and the branching logic
+is covered too. What has *not* been run against real hardware is the Arch install/start
+itself and the Android side (`termux-clipboard-set`, launching Moonlight) -- there's no
+Arch box or phone in the test environment. Treat it as experimental until it's been run
+for real.
+
 ## Why there's no config file to edit
 
 The original design (see `docs/DESIGN-NOTES.md`) used `sshph.conf` / `tarch.conf` files

@@ -40,7 +40,7 @@ try:  # POSIX only; Windows falls back to a numbered prompt
 except ImportError:  # pragma: no cover
     termios = tty = None
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 REPO = "franc417/Tailscale-SSH"
 REPO_FILE = "tailscale_ssh.py"
 BRAND = "tailscale-ssh"  # set for real in main(); module default for direct imports
@@ -921,7 +921,11 @@ def install_pubkey(pubkey_path: Path, ssh_base: list, user: str, ip: str) -> boo
         return False
 
 
-def connect(node: Node, ns, cfg: dict, devices: dict, remote_cmd: list) -> int:
+def resolve_connection(node: Node, ns, cfg: dict, devices: dict):
+    """Work out (user, port, ssh_base_args) for reaching `node`, prompting only for whatever
+    isn't already known, and offering to install our key on a device we haven't used before.
+    Returns None if the person declines to proceed (offline node, no SSH detected). Shared by
+    connect() and gui() -- both need the identical resolution, not two copies of it."""
     if node.is_self:
         die("That's this device.")
     android = node.os.lower() == "android"
@@ -934,12 +938,12 @@ def connect(node: Node, ns, cfg: dict, devices: dict, remote_cmd: list) -> int:
     if not node.online:
         warn(f"{node.name} is offline (last seen {ago(node.last_seen)}).")
         if not confirm("Try anyway?", False):
-            return 1
+            return None
     elif not node.ssh_port and not ns.port:
         warn(f"{node.name} is online but no SSH server answered on ports {', '.join(map(str, cfg['probe_ports']))}.")
         info("Start sshd there, or give the port yourself: -p PORT")
         if not confirm("Try anyway?", True):
-            return 1
+            return None
 
     user = ns.user or rec.get("user")
     new_device = not rec.get("user")
@@ -969,10 +973,18 @@ def connect(node: Node, ns, cfg: dict, devices: dict, remote_cmd: list) -> int:
                     ok(f"Key installed on {node.name}")
                 else:
                     warn(f"Couldn't install the key automatically -- you may be asked for {node.name}'s password.")
-    identity = ns.identity or cfg.get("identity")
 
     devices[node.name] = {"user": user, "port": int(port), "last_used": time.time()}
     save_json(DEV_FILE, devices)
+    return user, port, base
+
+
+def connect(node: Node, ns, cfg: dict, devices: dict, remote_cmd: list) -> int:
+    resolved = resolve_connection(node, ns, cfg, devices)
+    if not resolved:
+        return 1
+    user, port, base = resolved
+    identity = ns.identity or cfg.get("identity")
 
     if not shutil.which("ssh"):
         hint = {"termux": "pkg install openssh", "arch": "sudo pacman -S openssh",
@@ -989,6 +1001,177 @@ def connect(node: Node, ns, cfg: dict, devices: dict, remote_cmd: list) -> int:
     print(paint(f"{g('arrow')} ", "accent") + paint(node.name, "bold") + paint(f"  {user}@{node.ip}:{port}  {detail}", "dim"))
     sys.stdout.flush()
     os.execvp("ssh", cmd)
+
+
+# ───────────────────────────── mesh gui (remote desktop) ─────────────────────────────
+#
+# Orchestrates Sunshine (self-hosted GameStream host) on the target over the same SSH
+# connection mesh already has, then hands off to Moonlight (the client) on this device.
+# Tailscale is doing the hard part here for free: Sunshine's ports are only ever reachable
+# over the tailnet, so there's no relay/rendezvous server to run, unlike e.g. RustDesk.
+#
+# Two honest limits, checked rather than assumed:
+#  - Moonlight has no documented way to be launched pre-pointed at a host (confirmed: an
+#    open question on their own tracker, never answered -- github.com/moonlight-stream/
+#    moonlight-android/issues/878). So the first connection to a new device still needs one
+#    manual "+ Add PC" + paste + PIN step inside Moonlight; after that it remembers the host.
+#  - Sunshine needs a real, logged-in display session to capture -- it can't grab a screen
+#    that isn't there. A closed lid / no active session on the target means this won't work
+#    yet; that's a separate, unsolved problem (a virtual/dummy display), not a bug here.
+
+ARCH_SUNSHINE_INSTALL = r"""
+set -e
+if ! grep -q '^\[lizardbyte\]' /etc/pacman.conf; then
+  printf '\n[lizardbyte]\nSigLevel = Optional\nServer = https://github.com/LizardByte/pacman-repo/releases/latest/download\n' | sudo tee -a /etc/pacman.conf >/dev/null
+fi
+sudo pacman -Sy --noconfirm
+sudo pacman -S --needed --noconfirm lizardbyte/sunshine
+""".strip()
+
+SUNSHINE_START = 'export XDG_RUNTIME_DIR="/run/user/$(id -u)"; systemctl --user enable --now sunshine'
+
+
+def check_sunshine(base: list, user: str, ip: str):
+    """(installed, running) on the target, or (None, None) if we couldn't even check."""
+    script = ('command -v sunshine >/dev/null 2>&1 && echo I=1 || echo I=0; '
+              'pgrep -x sunshine >/dev/null 2>&1 && echo R=1 || echo R=0')
+    try:
+        p = subprocess.run(["ssh", *base, "-o", "BatchMode=yes", f"{user}@{ip}", script],
+                           capture_output=True, text=True, timeout=15)
+    except (subprocess.TimeoutExpired, OSError):
+        return None, None
+    if not p.stdout:
+        return None, None
+    return ("I=1" in p.stdout), ("R=1" in p.stdout)
+
+
+def wait_for_sunshine(base: list, user: str, ip: str, tries: int = 6, delay: float = 1.0) -> bool:
+    """`systemctl --user enable --now` returns before the process necessarily shows up, so
+    poll briefly instead of reporting failure for a service that's a second from being up."""
+    for i in range(tries):
+        _, running = check_sunshine(base, user, ip)
+        if running:
+            return True
+        if i < tries - 1:
+            time.sleep(delay)
+    return False
+
+
+def remote_platform(base: list, user: str, ip: str) -> str:
+    """Same idea as detect_platform(), but for the far end of the SSH connection."""
+    script = '. /etc/os-release 2>/dev/null; echo "${ID:-}:${ID_LIKE:-}"'
+    try:
+        p = subprocess.run(["ssh", *base, "-o", "BatchMode=yes", f"{user}@{ip}", script],
+                           capture_output=True, text=True, timeout=15)
+    except (subprocess.TimeoutExpired, OSError):
+        return "unknown"
+    ids = p.stdout.strip().lower()
+    if "arch" in ids:
+        return "arch"
+    if any(x in ids for x in ("debian", "ubuntu", "linuxmint")):
+        return "debian"
+    if any(x in ids for x in ("fedora", "rhel", "centos")):
+        return "fedora"
+    return "linux"
+
+
+def termux_handoff(ip: str) -> None:
+    """Best-effort convenience on the phone once Sunshine is confirmed running: copy the
+    host's address so it's one paste instead of a typed-out Tailscale IP, and bring Moonlight
+    to the foreground if it's there. See the limits noted above the ARCH_SUNSHINE_INSTALL
+    script -- this can't skip the one-time "Add PC" + PIN step Moonlight itself requires."""
+    if shutil.which("termux-clipboard-set"):
+        try:
+            subprocess.run(["termux-clipboard-set"], input=ip, text=True, timeout=5)
+            info(f"Copied {ip} to your clipboard.")
+        except (subprocess.TimeoutExpired, OSError):
+            info(f"Host address: {ip}")
+    else:
+        info(f"Host address: {ip}  (install termux-api for auto-copy: pkg install termux-api)")
+
+    have_moonlight = False
+    if shutil.which("pm"):
+        try:
+            p = subprocess.run(["pm", "list", "packages", "com.limelight"],
+                               capture_output=True, text=True, timeout=5)
+            have_moonlight = "com.limelight" in p.stdout
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    if not have_moonlight:
+        warn("Moonlight isn't installed.")
+        info("Get it: https://play.google.com/store/apps/details?id=com.limelight")
+        return
+    if shutil.which("monkey"):
+        run(["monkey", "-p", "com.limelight", "-c", "android.intent.category.LAUNCHER", "1"])
+    info("First time on this device? In Moonlight: + Add PC -> paste the address -> pair with the PIN shown.")
+    info("After that, Moonlight remembers it -- just tap it next time.")
+
+
+def cmd_gui(ns, cfg, devices, brand) -> int:
+    target = ns.words[1] if len(ns.words) > 1 else None
+    if target:
+        try:
+            nodes, _ = fetch_nodes(cfg, True)
+        except TSError as e:
+            die(str(e), e.hint)
+        hits = match_node(nodes, target)
+        if not hits:
+            die(f"No device matches '{target}'.", f"Devices: {', '.join(n.name for n in nodes) or 'none'}")
+        if len(hits) > 1:
+            die(f"'{target}' is ambiguous: {', '.join(n.name for n in hits)}")
+        node = hits[0]
+    else:
+        mon = Monitor(cfg, devices, ns.all)
+        interactive = termios and sys.stdin.isatty() and sys.stdout.isatty()
+        node = pick_interactive(mon, brand) if interactive else pick_numbered(mon, brand)
+        if not node:
+            return 0
+
+    resolved = resolve_connection(node, ns, cfg, devices)
+    if not resolved:
+        return 1
+    user, port, base = resolved
+
+    head(f"Remote desktop on {node.name}")
+    installed, running = check_sunshine(base, user, node.ip)
+    if installed is None:
+        die("Couldn't check Sunshine's status over SSH.", "Is the device reachable, with your key installed?")
+
+    if not installed:
+        plat = remote_platform(base, user, node.ip)
+        if plat != "arch":
+            warn(f"Sunshine isn't installed on {node.name}; auto-install is only wired up for Arch so far.")
+            info("Install it there yourself: https://docs.lizardbyte.dev/projects/sunshine/latest/about/installation.html")
+            return 1
+        info(f"Sunshine isn't installed on {node.name}. Installing via LizardByte's pacman repo...")
+        info("This runs sudo on the remote end -- you may be asked for its password there.")
+        rc = subprocess.call(["ssh", "-t", *base, f"{user}@{node.ip}", ARCH_SUNSHINE_INSTALL])
+        if rc != 0:
+            bad("Install didn't finish cleanly.")
+            return 1
+        installed, running = check_sunshine(base, user, node.ip)
+        if not installed:
+            # a clean exit isn't proof: don't go on to blame the display for what's really a missing package
+            bad(f"The install finished, but Sunshine still isn't there on {node.name}.")
+            return 1
+
+    if not running:
+        info(f"Starting Sunshine on {node.name}...")
+        subprocess.call(["ssh", "-t", *base, f"{user}@{node.ip}", SUNSHINE_START])
+        if not wait_for_sunshine(base, user, node.ip):
+            warn(f"Couldn't confirm Sunshine is running on {node.name}.")
+            info("Usually means no one's logged into a graphical session there yet --")
+            info("Sunshine needs a real display to capture (a closed laptop lid, for one).")
+            return 1
+
+    ok(f"Sunshine is running on {node.name}")
+    info(f"Pairing page (first time only): https://{node.ip}:47990")
+
+    if detect_platform() == "termux":
+        termux_handoff(node.ip)
+    else:
+        info(f"Open Moonlight and connect to {node.ip}.")
+    return 0
 
 
 # ───────────────────────────── commands ─────────────────────────────
@@ -1383,6 +1566,7 @@ HELP = """\
 
   list [--json] [-a]          show devices once
   watch                       live view without connecting
+  gui [device]                remote desktop (experimental): sets up Sunshine there, opens Moonlight
   setup [--account NAME]      first-run wizard: Tailscale, SSH server, key
   accounts [use <name>|add]   list/switch/add Tailscale accounts on this device
   doctor                      diagnose problems
@@ -1394,7 +1578,7 @@ options: -u USER  -p PORT  -i KEYFILE  -a/--all (include devices shared with you
          -y (assume yes)  --plain (no colour)  -V/--version
 """
 
-SUBS = {"list", "ls", "watch", "setup", "accounts", "doctor", "update", "forget", "config", "version", "help"}
+SUBS = {"list", "ls", "watch", "gui", "setup", "accounts", "doctor", "update", "forget", "config", "version", "help"}
 
 
 def main(argv=None) -> int:
@@ -1460,6 +1644,8 @@ def main(argv=None) -> int:
         return cmd_list(ns, cfg, devices, brand)
     if cmd == "watch":
         return cmd_watch(ns, cfg, devices, brand)
+    if cmd == "gui":
+        return cmd_gui(ns, cfg, devices, brand)
 
     if cmd:  # direct connect
         target = cmd

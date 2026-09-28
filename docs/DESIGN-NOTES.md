@@ -132,3 +132,29 @@ also signed in to that same account, since our profile switch and the Android ap
 active session are two independent things. Real network-level switching only exists
 where Tailscale's own fast user switching exists (Linux, macOS, iOS, Windows -- not
 Android), which is why the CLI-based path can honestly claim more than the Termux path.
+
+**New in 0.4.0 (experimental): `mesh gui`, remote desktop.** The idea was RustDesk's
+experience without RustDesk's infrastructure. RustDesk needs its own ID and relay servers
+because it can't assume anything about how two devices reach each other; here Tailscale
+already answers that, so the design reduces to orchestrating two existing, mature
+projects -- Sunshine on the target (capture + hardware encode) and Moonlight on the
+client (decode + render + input) -- instead of writing a capture/codec pipeline.
+
+Things checked before building, because the first sketch assumed them:
+
+- *Can Moonlight be launched pre-pointed at a host?* No documented way exists; the one
+  upstream issue asking is unanswered. The first sketch drew "launch Moonlight via
+  intent, pre-filled" -- that was wrong. What mesh can honestly do is copy the address
+  and bring the app forward; the first connection per device stays a manual "Add PC" +
+  PIN, after which Moonlight remembers it.
+- *How to install Sunshine on Arch?* It's AUR-only in the official ecosystem, and its
+  maintainers explicitly don't support the AUR package. They publish a pacman repo
+  instead, which needs no AUR helper and no compiling.
+
+Two bugs found in my own first version while testing it, both fixed: a clean exit from
+the installer was trusted as proof Sunshine was installed (a missing package would then
+have been blamed on "no graphical session"), and the running-check ran instantly after
+`systemctl --user enable --now`, before the process necessarily existed.
+
+Not verified against real hardware: the Arch install/start, and the Android handoff.
+Still open: capture needs a real display session, so a closed lid means no stream.
