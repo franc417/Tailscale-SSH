@@ -517,31 +517,37 @@ class TestGui(unittest.TestCase):
         self.assertTrue(self.up, "local sshd never came up")
         base = self._base()
 
-        installed, running = ts.check_sunshine(base, self.TESTUSER, "127.0.0.1")
+        installed, running, err = ts.check_sunshine(base, self.TESTUSER, "127.0.0.1")
         self.assertEqual((installed, running), (False, False))
+        self.assertIsNone(err)
 
         sunshine_bin = Path("/usr/local/bin/sunshine")
         sunshine_bin.write_text("#!/bin/bash\nsleep 30\n")
         sunshine_bin.chmod(0o755)
         try:
-            installed, running = ts.check_sunshine(base, self.TESTUSER, "127.0.0.1")
+            installed, running, err = ts.check_sunshine(base, self.TESTUSER, "127.0.0.1")
             self.assertEqual((installed, running), (True, False))
+            self.assertIsNone(err)
 
             r = subprocess.run(["ssh", *base, f"{self.TESTUSER}@127.0.0.1",
                                 "nohup sunshine >/dev/null 2>&1 & disown; sleep 0.3; echo started"],
                                capture_output=True, text=True, timeout=10)
             self.assertIn("started", r.stdout, r.stderr)
 
-            installed, running = ts.check_sunshine(base, self.TESTUSER, "127.0.0.1")
+            installed, running, err = ts.check_sunshine(base, self.TESTUSER, "127.0.0.1")
             self.assertEqual((installed, running), (True, True))
+            self.assertIsNone(err)
         finally:
             subprocess.run(["ssh", *base, f"{self.TESTUSER}@127.0.0.1", "pkill", "-x", "sunshine"],
                            capture_output=True, timeout=10)
             sunshine_bin.unlink(missing_ok=True)
 
     def test_check_sunshine_unreachable_host(self):
-        r = ts.check_sunshine(["-p", "1", "-o", "BatchMode=yes", "-o", "ConnectTimeout=1"], "nobody", "127.0.0.1")
-        self.assertEqual(r, (None, None))
+        installed, running, err = ts.check_sunshine(
+            ["-p", "1", "-o", "BatchMode=yes", "-o", "ConnectTimeout=1"], "nobody", "127.0.0.1")
+        self.assertIsNone(installed)
+        self.assertIsNone(running)
+        self.assertTrue(err)  # some non-empty reason, not swallowed into a bare (None, None)
 
     def test_remote_platform_real_ssh(self):
         if not self.have_user:
@@ -562,21 +568,24 @@ class TestGuiFlow(unittest.TestCase):
     up -- with the plumbing (ssh, device lookup) patched out. The plumbing itself is covered
     for real in TestGui; this is about the branching."""
 
-    def _run_gui(self, checks, platform="arch", call_rcs=(0, 0), termux=False):
-        """checks: successive (installed, running) results from check_sunshine.
-        Returns (exit_code, ssh_-t_calls, handoff_ips)."""
+    def _run_gui(self, checks, platform="arch", call_rcs=(0, 0), termux=False,
+                confirm_yes=True, key_install_ok=True):
+        """checks: successive check_sunshine results, as (installed, running) or the full
+        (installed, running, error). Returns (exit_code, ssh_-t_calls, handoff_ips, key_installs).
+        """
         import types
         node = ts.Node("arch", ips=["100.64.0.11"], online=True, os="linux")
         ns = types.SimpleNamespace(words=["gui", "arch"], all=False)
+
         def repeating_last(items):  # state persists in reality: once it stops changing, it stays that way
-            items = list(items)
+            items = [x if len(x) == 3 else (*x, None) for x in items]
             for x in items:
                 yield x
             while True:
                 yield items[-1]
 
         check_iter = repeating_last(checks)
-        ssh_calls, handoffs = [], []
+        ssh_calls, handoffs, key_installs = [], [], []
         rc_iter = iter(call_rcs)
 
         def fake_call(cmd, *a, **kw):
@@ -584,7 +593,8 @@ class TestGuiFlow(unittest.TestCase):
             return next(rc_iter, 0)
 
         saved = {n: getattr(ts, n) for n in ("fetch_nodes", "resolve_connection", "check_sunshine",
-                                            "remote_platform", "termux_handoff", "detect_platform")}
+                                            "remote_platform", "termux_handoff", "detect_platform",
+                                            "confirm", "ensure_key", "install_pubkey")}
         saved_call, saved_sleep = ts.subprocess.call, ts.time.sleep
         ts.time.sleep = lambda s: None  # the post-start poll shouldn't make the suite wait for real
         ts.fetch_nodes = lambda cfg, show_all: ([node], {})
@@ -593,30 +603,60 @@ class TestGuiFlow(unittest.TestCase):
         ts.remote_platform = lambda base, user, ip: platform
         ts.termux_handoff = lambda ip: handoffs.append(ip)
         ts.detect_platform = lambda: "termux" if termux else "arch"
+        ts.confirm = lambda *a, **kw: confirm_yes
+        ts.ensure_key = lambda: Path("/fake/id_ed25519")
+        ts.install_pubkey = lambda pub, base, user, ip: key_installs.append(ip) or key_install_ok
         ts.subprocess.call = fake_call
         try:
-            rc = ts.cmd_gui(ns, {}, {}, "mesh")
+            try:
+                rc = ts.cmd_gui(ns, {}, {}, "mesh")
+            except SystemExit as e:  # die() -- same exit code a real subprocess run would show
+                rc = e.code
         finally:
             for n, v in saved.items():
                 setattr(ts, n, v)
             ts.subprocess.call, ts.time.sleep = saved_call, saved_sleep
-        return rc, ssh_calls, handoffs
+        return rc, ssh_calls, handoffs, key_installs
 
     def test_already_running_touches_nothing(self):
-        rc, calls, handoffs = self._run_gui([(True, True)], termux=True)
+        rc, calls, handoffs, _kinst = self._run_gui([(True, True)], termux=True)
         self.assertEqual(rc, 0)
         self.assertEqual(calls, [])                 # no install, no start
         self.assertEqual(handoffs, ["100.64.0.11"])  # straight to the Moonlight handoff
 
+    def test_permission_denied_offers_key_install_and_recovers(self):
+        """The exact bug from the field: a device mesh has used before but never actually got
+        a key onto (install declined/failed the first time) must not be a permanent dead end."""
+        rc, calls, handoffs, kinst = self._run_gui(
+            [(None, None, "Permission denied (publickey)."), (True, True)], termux=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(kinst, ["100.64.0.11"])      # install_pubkey was actually invoked
+        self.assertEqual(handoffs, ["100.64.0.11"])   # ...and gui carried on to finish normally
+
+    def test_permission_denied_declined_fails_with_the_real_reason(self):
+        rc, calls, handoffs, kinst = self._run_gui(
+            [(None, None, "Permission denied (publickey).")], confirm_yes=False)
+        self.assertEqual(rc, 1)
+        self.assertEqual(kinst, [])                   # declined -- never even tried
+        self.assertEqual(handoffs, [])
+
+    def test_unreachable_host_does_not_try_to_install_a_key(self):
+        """A non-auth failure (host down, wrong port...) must not trigger the key-install
+        flow -- that's specific to 'permission denied', not every kind of failure."""
+        rc, calls, handoffs, kinst = self._run_gui(
+            [(None, None, "ssh: connect to host 100.64.0.11 port 22: Connection timed out")])
+        self.assertEqual(rc, 1)
+        self.assertEqual(kinst, [])
+
     def test_not_installed_on_non_arch_stops_without_installing(self):
-        rc, calls, handoffs = self._run_gui([(False, False)], platform="debian")
+        rc, calls, handoffs, _kinst = self._run_gui([(False, False)], platform="debian")
         self.assertEqual(rc, 1)
         self.assertEqual(calls, [])
         self.assertEqual(handoffs, [])
 
     def test_arch_installs_then_starts_then_hands_off(self):
         # check #1: not installed. after install: installed, not running. after start: running.
-        rc, calls, handoffs = self._run_gui([(False, False), (True, False), (True, True)], termux=True)
+        rc, calls, handoffs, _kinst = self._run_gui([(False, False), (True, False), (True, True)], termux=True)
         self.assertEqual(rc, 0)
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][:2], ["ssh", "-t"])       # -t: sudo may need to prompt on a real tty
@@ -625,26 +665,26 @@ class TestGuiFlow(unittest.TestCase):
         self.assertEqual(handoffs, ["100.64.0.11"])
 
     def test_failed_install_does_not_go_on_to_start(self):
-        rc, calls, handoffs = self._run_gui([(False, False)], call_rcs=(1,))
+        rc, calls, handoffs, _kinst = self._run_gui([(False, False)], call_rcs=(1,))
         self.assertEqual(rc, 1)
         self.assertEqual(len(calls), 1)             # only the install attempt
         self.assertEqual(handoffs, [])
 
     def test_install_that_exits_cleanly_but_leaves_nothing_is_not_blamed_on_the_display(self):
-        rc, calls, handoffs = self._run_gui([(False, False)])   # still not installed after the install ran
+        rc, calls, handoffs, _kinst = self._run_gui([(False, False)])   # still not installed after the install ran
         self.assertEqual(rc, 1)
         self.assertEqual(len(calls), 1)             # the install only -- never tries to start what isn't there
         self.assertEqual(handoffs, [])
 
     def test_service_that_takes_a_moment_to_appear_is_still_caught(self):
         # not running for the first two polls after start, then up -- must not be reported as a failure
-        rc, calls, handoffs = self._run_gui([(True, False), (True, False), (True, False), (True, True)],
+        rc, calls, handoffs, _kinst = self._run_gui([(True, False), (True, False), (True, False), (True, True)],
                                             termux=True)
         self.assertEqual(rc, 0)
         self.assertEqual(handoffs, ["100.64.0.11"])
 
     def test_start_that_does_not_take_reports_display_hint_and_fails(self):
-        rc, calls, handoffs = self._run_gui([(True, False), (True, False)], termux=True)
+        rc, calls, handoffs, _kinst = self._run_gui([(True, False), (True, False)], termux=True)
         self.assertEqual(rc, 1)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][-1], ts.SUNSHINE_START)

@@ -40,7 +40,7 @@ try:  # POSIX only; Windows falls back to a numbered prompt
 except ImportError:  # pragma: no cover
     termios = tty = None
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 REPO = "franc417/Tailscale-SSH"
 REPO_FILE = "tailscale_ssh.py"
 BRAND = "tailscale-ssh"  # set for real in main(); module default for direct imports
@@ -1032,24 +1032,30 @@ SUNSHINE_START = 'export XDG_RUNTIME_DIR="/run/user/$(id -u)"; systemctl --user 
 
 
 def check_sunshine(base: list, user: str, ip: str):
-    """(installed, running) on the target, or (None, None) if we couldn't even check."""
+    """(installed, running, error) on the target. installed/running are None, with error set
+    to a short reason, if we couldn't even check -- BatchMode means that's usually either no
+    key installed yet or the host being unreachable, and the caller needs to tell those apart
+    rather than just reporting a generic failure."""
     script = ('command -v sunshine >/dev/null 2>&1 && echo I=1 || echo I=0; '
               'pgrep -x sunshine >/dev/null 2>&1 && echo R=1 || echo R=0')
     try:
         p = subprocess.run(["ssh", *base, "-o", "BatchMode=yes", f"{user}@{ip}", script],
                            capture_output=True, text=True, timeout=15)
-    except (subprocess.TimeoutExpired, OSError):
-        return None, None
+    except subprocess.TimeoutExpired:
+        return None, None, "timed out"
+    except OSError as e:
+        return None, None, str(e)
     if not p.stdout:
-        return None, None
-    return ("I=1" in p.stdout), ("R=1" in p.stdout)
+        lines = [l for l in (p.stderr or "").strip().splitlines() if l]
+        return None, None, (lines[-1] if lines else f"ssh exited {p.returncode}")
+    return ("I=1" in p.stdout), ("R=1" in p.stdout), None
 
 
 def wait_for_sunshine(base: list, user: str, ip: str, tries: int = 6, delay: float = 1.0) -> bool:
     """`systemctl --user enable --now` returns before the process necessarily shows up, so
     poll briefly instead of reporting failure for a service that's a second from being up."""
     for i in range(tries):
-        _, running = check_sunshine(base, user, ip)
+        _, running, _ = check_sunshine(base, user, ip)
         if running:
             return True
         if i < tries - 1:
@@ -1133,9 +1139,20 @@ def cmd_gui(ns, cfg, devices, brand) -> int:
     user, port, base = resolved
 
     head(f"Remote desktop on {node.name}")
-    installed, running = check_sunshine(base, user, node.ip)
+    installed, running, err = check_sunshine(base, user, node.ip)
+    if installed is None and err and "permission denied" in err.lower():
+        # a device mesh has used before stops being offered a key install automatically; if
+        # the very first attempt on it never actually got a key on there, every later run
+        # hits this same wall with no way out short of `mesh forget` -- so offer it again here
+        warn(f"No SSH key seems to be installed on {node.name} yet.")
+        if confirm(f"Install your SSH key on {node.name} now?", True):
+            key = ensure_key()
+            if key and install_pubkey(Path(str(key) + ".pub"), base, user, node.ip):
+                ok(f"Key installed on {node.name}")
+                installed, running, err = check_sunshine(base, user, node.ip)
     if installed is None:
-        die("Couldn't check Sunshine's status over SSH.", "Is the device reachable, with your key installed?")
+        die(f"Couldn't check Sunshine's status over SSH{f': {err}' if err else ''}.",
+            "Is the device reachable, with your key installed?")
 
     if not installed:
         plat = remote_platform(base, user, node.ip)
@@ -1149,7 +1166,7 @@ def cmd_gui(ns, cfg, devices, brand) -> int:
         if rc != 0:
             bad("Install didn't finish cleanly.")
             return 1
-        installed, running = check_sunshine(base, user, node.ip)
+        installed, running, _ = check_sunshine(base, user, node.ip)
         if not installed:
             # a clean exit isn't proof: don't go on to blame the display for what's really a missing package
             bad(f"The install finished, but Sunshine still isn't there on {node.name}.")

@@ -158,3 +158,19 @@ have been blamed on "no graphical session"), and the running-check ran instantly
 
 Not verified against real hardware: the Arch install/start, and the Android handoff.
 Still open: capture needs a real display session, so a closed lid means no stream.
+
+**0.4.1 fix: a device mesh had used before could get permanently stuck.**
+check_sunshine()'s BatchMode SSH call throws away *why* it failed -- useful for a
+clean "not reachable yet" message, less useful when the real reason was "no key was
+ever actually installed here." And resolve_connection() only offers to install a key
+on a device it doesn't already have a saved username for -- so if the very first `mesh
+gui` on a device had the install declined, fail, or just never happen, every run after
+that hit the identical silent wall with no way out short of `mesh forget`. Reported from
+a real run: two identical "Couldn't check Sunshine's status over SSH" attempts in a row,
+no prompt either time.
+
+Fixed two ways: check_sunshine now returns the real reason (SSH's own stderr) instead of
+discarding it, and when that reason looks like a permission/key problem specifically --
+not a timeout or an unreachable host, which must not trigger this -- gui offers to
+install the key right there and retries once, the same recovery resolve_connection()
+already does for a device it's never seen before.
