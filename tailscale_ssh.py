@@ -40,7 +40,7 @@ try:  # POSIX only; Windows falls back to a numbered prompt
 except ImportError:  # pragma: no cover
     termios = tty = None
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 REPO = "franc417/Tailscale-SSH"
 REPO_FILE = "tailscale_ssh.py"
 BRAND = "tailscale-ssh"  # set for real in main(); module default for direct imports
@@ -1030,6 +1030,36 @@ sudo pacman -S --needed --noconfirm lizardbyte/sunshine
 
 SUNSHINE_START = 'export XDG_RUNTIME_DIR="/run/user/$(id -u)"; systemctl --user enable --now sunshine'
 
+# Officially documented, required Linux setup (docs.lizardbyte.dev/projects/sunshine) that's
+# easy to miss: Sunshine injects keyboard/mouse/gamepad input through /dev/uinput, which is
+# root-only by default. Without this, video and often mouse still work (they have other
+# paths), but keyboard input silently does nothing -- exactly what was reported after a real
+# first run. This is the udev rule + group membership Sunshine's own docs call for.
+UINPUT_SETUP = r"""
+set -e
+sudo tee /etc/udev/rules.d/85-sunshine.rules >/dev/null <<'RULE'
+KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"
+RULE
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+sudo usermod -aG input "$(whoami)"
+""".strip()
+
+
+def uinput_group_ok(base: list, user: str, ip: str):
+    """True if `user` is already in the 'input' group on the target, False if not, None if we
+    couldn't check. Checked separately (quick, non-interactive) from actually running
+    UINPUT_SETUP so cmd_gui only shows the "log out and back in" notice when it's actually
+    about to change something, not on every run."""
+    try:
+        p = subprocess.run(["ssh", *base, "-o", "BatchMode=yes", f"{user}@{ip}", "groups"],
+                           capture_output=True, text=True, timeout=15)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if not p.stdout:
+        return None
+    return bool(re.search(r"\binput\b", p.stdout))
+
 
 def check_sunshine(base: list, user: str, ip: str):
     """(installed, running, error) on the target. installed/running are None, with error set
@@ -1182,6 +1212,15 @@ def cmd_gui(ns, cfg, devices, brand) -> int:
             return 1
 
     ok(f"Sunshine is running on {node.name}")
+
+    had_uinput = uinput_group_ok(base, user, node.ip)
+    if had_uinput is False:
+        info("Setting up keyboard/mouse input (uinput) -- an easy-to-miss required step on Linux...")
+        subprocess.call(["ssh", "-t", *base, f"{user}@{node.ip}", UINPUT_SETUP])
+        warn(f"Log out and back in on {node.name} once (or reboot) before keyboard/mouse input works.")
+    elif had_uinput is None:
+        info("Couldn't confirm uinput access -- if keyboard/mouse input doesn't work, see the README.")
+
     info(f"Pairing page (first time only): https://{node.ip}:47990")
 
     if detect_platform() == "termux":

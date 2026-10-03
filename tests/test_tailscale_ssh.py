@@ -562,6 +562,27 @@ class TestGui(unittest.TestCase):
         self.assertIn("lizardbyte/sunshine", ts.ARCH_SUNSHINE_INSTALL)
         self.assertIn("pacman-repo/releases/latest/download", ts.ARCH_SUNSHINE_INSTALL)
 
+    def test_uinput_setup_script_is_valid_bash(self):
+        r = subprocess.run(["bash", "-n"], input=ts.UINPUT_SETUP, text=True, capture_output=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("GROUP=\"input\"", ts.UINPUT_SETUP)
+        self.assertIn("usermod -aG input", ts.UINPUT_SETUP)
+
+    def test_uinput_group_ok_real_ssh(self):
+        """A real check against a real account that is (and isn't) in a group named 'input' --
+        not just parsing canned text."""
+        if not self.have_user:
+            self.skipTest("can't create a local test user in this environment")
+        self.assertTrue(self.up, "local sshd never came up")
+        base = self._base()
+        self.assertFalse(ts.uinput_group_ok(base, self.TESTUSER, "127.0.0.1"))  # fresh user: not in it yet
+        subprocess.run(["groupadd", "-f", "input"], check=True)
+        subprocess.run(["usermod", "-aG", "input", self.TESTUSER], check=True)
+        try:
+            self.assertTrue(ts.uinput_group_ok(base, self.TESTUSER, "127.0.0.1"))
+        finally:
+            subprocess.run(["gpasswd", "-d", self.TESTUSER, "input"], capture_output=True)
+
 
 class TestGuiFlow(unittest.TestCase):
     """cmd_gui's decision logic -- which remote commands run, in what order, and when it gives
@@ -569,7 +590,7 @@ class TestGuiFlow(unittest.TestCase):
     for real in TestGui; this is about the branching."""
 
     def _run_gui(self, checks, platform="arch", call_rcs=(0, 0), termux=False,
-                confirm_yes=True, key_install_ok=True):
+                confirm_yes=True, key_install_ok=True, uinput_ok=True):
         """checks: successive check_sunshine results, as (installed, running) or the full
         (installed, running, error). Returns (exit_code, ssh_-t_calls, handoff_ips, key_installs).
         """
@@ -594,7 +615,7 @@ class TestGuiFlow(unittest.TestCase):
 
         saved = {n: getattr(ts, n) for n in ("fetch_nodes", "resolve_connection", "check_sunshine",
                                             "remote_platform", "termux_handoff", "detect_platform",
-                                            "confirm", "ensure_key", "install_pubkey")}
+                                            "confirm", "ensure_key", "install_pubkey", "uinput_group_ok")}
         saved_call, saved_sleep = ts.subprocess.call, ts.time.sleep
         ts.time.sleep = lambda s: None  # the post-start poll shouldn't make the suite wait for real
         ts.fetch_nodes = lambda cfg, show_all: ([node], {})
@@ -606,6 +627,7 @@ class TestGuiFlow(unittest.TestCase):
         ts.confirm = lambda *a, **kw: confirm_yes
         ts.ensure_key = lambda: Path("/fake/id_ed25519")
         ts.install_pubkey = lambda pub, base, user, ip: key_installs.append(ip) or key_install_ok
+        ts.uinput_group_ok = lambda base, user, ip: uinput_ok
         ts.subprocess.call = fake_call
         try:
             try:
@@ -623,6 +645,26 @@ class TestGuiFlow(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(calls, [])                 # no install, no start
         self.assertEqual(handoffs, ["100.64.0.11"])  # straight to the Moonlight handoff
+
+    def test_uinput_already_set_up_is_silent(self):
+        rc, calls, handoffs, _ = self._run_gui([(True, True)], termux=True, uinput_ok=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, [])  # no extra ssh -t call when nothing needs fixing
+
+    def test_uinput_missing_runs_setup_and_warns(self):
+        rc, calls, handoffs, _ = self._run_gui([(True, True)], termux=True, uinput_ok=False)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:2], ["ssh", "-t"])
+        self.assertEqual(calls[0][-1], ts.UINPUT_SETUP)
+        self.assertEqual(handoffs, ["100.64.0.11"])  # still finishes -- this is a warning, not a failure
+
+    def test_uinput_check_unreachable_does_not_block_success(self):
+        """Can't confirm uinput access (None) is advisory -- must not fail the whole run."""
+        rc, calls, handoffs, _ = self._run_gui([(True, True)], termux=True, uinput_ok=None)
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, [])
+        self.assertEqual(handoffs, ["100.64.0.11"])
 
     def test_permission_denied_offers_key_install_and_recovers(self):
         """The exact bug from the field: a device mesh has used before but never actually got

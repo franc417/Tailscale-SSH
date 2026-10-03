@@ -174,3 +174,19 @@ discarding it, and when that reason looks like a permission/key problem specific
 not a timeout or an unreachable host, which must not trigger this -- gui offers to
 install the key right there and retries once, the same recovery resolve_connection()
 already does for a device it's never seen before.
+
+**0.4.2 fix: no keyboard input.** Reported from the first real successful connection --
+mouse and video worked, keyboard did nothing. Root cause, confirmed against Sunshine's own
+docs (docs.lizardbyte.dev): Sunshine injects keyboard/mouse/gamepad input through
+/dev/uinput, which is root-only by default on Linux. This is an officially required setup
+step (a udev rule granting the `input` group access, plus adding the user to that group) --
+easy to miss because it's a separate manual step in Sunshine's own install instructions,
+not something pacman or the LizardByte repo does automatically. The install script never
+did this.
+
+Fixed: gui now checks group membership after confirming Sunshine is running (not just
+right after a fresh install, so it also repairs an existing installation like this one),
+applies the udev rule + group membership if missing, and tells the person to log out and
+back in once -- group membership changes don't apply to an already-running login session,
+only udev's own device permissions do, so this can't be fully silent no matter how it's
+automated.

@@ -117,11 +117,17 @@ Two limits, both checked rather than assumed:
   session means there's nothing to capture. A virtual/dummy display would fix that; it
   isn't built yet.
 
-Status: the SSH orchestration is tested against a real `sshd`, and the branching logic
-is covered too. What has *not* been run against real hardware is the Arch install/start
-itself and the Android side (`termux-clipboard-set`, launching Moonlight) -- there's no
-Arch box or phone in the test environment. Treat it as experimental until it's been run
-for real.
+**Keyboard/mouse not working after connecting?** Sunshine needs access to `/dev/uinput`
+to inject input, which Linux restricts by default -- `mesh gui` sets this up
+automatically (a udev rule + adding you to the `input` group), but group membership
+doesn't apply to a session that's already logged in. Log out and back in once (or
+reboot) on the host after the first `mesh gui` run there, then try again.
+
+Status: verified end to end against real hardware -- real Arch install via the
+LizardByte repo, real Sunshine start, a real Moonlight connection with working
+video/mouse, and the uinput keyboard fix above (all three issues below were found this
+way and are now fixed). The Android handoff (`termux-clipboard-set`, launching
+Moonlight) is still only tested with mocks for the command plumbing itself.
 
 ## Why there's no config file to edit
 
