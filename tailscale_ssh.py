@@ -40,7 +40,7 @@ try:  # POSIX only; Windows falls back to a numbered prompt
 except ImportError:  # pragma: no cover
     termios = tty = None
 
-__version__ = "0.4.2"
+__version__ = "0.4.3"
 REPO = "franc417/Tailscale-SSH"
 REPO_FILE = "tailscale_ssh.py"
 BRAND = "tailscale-ssh"  # set for real in main(); module default for direct imports
@@ -1069,10 +1069,13 @@ def check_sunshine(base: list, user: str, ip: str):
     script = ('command -v sunshine >/dev/null 2>&1 && echo I=1 || echo I=0; '
               'pgrep -x sunshine >/dev/null 2>&1 && echo R=1 || echo R=0')
     try:
-        p = subprocess.run(["ssh", *base, "-o", "BatchMode=yes", f"{user}@{ip}", script],
-                           capture_output=True, text=True, timeout=15)
+        # ConnectTimeout bounds the TCP handshake itself and gets ssh's own specific reason
+        # ("Connection timed out", "No route to host"...) into stderr for the parsing below,
+        # instead of a bare Python-level timeout with no detail on what actually stalled.
+        p = subprocess.run(["ssh", *base, "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+                            f"{user}@{ip}", script], capture_output=True, text=True, timeout=15)
     except subprocess.TimeoutExpired:
-        return None, None, "timed out"
+        return None, None, "timed out (connected, but the remote check itself didn't finish)"
     except OSError as e:
         return None, None, str(e)
     if not p.stdout:
@@ -1097,8 +1100,8 @@ def remote_platform(base: list, user: str, ip: str) -> str:
     """Same idea as detect_platform(), but for the far end of the SSH connection."""
     script = '. /etc/os-release 2>/dev/null; echo "${ID:-}:${ID_LIKE:-}"'
     try:
-        p = subprocess.run(["ssh", *base, "-o", "BatchMode=yes", f"{user}@{ip}", script],
-                           capture_output=True, text=True, timeout=15)
+        p = subprocess.run(["ssh", *base, "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+                            f"{user}@{ip}", script], capture_output=True, text=True, timeout=15)
     except (subprocess.TimeoutExpired, OSError):
         return "unknown"
     ids = p.stdout.strip().lower()

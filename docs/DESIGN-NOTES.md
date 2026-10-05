@@ -190,3 +190,14 @@ applies the udev rule + group membership if missing, and tells the person to log
 back in once -- group membership changes don't apply to an already-running login session,
 only udev's own device permissions do, so this can't be fully silent no matter how it's
 automated.
+
+**0.4.3 fix: "Couldn't check Sunshine's status over SSH: timed out" with no detail.**
+check_sunshine's ssh call had no ConnectTimeout, so an unreachable host (or a slow/flaky
+mobile+VPN link) fell through to a blanket Python-level 15s timeout with no specifics --
+reported live from a device Sunshine was confirmed running fine on, where the real cause
+was presumably a transient network blip, not Sunshine. Added `-o ConnectTimeout=8` to both
+check_sunshine and remote_platform's ssh calls: a genuinely unreachable host now fails in
+8s with ssh's own specific reason (e.g. "Connection timed out", "No route to host") surfaced
+through the existing stderr-parsing path, instead of a generic message with no detail. The
+outer 15s Python timeout stays as a backstop for the separate, rarer case of the remote
+script itself hanging after a successful connection.
