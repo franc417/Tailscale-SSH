@@ -80,6 +80,24 @@ fetch_engine() {
     || err "Downloaded file failed a sanity check — not installing it."
 }
 
+fetch_agent() {  # fetch_agent <dest>: the host-side input agent. Optional: a failure warns, never blocks the install.
+  local dest="$1" token=""
+  token="${TSSH_TOKEN:-${GITHUB_TOKEN:-}}"
+  AUTH_HEADER=(); AUTH_HEADER_WGET=()
+  if [ -n "$token" ]; then
+    AUTH_HEADER=(-H "Authorization: Bearer $token")
+    AUTH_HEADER_WGET=(--header="Authorization: Bearer $token")
+  fi
+  if fetch "https://raw.githubusercontent.com/$REPO/$REF/mesh_input.py" "$dest.tmp" 2>/dev/null \
+     && python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$dest.tmp" 2>/dev/null; then
+    mv "$dest.tmp" "$dest"
+  else
+    rm -f "$dest.tmp"
+    warn "Could not download the input agent (mesh_input.py); the rest is installed. Re-run the installer later."
+    return 1
+  fi
+}
+
 main() {
   local plat; plat="$(detect_platform)"
   info "◈ tailscale-ssh installer  ($plat)"
@@ -102,6 +120,15 @@ main() {
     fetch_engine "$engine"
   fi
   chmod +x "$engine"
+
+  # The host-side input agent (stdlib-only Python). Phones talk to it; `mesh` can copy it to other computers.
+  local agent="$libdir/mesh_input.py"
+  if [ -f "$here/mesh_input.py" ]; then
+    cp "$here/mesh_input.py" "$agent"
+  else
+    fetch_agent "$agent" || true
+  fi
+  [ -f "$agent" ] && chmod +x "$agent"
 
   cat > "$bindir/$NAME" <<WRAP
 #!/usr/bin/env bash

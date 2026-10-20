@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch: {}
+
+jobs:
+  python:
+    name: Python (engine + host input agent)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: python -m pip install pytest evdev
+      - name: Run tests
+        run: python -m pytest -q
+
+  kotlin:
+    name: Phone library (Kotlin, against the real host agent)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: Test mesh-core (includes the live test against mesh_input.py)
+        working-directory: android
+        run: gradle :mesh-core:test --stacktrace
+      - name: Upload reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesh-core-test-reports
+          path: android/mesh-core/build/reports/tests/test/
