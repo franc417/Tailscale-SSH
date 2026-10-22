@@ -70,8 +70,8 @@ class MainActivity : Activity() {
         column.addView(Ui.gap(this, 12))
 
         nameInput = field("Name (optional)")
-        hostInput = field("Address: IP or Tailscale name", InputType.TYPE_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
-        pairInput = field("Pairing info", InputType.TYPE_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS).apply {
+        hostInput = field("Address: IP or Tailscale name", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
+        pairInput = field("Pairing info", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS).apply {
             minLines = 3
             gravity = Gravity.TOP
         }

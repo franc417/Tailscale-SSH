@@ -88,8 +88,12 @@ jobs:
           set +e
           gradle :input-ui:testDebugUnitTest :app:assembleDebug --stacktrace 2>&1 | tee build.log
           code=${PIPESTATUS[0]}
-          # Publish compile and build errors as annotations (the raw log is not downloadable everywhere)
-          grep -E "^e: |error:|What went wrong|Execution failed|AAPT|Unresolved reference" -A2 build.log | head -9 | while IFS= read -r l; do echo "::error title=build::${l//%/%25}"; done
+          # Publish compile and build errors as ONE annotation (GitHub shows only a few per step, and the raw log
+          # is not downloadable everywhere). Newlines are encoded as %0A.
+          if [ $code -ne 0 ]; then
+            msg=$(grep -E "^e: |error:|What went wrong|Execution failed|AAPT|Unresolved reference|FAILED|^  [A-Za-z].*(Test|test).*FAILED" -A1 build.log | grep -v "^--$" | sed 's#file:///home/runner/work/Tailscale-SSH/Tailscale-SSH/##' | head -40 | sed 's/%/%25/g' | paste -sd '\n' | sed 's/\n/%0A/g')
+            echo "::error title=build::${msg}"
+          fi
           exit $code
       - name: Upload the APK
         if: success()
