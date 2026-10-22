@@ -1,0 +1,4 @@
+#!/bin/sh
+# Test stand-in for sudo: run the command directly. The real sudo resets PATH, which would bypass the
+# mock tailscale in this directory whenever the tests run as a non-root user (as they do in CI).
+exec "$@"

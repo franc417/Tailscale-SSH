@@ -34,6 +34,15 @@ def strip(s):
     return ANSI.sub("", s)
 
 
+
+def _ensure_privsep_dir():
+    """sshd's privilege-separation directory. Root can create it; an ordinary user (CI) cannot, and
+    does not need to, because sshd only insists on it when it runs as root."""
+    try:
+        Path("/run/sshd").mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        pass
+
 class Listener(threading.Thread):
     """Accepts connections on ip:0 and sends an SSH banner (or junk)."""
 
@@ -339,7 +348,7 @@ class TestInstallPubkey(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        Path("/run/sshd").mkdir(parents=True, exist_ok=True)  # sshd's privsep dir; not always pre-created
+        _ensure_privsep_dir()  # sshd's privsep dir; not always pre-created
         subprocess.run(["userdel", "-r", cls.TESTUSER], capture_output=True)  # in case a prior run left it
         r = subprocess.run(["useradd", "-m", "-s", "/bin/bash", cls.TESTUSER], capture_output=True, text=True)
         cls.have_user = r.returncode == 0
@@ -447,7 +456,7 @@ class TestGui(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        Path("/run/sshd").mkdir(parents=True, exist_ok=True)
+        _ensure_privsep_dir()
         subprocess.run(["pkill", "-KILL", "-u", cls.TESTUSER], capture_output=True)
         subprocess.run(["userdel", "-r", cls.TESTUSER], capture_output=True)
         r = subprocess.run(["useradd", "-m", "-s", "/bin/bash", cls.TESTUSER], capture_output=True, text=True)

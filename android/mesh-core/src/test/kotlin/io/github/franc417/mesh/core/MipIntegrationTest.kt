@@ -102,8 +102,14 @@ class MipIntegrationTest {
         return false
     }
 
+    /** In CI (MESH_REQUIRE_INTEGRATION=1) a missing python3/openssl is a failure, never a silent pass. */
+    private val required = System.getenv("MESH_REQUIRE_INTEGRATION") == "1"
+
     private fun withAgent(block: (Agent) -> Unit) {
-        if (!canRun) return
+        if (!canRun) {
+            check(!required) { "the live agent tests are required here but python3, openssl or mesh_input.py is missing" }
+            return
+        }
         val agent = startAgent()
         try { block(agent) } finally { agent.stop() }
     }
@@ -223,7 +229,10 @@ class MipIntegrationTest {
 
     @Test
     fun `nothing listening gives a plain error`() {
-        if (!canRun) return
+        if (!canRun) {
+            check(!required) { "the live agent tests are required here but python3, openssl or mesh_input.py is missing" }
+            return
+        }
         val port = ServerSocket(0).use { it.localPort }
         var error: MipException? = null
         try {
