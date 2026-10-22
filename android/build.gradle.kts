@@ -1,4 +1,7 @@
 plugins {
+    id("com.android.application") version "8.7.2" apply false
+    id("com.android.library") version "8.7.2" apply false
+    id("org.jetbrains.kotlin.android") version "2.0.20" apply false
     // Plugin versions are pinned here, once, and subprojects apply them without a version.
     // (Declaring a version in a subproject as well is a well-known source of plugin version
     // conflicts in multi-module builds.) Kotlin 2.0.20 is the compiler the code is also

@@ -26,7 +26,7 @@ import javax.net.ssl.SSLSocket
  *  - A ping every few seconds measures round-trip time and proves the host is alive; the
  *    host closing or going silent ends the session and is reported once.
  */
-class MipClient(private val config: Config, private val listener: Listener) {
+class MipClient(private val config: Config, private val listener: Listener) : InputSink {
 
     class Config(
         val host: String,
@@ -168,7 +168,7 @@ class MipClient(private val config: Config, private val listener: Listener) {
 
     // ------------------------------------------------------------------ sending
 
-    fun move(dx: Float, dy: Float) {
+    override fun move(dx: Float, dy: Float) {
         synchronized(motionLock) {
             pendingDx += dx
             pendingDy += dy
@@ -178,7 +178,7 @@ class MipClient(private val config: Config, private val listener: Listener) {
         post { flushMotion() }
     }
 
-    fun scroll(vertical: Float, horizontal: Float = 0f) {
+    override fun scroll(vertical: Float, horizontal: Float) {
         synchronized(motionLock) {
             pendingScrollV += vertical
             pendingScrollH += horizontal
@@ -188,12 +188,12 @@ class MipClient(private val config: Config, private val listener: Listener) {
         post { flushMotion() }
     }
 
-    fun button(button: Int, down: Boolean) = send(MipCodec.button(button, down))
+    override fun button(button: Int, down: Boolean) = send(MipCodec.button(button, down))
 
-    fun key(code: String, down: Boolean) = send(MipCodec.key(code, down))
+    override fun key(code: String, down: Boolean) = send(MipCodec.key(code, down))
 
     /** Types text on the computer (any length; sent in pieces that fit a frame). */
-    fun text(text: String) {
+    override fun text(text: String) {
         for (chunk in MipCodec.textChunks(text)) send(MipCodec.text(chunk))
     }
 

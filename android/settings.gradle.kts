@@ -16,3 +16,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "mesh"
 include(":mesh-core")
+include(":input-ui")
+include(":app")
