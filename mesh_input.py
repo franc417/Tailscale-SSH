@@ -24,6 +24,8 @@ Commands:
   python3 mesh_input.py init                 create the certificate and token
   python3 mesh_input.py pair-info            print what the phone needs, as JSON
   python3 mesh_input.py run [--port N]       serve (needs /dev/uinput access)
+  python3 mesh_input.py install-service      start at every login and restart on failure (systemd user service)
+  python3 mesh_input.py uninstall-service    stop and remove that service
 """
 
 import argparse
@@ -728,13 +730,88 @@ async def serve(directory: str, port: int, injector: Injector, log=_log, host: s
         await tls.serve_forever()
 
 
+# ---------------------------------------------------------------- service (start at login, restart on failure)
+
+SERVICE_NAME = "mesh-input.service"
+
+
+def service_unit(python: str, script: str, port: int, directory: Optional[str] = None) -> str:
+    """The systemd user unit. Runs as you (it needs your /dev/uinput access, like Sunshine), starts at login,
+    and comes back by itself if it ever stops."""
+    command = f"{python} {script} run --port {port}"
+    if directory and directory != default_dir():
+        command += f" --dir {directory}"
+    return (
+        "[Unit]\n"
+        "Description=Mesh input channel (phone keyboard and trackpad)\n"
+        "After=network.target\n"
+        "\n"
+        "[Service]\n"
+        f"ExecStart={command}\n"
+        "Restart=on-failure\n"
+        "RestartSec=2\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+
+
+def unit_dir() -> str:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "systemd", "user")
+
+
+def install_service(port: int, directory: Optional[str] = None, start: bool = True,
+                    target_dir: Optional[str] = None, runner=subprocess.run) -> str:
+    """Writes the unit and (unless start is False) enables and starts it. Makes the certificate and token
+    first, so the very first start already has them. Returns a message for the user."""
+    ensure_identity(directory or default_dir())
+    target = target_dir or unit_dir()
+    os.makedirs(target, exist_ok=True)
+    path = os.path.join(target, SERVICE_NAME)
+    with open(path, "w") as f:
+        f.write(service_unit(sys.executable, os.path.abspath(__file__), port, directory))
+    if not start:
+        return f"service written to {path} (not started)"
+    for args in (["daemon-reload"], ["enable", "--now", SERVICE_NAME]):
+        result = runner(["systemctl", "--user", *args], capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"`systemctl --user {' '.join(args)}` failed: {(result.stderr or result.stdout).strip()}")
+    return f"service installed and started ({path}); check it with: systemctl --user status {SERVICE_NAME}"
+
+
+def uninstall_service(target_dir: Optional[str] = None, runner=subprocess.run) -> str:
+    path = os.path.join(target_dir or unit_dir(), SERVICE_NAME)
+    if target_dir is None:
+        runner(["systemctl", "--user", "disable", "--now", SERVICE_NAME], capture_output=True, text=True)
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        return "no service was installed"
+    if target_dir is None:
+        runner(["systemctl", "--user", "daemon-reload"], capture_output=True, text=True)
+    return f"service removed ({path})"
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Mesh input channel (host side)")
-    ap.add_argument("command", choices=["init", "pair-info", "run", "reset-token"])
+    ap.add_argument("command", choices=["init", "pair-info", "run", "reset-token", "install-service", "uninstall-service"])
     ap.add_argument("--dir", default=default_dir())
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--dry-run", action="store_true", help="record events instead of injecting them")
+    ap.add_argument("--no-start", action="store_true", help="install-service: write the unit but do not start it")
     args = ap.parse_args(argv)
+
+    if args.command in ("install-service", "uninstall-service"):
+        try:
+            if args.command == "install-service":
+                print(install_service(args.port, args.dir, start=not args.no_start))
+            else:
+                print(uninstall_service())
+        except (RuntimeError, OSError, subprocess.CalledProcessError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        return 0
 
     if args.command == "reset-token":
         reset_token(args.dir)

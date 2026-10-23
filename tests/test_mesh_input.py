@@ -664,3 +664,67 @@ def test_many_moves_are_handled_quickly(tmp_path):
             assert time.perf_counter() - start < 2.0
             assert sum(e[1] for e in inj.events if e[0] == "move") == 2000
     asyncio.run(go())
+
+
+# ----------------------------------------------------------------- service (start at login)
+
+def test_the_unit_runs_the_agent_at_login_and_restarts_it():
+    unit = mi.service_unit("/usr/bin/python3", "/home/u/.local/share/tailscale-ssh/mesh_input.py", 47600)
+    assert "ExecStart=/usr/bin/python3 /home/u/.local/share/tailscale-ssh/mesh_input.py run --port 47600\n" in unit
+    assert "Restart=on-failure" in unit and "WantedBy=default.target" in unit
+    assert "--dir" not in unit                                       # the default location needs no flag
+
+
+def test_a_custom_directory_and_port_are_carried_into_the_unit():
+    unit = mi.service_unit("/usr/bin/python3", "/x/mesh_input.py", 5000, "/custom/agent")
+    assert "run --port 5000 --dir /custom/agent" in unit
+
+
+@needs_openssl
+def test_install_writes_the_unit_makes_the_identity_and_can_skip_starting(tmp_path):
+    units, agent = str(tmp_path / "units"), str(tmp_path / "agent")
+    msg = mi.install_service(47600, agent, start=False, target_dir=units)
+    text = open(os.path.join(units, "mesh-input.service")).read()
+    assert "not started" in msg and "ExecStart=" in text and os.path.abspath(mi.__file__) in text
+    assert os.path.exists(os.path.join(agent, "cert.pem")) and os.path.exists(os.path.join(agent, "token"))
+    mi.install_service(47600, agent, start=False, target_dir=units)   # twice is fine
+    assert open(os.path.join(units, "mesh-input.service")).read() == text
+
+
+@needs_openssl
+def test_install_enables_and_starts_through_systemctl_and_reports_a_failure(tmp_path):
+    calls = []
+
+    class Result:
+        def __init__(self, code, err=""):
+            self.returncode, self.stderr, self.stdout = code, err, ""
+
+    def ok(cmd, **kw):
+        calls.append(cmd)
+        return Result(0)
+    mi.install_service(47600, str(tmp_path / "a"), target_dir=str(tmp_path / "u"), runner=ok)
+    assert calls == [["systemctl", "--user", "daemon-reload"], ["systemctl", "--user", "enable", "--now", "mesh-input.service"]]
+
+    def failing(cmd, **kw):
+        return Result(1, "Failed to connect to bus")
+    with pytest.raises(RuntimeError) as err:
+        mi.install_service(47600, str(tmp_path / "a"), target_dir=str(tmp_path / "u"), runner=failing)
+    assert "Failed to connect to bus" in str(err.value)
+
+
+@needs_openssl
+def test_uninstall_removes_the_unit_and_is_harmless_when_nothing_is_installed(tmp_path):
+    units = str(tmp_path / "units")
+    assert "no service" in mi.uninstall_service(target_dir=units)
+    mi.install_service(47600, str(tmp_path / "a"), start=False, target_dir=units)
+    assert "removed" in mi.uninstall_service(target_dir=units)
+    assert not os.path.exists(os.path.join(units, "mesh-input.service"))
+
+
+@needs_openssl
+def test_the_cli_installs_with_no_start(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    assert mi.main(["install-service", "--no-start", "--port", "47601"]) == 0
+    assert "not started" in capsys.readouterr().out
+    unit = open(str(tmp_path / "cfg" / "systemd" / "user" / "mesh-input.service")).read()
+    assert "run --port 47601" in unit

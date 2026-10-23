@@ -95,6 +95,20 @@ jobs:
             echo "::error title=build::${msg}"
           fi
           exit $code
+      - name: Report which tests ran
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import glob, xml.etree.ElementTree as ET
+          total = failed = skipped = 0
+          for f in glob.glob("android/input-ui/build/test-results/testDebugUnitTest/*.xml"):
+              r = ET.parse(f).getroot()
+              total += int(r.get("tests", 0)); failed += int(r.get("failures", 0)) + int(r.get("errors", 0)); skipped += int(r.get("skipped", 0))
+              for case in r.iter("testcase"):
+                  if case.find("failure") is not None or case.find("error") is not None:
+                      print("::error title=Keyboard test failed::%s.%s" % (case.get("classname"), case.get("name")))
+          print("::notice title=input-ui tests::%d run, %d failed, %d skipped" % (total, failed, skipped))
+          PY
       - name: Upload the APK
         if: success()
         uses: actions/upload-artifact@v4

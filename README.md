@@ -174,3 +174,11 @@ in the repo or in the installer. Now that the repo is public, `install.sh`/`mesh
 update` don't need a token at all. Still worth rotating the one you pasted here once
 you've reviewed the code — a token that's appeared in plaintext chat is best treated
 as burned, regardless of whether it's still needed for anything.
+
+
+## Mesh app (in progress)
+
+A phone app (`android/`) that controls your computers: a trackpad and keyboard over its own encrypted input channel
+(`mesh_input.py` on the computer, `android/mesh-core` on the phone), with streamed video to follow.
+How the channel works: [docs/MESH-INPUT-PROTOCOL.md](docs/MESH-INPUT-PROTOCOL.md). How to try it:
+[docs/MESH-TESTING.md](docs/MESH-TESTING.md).
