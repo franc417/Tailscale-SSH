@@ -728,3 +728,75 @@ def test_the_cli_installs_with_no_start(tmp_path, monkeypatch, capsys):
     assert "not started" in capsys.readouterr().out
     unit = open(str(tmp_path / "cfg" / "systemd" / "user" / "mesh-input.service")).read()
     assert "run --port 47601" in unit
+
+
+# ----------------------------------------------------------------- finding this computer's addresses
+
+IP_ADDR_OUTPUT = """\
+2: enp3s0    inet 192.168.100.8/24 brd 192.168.100.255 scope global dynamic noprefixroute enp3s0\\       valid_lft 85000sec
+3: wlan0    inet 10.0.0.23/24 brd 10.0.0.255 scope global dynamic wlan0\\       valid_lft 3000sec
+4: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0\\       valid_lft forever
+5: virbr0    inet 192.168.122.1/24 brd 192.168.122.255 scope global virbr0\\       valid_lft forever
+6: tailscale0    inet 100.101.102.103/32 scope global tailscale0\\       valid_lft forever
+7: veth12ab    inet 172.18.0.1/16 scope global veth12ab\\       valid_lft forever
+8: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever
+9: usb0    inet 169.254.7.7/16 scope global usb0\\       valid_lft forever
+"""
+
+
+def test_container_vm_loopback_and_link_local_interfaces_are_skipped():
+    assert mi.parse_ip_addr(IP_ADDR_OUTPUT) == [("enp3s0", "192.168.100.8"), ("wlan0", "10.0.0.23"), ("tailscale0", "100.101.102.103")]
+
+
+def test_garbage_ip_output_gives_nothing_instead_of_crashing():
+    assert mi.parse_ip_addr("") == [] and mi.parse_ip_addr("nonsense\n\n  \ninet\n") == []
+
+
+class _Result:
+    def __init__(self, code=0, out=""):
+        self.returncode, self.stdout = code, out
+
+
+def test_tailscale_comes_first_then_lan_without_duplicates():
+    def runner(cmd, **kw):
+        return _Result(0, "100.101.102.103\n") if cmd[0] == "tailscale" else _Result(0, IP_ADDR_OUTPUT)
+    assert mi.local_addresses(runner) == ["100.101.102.103", "192.168.100.8", "10.0.0.23"]
+
+
+def test_a_missing_tailscale_or_ip_command_is_fine():
+    def only_ip(cmd, **kw):
+        if cmd[0] == "tailscale":
+            raise FileNotFoundError("tailscale")
+        return _Result(0, IP_ADDR_OUTPUT)
+    assert mi.local_addresses(only_ip) == ["192.168.100.8", "10.0.0.23", "100.101.102.103"]
+
+    def nothing(cmd, **kw):
+        raise FileNotFoundError(cmd[0])
+    assert mi.local_addresses(nothing) == []
+
+
+def test_a_failing_tailscale_does_not_hide_the_lan_addresses():
+    def runner(cmd, **kw):
+        return _Result(1, "") if cmd[0] == "tailscale" else _Result(0, IP_ADDR_OUTPUT)
+    assert "192.168.100.8" in mi.local_addresses(runner)
+
+
+def test_no_address_is_ever_the_wildcard_loopback_or_garbage_whatever_the_tools_report():
+    def runner(cmd, **kw):
+        return _Result(0, "0.0.0.0\n127.0.0.1\n169.254.1.1\nnot-an-ip\n300.1.1.1\n100.9.9.9\n") if cmd[0] == "tailscale" else _Result(0, IP_ADDR_OUTPUT)
+    assert mi.local_addresses(runner) == ["100.9.9.9", "192.168.100.8", "10.0.0.23", "100.101.102.103"]
+
+
+def test_usable_address():
+    for good in ("192.168.1.5", "100.64.0.1", "10.0.0.1"):
+        assert mi.usable_address(good)
+    for bad in ("0.0.0.0", "127.0.0.1", "169.254.3.3", "", "localhost", "1.2.3", "1.2.3.4.5", "256.1.1.1", "a.b.c.d", "::1"):
+        assert not mi.usable_address(bad), bad
+
+
+@needs_openssl
+def test_pair_info_lists_addresses(tmp_path, monkeypatch):
+    monkeypatch.setattr(mi, "local_addresses", lambda runner=None: ["100.1.2.3", "192.168.1.9"])
+    info = mi.pair_info(str(tmp_path / "agent"))
+    assert info["addresses"] == ["100.1.2.3", "192.168.1.9"]
+    assert info["version"] == 1 and len(info["token"]) == 64

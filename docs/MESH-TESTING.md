@@ -18,8 +18,10 @@ computer over the encrypted, certificate-pinned input channel (no video yet).
 
 1. Install the app. In the GitHub repository open **Actions**, pick the newest green run, download the
    **mesh-debug** artifact, unzip it and install the APK.
-2. Open **Mesh**. Under **Add a computer** enter the computer's address (its Tailscale name or IP, or its LAN IP),
-   tap **Paste from clipboard** (or paste into the box), and tap **Save**.
+2. Open **Mesh**. Under **Add a computer** tap **Paste from clipboard** (or paste into the box) and tap **Save**.
+   The pairing info already lists the computer's addresses (Tailscale first, then LAN), and the phone tries them all
+   at once, so you do not need to type one. The address box is only for a computer whose addresses are not listed.
+   Never use `0.0.0.0`: it only means "every address" in the agent's log, and the app refuses it.
 3. Tap the computer. The top line shows `Connecting`, then `Connected  ·  12 ms` (the round-trip time).
 
 ## What to try
@@ -36,7 +38,8 @@ The messages are meant to be readable. The common ones:
 
 | Message | Meaning |
 |---|---|
-| the computer did not answer (is the Mesh agent running?) | agent not running, wrong address, or a firewall |
+| Could not reach … at …. Is the Mesh agent running… | no address answered: the agent is not running, a firewall blocks TCP 47600, or the phone is on neither the same Wi-Fi nor Tailscale |
+| the computer did not answer (is the Mesh agent running?) | something answered the port but not as the agent |
 | the computer rejected this phone's pairing token (pair again) | the token was reset on the computer; paste fresh `pair-info` |
 | the computer's certificate does not match the one paired with this phone | the agent's certificate changed (reinstall) or someone is in the middle; pair again only if you know why |
 | no permission to open /dev/uinput | the agent cannot type on this computer yet; see step 2 |

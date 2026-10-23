@@ -587,10 +587,63 @@ def cert_fingerprint(cert_path: str) -> str:
     return hashlib.sha256(der).hexdigest()
 
 
+# ---------------------------------------------------------------- finding this computer's addresses
+
+_IGNORED_INTERFACES = ("lo", "docker", "br-", "veth", "virbr", "vmnet", "vboxnet", "podman", "cni", "flannel")
+
+
+def parse_ip_addr(text: str) -> List[Tuple[str, str]]:
+    """(interface, address) pairs from `ip -4 -o addr show scope global`, skipping loopback, link-local and the
+    virtual interfaces of containers and VMs (a phone can never reach those)."""
+    found = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 4 or "inet" not in parts:
+            continue
+        name = parts[1].rstrip(":")
+        address = parts[parts.index("inet") + 1].split("/")[0]
+        if name.startswith(_IGNORED_INTERFACES) or address.startswith(("127.", "169.254.")):
+            continue
+        found.append((name, address))
+    return found
+
+
+def local_addresses(runner=subprocess.run) -> List[str]:
+    """The addresses a phone could use to reach this computer, best first: the Tailscale address (works from
+    anywhere), then the ordinary LAN addresses. Never 0.0.0.0, which only means "listen everywhere"."""
+    tailscale: List[str] = []
+    lan: List[str] = []
+    try:
+        result = runner(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=3)
+        if result.returncode == 0:
+            tailscale = [a.strip() for a in result.stdout.split() if a.strip()]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        result = runner(["ip", "-4", "-o", "addr", "show", "scope", "global"], capture_output=True, text=True, timeout=3)
+        if result.returncode == 0:
+            lan = [address for _name, address in parse_ip_addr(result.stdout) if address not in tailscale]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    ordered: List[str] = []
+    for address in tailscale + lan:
+        if usable_address(address) and address not in ordered:
+            ordered.append(address)
+    return ordered
+
+
+def usable_address(address: str) -> bool:
+    """A dotted IPv4 address a phone could actually connect to: not the wildcard 0.0.0.0, not loopback, not link-local."""
+    parts = address.split(".")
+    if len(parts) != 4 or not all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+        return False
+    return not (address == "0.0.0.0" or address.startswith(("127.", "169.254.")))
+
+
 def pair_info(directory: str, port: int = DEFAULT_PORT) -> dict:
     cert, _key, token = ensure_identity(directory)
     return {"version": VERSION, "port": port, "fingerprint": cert_fingerprint(cert), "token": token.hex(),
-            "host": socket.gethostname()}
+            "host": socket.gethostname(), "addresses": local_addresses()}
 
 
 def reset_token(directory: str) -> None:
@@ -725,7 +778,12 @@ async def serve(directory: str, port: int, injector: Injector, log=_log, host: s
     cert, key, token = ensure_identity(directory)
     server = Server(injector, token, log=log)
     tls = await asyncio.start_server(server.handle, host, port, ssl=make_ssl_context(cert, key))
-    log(f"mesh input channel listening on {host}:{port}  (certificate {cert_fingerprint(cert)[:16]}...)")
+    log(f"mesh input channel listening on port {port}  (certificate {cert_fingerprint(cert)[:16]}...)")
+    addresses = local_addresses()
+    if addresses:
+        log("phones can reach this computer at: " + ", ".join(addresses) + "   (pair-info lists them; 0.0.0.0 is NOT an address)")
+    else:
+        log("could not work out this computer's address; use its IP from `ip addr` when adding it on the phone")
     async with tls:
         await tls.serve_forever()
 

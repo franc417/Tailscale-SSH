@@ -66,4 +66,28 @@ class PairInfoTest {
         assertTrue(rejected(agentOutput.replace("\"port\": 47600, ", "")).contains("port"))
         assertTrue(rejected(agentOutput.replace("g", "g").replace(tok, "z".repeat(64))).contains("token"))
     }
+
+    @Test
+    fun `the addresses the computer lists are read in order`() {
+        val withAddresses = agentOutput.replace("\"host\": \"mkz\"", "\"host\": \"mkz\", \"addresses\": [\"100.1.2.3\", \"192.168.1.9\"]")
+        assertEquals(listOf("100.1.2.3", "192.168.1.9"), PairInfo.parse(withAddresses).addresses)
+    }
+
+    @Test
+    fun `unusable addresses in the list are dropped`() {
+        val text = agentOutput.replace("\"host\": \"mkz\"", "\"host\": \"mkz\", \"addresses\": [\"0.0.0.0\", \"127.0.0.1\", \"192.168.1.9\", \"192.168.1.9\", \"not an ip\"]")
+        assertEquals(listOf("192.168.1.9"), PairInfo.parse(text).addresses)
+    }
+
+    @Test
+    fun `no addresses field means an empty list`() {
+        assertEquals(emptyList<String>(), PairInfo.parse(agentOutput).addresses)
+    }
+
+    @Test
+    fun `an empty or pretty printed list parses`() {
+        assertEquals(emptyList<String>(), PairInfo.parse(agentOutput.replace("\"host\": \"mkz\"", "\"host\": \"mkz\", \"addresses\": []")).addresses)
+        val pretty = "{\n \"version\": 1,\n \"port\": 47600,\n \"fingerprint\": \"$fp\",\n \"token\": \"$tok\",\n \"addresses\": [\n  \"100.1.2.3\",\n  \"10.0.0.5\"\n ]\n}"
+        assertEquals(listOf("100.1.2.3", "10.0.0.5"), PairInfo.parse(pretty).addresses)
+    }
 }

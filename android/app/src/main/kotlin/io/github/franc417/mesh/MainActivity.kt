@@ -15,6 +15,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Toast
+import io.github.franc417.mesh.core.HostAddress
 import io.github.franc417.mesh.core.PairInfo
 import java.util.UUID
 
@@ -70,7 +71,7 @@ class MainActivity : Activity() {
         column.addView(Ui.gap(this, 12))
 
         nameInput = field("Name (optional)")
-        hostInput = field("Address: IP or Tailscale name", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
+        hostInput = field("Address (optional: the pairing info already lists them)", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
         pairInput = field("Pairing info", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS).apply {
             minLines = 3
             gravity = Gravity.TOP
@@ -113,9 +114,11 @@ class MainActivity : Activity() {
     }
 
     private fun save() {
-        val host = hostInput.text.toString().trim()
-        if (host.isEmpty()) {
-            toast("Enter the computer's address")
+        val typed = hostInput.text.toString().trim()
+        val typedHost = if (typed.isEmpty()) null else try {
+            HostAddress.parse(typed)
+        } catch (e: HostAddress.Invalid) {
+            toast(e.message ?: "That address cannot work")
             return
         }
         val info = try {
@@ -124,11 +127,16 @@ class MainActivity : Activity() {
             toast(e.message ?: "That is not valid pairing info")
             return
         }
-        val name = nameInput.text.toString().trim().ifEmpty { info.hostName.ifEmpty { host } }
-        store.add(Computer(UUID.randomUUID().toString(), name, host, info.port, info.fingerprint, info.tokenHex))
+        val hosts = (listOfNotNull(typedHost) + info.addresses).distinct()
+        if (hosts.isEmpty()) {
+            toast("The pairing info lists no addresses, so type the computer's address in the box above")
+            return
+        }
+        val name = nameInput.text.toString().trim().ifEmpty { info.hostName.ifEmpty { hosts.first() } }
+        store.add(Computer(UUID.randomUUID().toString(), name, hosts, info.port, info.fingerprint, info.tokenHex))
         for (f in listOf(nameInput, hostInput, pairInput)) f.setText("")
         renderList()
-        toast("Saved $name")
+        toast("Saved $name (${hosts.size} address${if (hosts.size == 1) "" else "es"})")
     }
 
     private fun renderList() {
@@ -145,7 +153,12 @@ class MainActivity : Activity() {
                 val p = Ui.dp(this@MainActivity, 16)
                 setPadding(p, p, p, p)
                 addView(Ui.text(this@MainActivity, c.name, 17f, Ui.TEXT, bold = true))
-                addView(Ui.text(this@MainActivity, "${c.host}:${c.port}", 13f, Ui.MUTED))
+                val where = when {
+                    c.hosts.isEmpty() -> "no usable address saved: remove it and add it again"
+                    c.hosts.size == 1 -> "${c.hosts[0]}:${c.port}"
+                    else -> "${c.hosts[0]}:${c.port}  (+${c.hosts.size - 1} more)"
+                }
+                addView(Ui.text(this@MainActivity, where, 13f, if (c.hosts.isEmpty()) Ui.ERROR else Ui.MUTED))
                 setOnClickListener { startActivity(Intent(this@MainActivity, ControlActivity::class.java).putExtra(ControlActivity.EXTRA_ID, c.id)) }
                 setOnLongClickListener {
                     confirmRemove(c)

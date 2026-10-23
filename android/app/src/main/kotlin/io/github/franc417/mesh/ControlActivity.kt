@@ -13,6 +13,7 @@ import io.github.franc417.mesh.core.HostMessage
 import io.github.franc417.mesh.core.InputBridge
 import io.github.franc417.mesh.core.MipClient
 import io.github.franc417.mesh.core.MipException
+import io.github.franc417.mesh.core.Reach
 import io.github.franc417.mesh.core.hexToBytes
 import io.github.franc417.mesh.input.KeyboardView
 import io.github.franc417.mesh.input.TrackpadView
@@ -28,6 +29,7 @@ class ControlActivity : Activity() {
     private var bridge: InputBridge? = null
     private lateinit var status: TextView
     private lateinit var retry: TextView
+    private var attempt = 0   // bumped to cancel an address search that is still running
 
     /** Reports for ONE connection attempt; ignores anything from a connection that has since been replaced. */
     private inner class Session : MipClient.Listener {
@@ -96,6 +98,7 @@ class ControlActivity : Activity() {
     }
 
     override fun onStop() {
+        attempt++
         // Closing tells the computer to let go of any key still held down.
         client?.close()
         client = null
@@ -111,12 +114,36 @@ class ControlActivity : Activity() {
     private fun connect() {
         val c = computer ?: return
         client?.close()
+        client = null
+        bridge = null
         retry.visibility = View.GONE
-        show("Connecting to ${c.host}...", Ui.MUTED)
+        if (c.hosts.isEmpty()) {
+            show("This computer has no usable address saved. Remove it and add it again.", Ui.ERROR)
+            return
+        }
+        val mine = ++attempt
+        show("Looking for ${c.name}...", Ui.MUTED)
+        // Every saved address is tried at once; the first that answers is used, so a home LAN address that is
+        // unreachable while you are away never slows down the Tailscale one.
+        Thread {
+            val host = Reach.firstReachable(c.hosts, c.port, 3000)
+            runOnUiThread {
+                if (mine != attempt) return@runOnUiThread
+                if (host == null) {
+                    show("Could not reach ${c.name} at ${c.hosts.joinToString(", ")}. Is the Mesh agent running, and are you on the same Wi-Fi or on Tailscale?", Ui.ERROR)
+                    retry.visibility = View.VISIBLE
+                } else {
+                    startSession(c, host)
+                }
+            }
+        }.start()
+    }
 
+    private fun startSession(c: Computer, host: String) {
+        show("Connecting to $host...", Ui.MUTED)
         val session = Session()
         val mip = MipClient(
-            MipClient.Config(c.host, c.port, c.tokenHex.hexToBytes(), c.fingerprint, Build.MODEL ?: "Android phone"),
+            MipClient.Config(host, c.port, c.tokenHex.hexToBytes(), c.fingerprint, Build.MODEL ?: "Android phone"),
             session,
         )
         session.owner = mip

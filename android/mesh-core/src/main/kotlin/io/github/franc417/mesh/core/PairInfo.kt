@@ -10,6 +10,8 @@ data class PairInfo(
     val tokenHex: String,
     /** The computer's own name, if it reported one. */
     val hostName: String,
+    /** Addresses the computer says it can be reached at, best first (Tailscale, then LAN). May be empty. */
+    val addresses: List<String> = emptyList(),
 ) {
     val token: ByteArray get() = tokenHex.hexToBytes()
 
@@ -35,7 +37,10 @@ data class PairInfo(
                 ?.takeIf { it.matches(Regex("[0-9a-f]{64}")) } ?: throw ParseException("the certificate fingerprint should be 64 hex characters")
             val token = field("token")?.trim()?.lowercase()
                 ?.takeIf { it.matches(Regex("[0-9a-f]{64}")) } ?: throw ParseException("the pairing token should be 64 hex characters")
-            return PairInfo(version, port, fingerprint, token, field("host").orEmpty())
+            val addresses = Regex("\"addresses\"\\s*:\\s*\\[(.*?)\\]", RegexOption.DOT_MATCHES_ALL).find(text)?.groupValues?.get(1)
+                ?.let { list -> Regex("\"([^\"]+)\"").findAll(list).map { it.groupValues[1] }.toList() }.orEmpty()
+                .filter { HostAddress.isUsable(it) }.distinct()
+            return PairInfo(version, port, fingerprint, token, field("host").orEmpty(), addresses)
         }
     }
 }
