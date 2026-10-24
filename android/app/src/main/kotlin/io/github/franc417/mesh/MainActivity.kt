@@ -159,7 +159,16 @@ class MainActivity : Activity() {
                     else -> "${c.hosts[0]}:${c.port}  (+${c.hosts.size - 1} more)"
                 }
                 addView(Ui.text(this@MainActivity, where, 13f, if (c.hosts.isEmpty()) Ui.ERROR else Ui.MUTED))
-                setOnClickListener { startActivity(Intent(this@MainActivity, ControlActivity::class.java).putExtra(ControlActivity.EXTRA_ID, c.id)) }
+                addView(Ui.gap(this@MainActivity, 12))
+                val actions = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.HORIZONTAL }
+                actions.addView(Ui.button(this@MainActivity, "Open desktop") {
+                    startActivity(Intent(this@MainActivity, StreamActivity::class.java).putExtra(StreamActivity.EXTRA_ID, c.id))
+                }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 2f))
+                actions.addView(android.view.View(this@MainActivity), LinearLayout.LayoutParams(Ui.dp(this@MainActivity, 10), 1))
+                actions.addView(Ui.button(this@MainActivity, "Input only") {
+                    startActivity(Intent(this@MainActivity, ControlActivity::class.java).putExtra(ControlActivity.EXTRA_ID, c.id))
+                }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                addView(actions)
                 setOnLongClickListener {
                     confirmRemove(c)
                     true

@@ -34,4 +34,5 @@ android {
 dependencies {
     implementation(project(":mesh-core"))
     implementation(project(":input-ui"))
+    implementation(project(":stream"))
 }

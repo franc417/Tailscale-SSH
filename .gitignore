@@ -8,3 +8,7 @@ android/**/build/
 android/local.properties
 *.iml
 .idea/
+
+# Moonlight native core: fetched by android/third_party/fetch-moonlight-core.sh (pinned commit), not committed
+android/stream/src/main/jni/moonlight-core/
+android/stream/.cxx/

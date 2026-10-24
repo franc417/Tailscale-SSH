@@ -22,7 +22,14 @@
             </intent-filter>
         </activity>
 
-        <!-- Portrait for now: this screen is the input-channel test bench. The stream view (landscape) comes later. -->
+        <!-- The desktop view: landscape, full screen. Video and audio come from the streaming core, input goes over Mesh's own channel. -->
+        <activity
+            android:name=".StreamActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize"
+            android:screenOrientation="sensorLandscape" />
+
+        <!-- Portrait: the input-only test bench (trackpad + keyboard, no video). -->
         <activity
             android:name=".ControlActivity"
             android:exported="false"

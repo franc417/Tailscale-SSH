@@ -77,7 +77,9 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
-          packages: platform-tools
+          packages: platform-tools ndk;27.0.12077973
+      - name: Fetch the Moonlight native core (pinned commit)
+        run: android/third_party/fetch-moonlight-core.sh
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
@@ -86,7 +88,7 @@ jobs:
         working-directory: android
         run: |
           set +e
-          gradle :input-ui:testDebugUnitTest :app:assembleDebug --stacktrace 2>&1 | tee build.log
+          gradle :input-ui:testDebugUnitTest :stream:testDebugUnitTest :app:assembleDebug --stacktrace 2>&1 | tee build.log
           code=${PIPESTATUS[0]}
           # Publish compile and build errors as ONE annotation (GitHub shows only a few per step, and the raw log
           # is not downloadable everywhere). Newlines are encoded as %0A.
@@ -101,13 +103,13 @@ jobs:
           python3 - <<'PY'
           import glob, xml.etree.ElementTree as ET
           total = failed = skipped = 0
-          for f in glob.glob("android/input-ui/build/test-results/testDebugUnitTest/*.xml"):
+          for f in glob.glob("android/input-ui/build/test-results/testDebugUnitTest/*.xml") + glob.glob("android/stream/build/test-results/testDebugUnitTest/*.xml"):
               r = ET.parse(f).getroot()
               total += int(r.get("tests", 0)); failed += int(r.get("failures", 0)) + int(r.get("errors", 0)); skipped += int(r.get("skipped", 0))
               for case in r.iter("testcase"):
                   if case.find("failure") is not None or case.find("error") is not None:
                       print("::error title=Keyboard test failed::%s.%s" % (case.get("classname"), case.get("name")))
-          print("::notice title=input-ui tests::%d run, %d failed, %d skipped" % (total, failed, skipped))
+          print("::notice title=input-ui + stream tests::%d run, %d failed, %d skipped" % (total, failed, skipped))
           PY
       - name: Upload the APK
         if: success()

@@ -72,6 +72,16 @@ class TrackpadView @JvmOverloads constructor(
 
     var onEvent: ((Map<String, Any?>) -> Unit)? = null
 
+    /**
+     * Mesh change: when true the pad draws no panel or grid, only the finger rings and tap ripples, so it can lie on
+     * top of the streamed desktop and be used without hiding it.
+     */
+    var overlay: Boolean = false
+        set(value) {
+            field = value
+            invalidate()
+        }
+
     private var lastX = 0f
     private var lastY = 0f
     private var lastTwoFingerY = 0f
@@ -296,10 +306,12 @@ class TrackpadView @JvmOverloads constructor(
         super.onDraw(canvas)
         val now = System.currentTimeMillis()
 
-        // Recessed panel with the dot grid.
-        canvas.drawRoundRect(panelRect, panelRadius, panelRadius, panelFill)
-        canvas.drawRoundRect(panelRect, panelRadius, panelRadius, gridPaint)
-        canvas.drawRoundRect(panelRect, panelRadius, panelRadius, panelStroke)
+        // Recessed panel with the dot grid (skipped in overlay mode so the video underneath stays visible).
+        if (!overlay) {
+            canvas.drawRoundRect(panelRect, panelRadius, panelRadius, panelFill)
+            canvas.drawRoundRect(panelRect, panelRadius, panelRadius, gridPaint)
+            canvas.drawRoundRect(panelRect, panelRadius, panelRadius, panelStroke)
+        }
 
         // 1 while a finger is down, then fades to 0 after release.
         val presence = if (touching) {
