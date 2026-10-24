@@ -75,6 +75,9 @@ streaming engine inside the app. Typing and the trackpad still go over the Mesh 
    The phone then continues by itself. This happens once per computer.
 4. The desktop appears. Top bar: **Close**, a status line (decoder, frames shown and dropped, input status),
    a quality button (Smooth 720p60 / Sharp 1080p60 / Light 720p30) and **Keyboard**.
+5. **Keyboard** opens a small box that floats over the desktop (it never shrinks the picture). Drag it by its title to
+   move it, **Bigger** makes it as large as half the screen (**Smaller** goes back), **Hide** or the **Keyboard** button
+   puts it away.
 
 ## What to report
 
@@ -90,4 +93,3 @@ streaming engine inside the app. Typing and the trackpad still go over the Mesh 
 - Pairing needs you to type the PIN into Sunshine's web page once (automatic PIN entry through the agent comes later).
 - H.264 only, stereo sound only, no HDR, no gamepad, no mouse through the streaming engine (input is Mesh's own channel).
 - No virtual display: with no monitor attached or a locked screen the picture may be black (Linux specific).
-- The keyboard is the docked one for now; the small floating keyboard is planned.
