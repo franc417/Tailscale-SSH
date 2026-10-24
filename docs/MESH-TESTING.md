@@ -1,7 +1,8 @@
 # Trying the Mesh input channel
 
 This is the first end-to-end test of the Mesh phone app: a trackpad and keyboard on your phone driving your
-computer over the encrypted, certificate-pinned input channel (no video yet).
+computer over the encrypted, certificate-pinned input channel. The second half of this page covers the **desktop view**
+(the computer's screen on your phone), which is new and has only ever been compiled, never run on a phone.
 
 ## On the computer (Arch or any Linux)
 
@@ -50,4 +51,43 @@ To revoke every phone: `python3 mesh_input.py reset-token`, then pair again.
 
 - A held key sends a quick press and release (no hold-to-repeat yet).
 - The pairing token is stored in the app's private storage (backups are off); wrapping it with an Android Keystore key is planned.
-- No video: the streamed desktop (Sunshine and Moonlight) is the next milestone.
+- See the desktop view section below for what is and is not done there.
+
+# Trying the desktop view
+
+Mesh shows the computer's screen by talking to **Sunshine** (the same program Moonlight uses), using Moonlight's
+streaming engine inside the app. Typing and the trackpad still go over the Mesh input channel above, laid on top of the picture.
+
+## One-time setup on the computer
+
+1. Install Sunshine (Arch: the `sunshine` package) and start it. Open its web page, `https://localhost:47990`, accept
+   the self-signed certificate warning, and create the Sunshine username and password when it asks.
+2. Make sure the application list contains **Desktop** (Sunshine adds it by default).
+3. If you run a firewall, allow TCP 47984, 47989, 48010 and UDP 47998 to 48000 (Tailscale traffic is usually already allowed).
+4. Keep the Mesh agent running as in the steps above. The picture and the input use different programs on purpose.
+
+## On the phone
+
+1. Install the newest **mesh-debug** APK (it replaces the old one, your saved computers stay).
+2. Tap **Open desktop** on the computer's card. The phone goes landscape.
+3. The first time, the phone shows a 4-digit PIN. Tap **Open Sunshine's PIN page** (or open
+   `https://<computer address>:47990/pin` on any device), log in, type the PIN and any device name, and send it.
+   The phone then continues by itself. This happens once per computer.
+4. The desktop appears. Top bar: **Close**, a status line (decoder, frames shown and dropped, input status),
+   a quality button (Smooth 720p60 / Sharp 1080p60 / Light 720p30) and **Keyboard**.
+
+## What to report
+
+- Does a picture appear at all? If not, the message on screen says where it stopped (contacting, pairing, starting, video).
+- Is it smooth? Read the status line: `shown` should climb by about 60 a second; many `dropped` means the phone or the
+  network cannot keep up, so try **Light**.
+- Is there sound? Is the delay when you move the pointer acceptable?
+- Green or garbled picture, or a long delay on a cheap phone: tell me the phone model, that is the known weak spot
+  (the video decoder is deliberately minimal and has no per-phone workarounds yet).
+
+## What is not done in the desktop view
+
+- Pairing needs you to type the PIN into Sunshine's web page once (automatic PIN entry through the agent comes later).
+- H.264 only, stereo sound only, no HDR, no gamepad, no mouse through the streaming engine (input is Mesh's own channel).
+- No virtual display: with no monitor attached or a locked screen the picture may be black (Linux specific).
+- The keyboard is the docked one for now; the small floating keyboard is planned.
