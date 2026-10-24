@@ -4,8 +4,12 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.VIBRATE" />
 
+    <!-- usesCleartextTraffic: Sunshine answers discovery and the first step of pairing (port 47989) over plain HTTP by
+         design; the pairing exchange itself is encrypted with the PIN and everything after it uses pinned HTTPS. Android
+         blocks plain HTTP by default, which made the desktop view fail with "CLEARTEXT communication ... not permitted". -->
     <application
         android:allowBackup="false"
+        android:usesCleartextTraffic="true"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:label="@string/app_name"
