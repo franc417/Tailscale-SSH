@@ -29,6 +29,14 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+
+    packaging {
+        resources {
+            // BouncyCastle (pulled in by :stream) ships licence/manifest files that several of its jars have in common;
+            // they are metadata, not code, so leaving them out of the APK is safe.
+            excludes += listOf("/META-INF/*.md", "/META-INF/versions/9/OSGI-INF/MANIFEST.MF")
+        }
+    }
 }
 
 dependencies {
