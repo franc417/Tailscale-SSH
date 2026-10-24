@@ -178,7 +178,8 @@ public class NvHTTP {
                 .readTimeout(READ_TIMEOUT, TimeUnit.MILLISECONDS)
                 .connectTimeout(LONG_CONNECTION_TIMEOUT, TimeUnit.MILLISECONDS)
                 .proxy(Proxy.NO_PROXY)
-                .fastFallback(false)
+                // MESH CHANGE: Moonlight 12.2 also calls .fastFallback(false) here, which only exists in OkHttp 5.x.
+                // OkHttp 4.12 (used here) always tries addresses one after another, which is the behaviour that call asks for.
                 .build();
 
         httpClientShortConnectTimeout = httpClientLongConnectTimeout.newBuilder()

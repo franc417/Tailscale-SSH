@@ -4,10 +4,10 @@ Mesh shows the computer's desktop by speaking the same streaming protocol as Moo
 re-implement it, this module reuses Moonlight for Android (GPL-3.0, https://github.com/moonlight-stream/moonlight-android),
 pinned to version 12.2, commit `b48494cb96bff23d8886c4775cc4f39a1075495d`.
 
-## What is Moonlight's, unchanged
+## What is Moonlight's, almost unchanged
 
 - `src/main/java/com/limelight/**`: the protocol and pairing code (`NvHTTP`, `PairingManager`, `NvConnection`,
-  `MoonBridge` and the small classes they need), copied byte for byte. The package names must stay as they are:
+  `MoonBridge` and the small classes they need), copied from Moonlight, with ONE edit (marked `MESH CHANGE` in `NvHTTP.java`: the OkHttp 5-only `.fastFallback(false)` call is dropped). The package names must stay as they are:
   the native glue looks up `com.limelight.nvstream.jni.MoonBridge` by name.
 - The native core (moonlight-common-c, ENet, the JNI glue, prebuilt OpenSSL and Opus static libraries) is **not** committed.
   `android/third_party/fetch-moonlight-core.sh` downloads it at the pinned commit into `src/main/jni/moonlight-core`
