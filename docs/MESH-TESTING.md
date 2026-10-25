@@ -53,6 +53,13 @@ To revoke every phone: `python3 mesh_input.py reset-token`, then pair again.
 - The pairing token is stored in the app's private storage (backups are off); wrapping it with an Android Keystore key is planned.
 - See the desktop view section below for what is and is not done there.
 
+# Adding and editing desktops
+
+The home screen has **+ Add desktop** at the top. Each saved computer has **Open desktop**, **Input only** and **Edit**.
+**Edit** changes the name, the addresses (one per line; all are tried at once), and the port. If the agent on the computer
+was reinstalled or its pairing reset, paste its new `pair-info` there to replace the saved pairing. **Remove this
+computer** is at the bottom of the edit screen.
+
 # Trying the desktop view
 
 Mesh shows the computer's screen by talking to **Sunshine** (the same program Moonlight uses), using Moonlight's
@@ -73,8 +80,11 @@ streaming engine inside the app. Typing and the trackpad still go over the Mesh 
 3. The first time, the phone shows a 4-digit PIN. Tap **Open Sunshine's PIN page** (or open
    `https://<computer address>:47990/pin` on any device), log in, type the PIN and any device name, and send it.
    The phone then continues by itself. This happens once per computer.
-4. The desktop appears. Top bar: **Close**, a status line (decoder, frames shown and dropped, input status),
-   a quality button (Smooth 720p60 / Sharp 1080p60 / Light 720p30) and **Keyboard**.
+4. The desktop appears and the controls tuck away so the picture is full screen. Tap the small **arrow tab** at the top
+   centre to bring the bar back (and again to hide it). The bar has **Close**, a status line, **Smooth** (a menu to
+   pick Smooth 720p60 / Sharp 1080p60 / Light 720p30) and **Keyboard**. Changing the quality restarts the stream.
+   The status line reads like `58 fps · net 12 ms · host 4.1 ms · dec 7 ms · 2 dropped`: frames per second shown,
+   network round trip, how long the computer took to encode a frame, how long the phone took to decode it, frames thrown away.
 5. **Keyboard** opens a small box that floats over the desktop (it never shrinks the picture). Drag it by its title to
    move it, **Bigger** makes it as large as half the screen (**Smaller** goes back), **Hide** or the **Keyboard** button
    puts it away.
@@ -82,8 +92,9 @@ streaming engine inside the app. Typing and the trackpad still go over the Mesh 
 ## What to report
 
 - Does a picture appear at all? If not, the message on screen says where it stopped (contacting, pairing, starting, video).
-- Is it smooth? Read the status line: `shown` should climb by about 60 a second; many `dropped` means the phone or the
-  network cannot keep up, so try **Light**.
+- Is it smooth, and where is the delay? Send me the status line while you move the pointer. `fps` should be near 60;
+  a high `net` is the network (try the Wi-Fi 5 GHz band, or **Light**); a high `host` is the computer's encoder
+  (Sunshine's settings); a high `dec` is the phone's decoder. Many `dropped` means the phone or network cannot keep up.
 - Is there sound? Is the delay when you move the pointer acceptable?
 - Green or garbled picture, or a long delay on a cheap phone: tell me the phone model, that is the known weak spot
   (the video decoder is deliberately minimal and has no per-phone workarounds yet).

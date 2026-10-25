@@ -1,9 +1,13 @@
 package io.github.franc417.mesh
 
 import android.app.Activity
+import android.app.AlertDialog
+import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
+import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -54,6 +58,10 @@ class StreamActivity : Activity() {
     private lateinit var retryButton: TextView
     private lateinit var statusChip: TextView
     private lateinit var qualityChip: TextView
+    private lateinit var controlBar: View
+    private lateinit var chevron: ChevronView
+    private var controlsExpanded = true
+    private var wifiLock: WifiManager.WifiLock? = null
 
     private val streamClient by lazy { StreamClient(this) }
     private var inputLink: InputLink? = null
@@ -126,7 +134,7 @@ class StreamActivity : Activity() {
         stage.addView(trackpad, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
 
         stage.addView(buildMessagePanel(), FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
-        stage.addView(buildTopBar(), FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP))
+        stage.addView(buildTopPanel(), FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP))
         stage.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
             fitSurface()
             layoutKeyboard()
@@ -160,14 +168,46 @@ class StreamActivity : Activity() {
         val gap = { View(this).apply { layoutParams = LinearLayout.LayoutParams(Ui.dp(this@StreamActivity, 6), 1) } }
         bar.addView(chip("\u2715  Close") { finish() })
         bar.addView(gap())
-        statusChip = chip("") {}.apply { visibility = View.GONE }
-        bar.addView(statusChip)
-        bar.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
-        qualityChip = chip(StreamSettings.presets[presetIndex].first.substringBefore(" ")) { cycleQuality() }
+        statusChip = chip("") {}.apply {
+            visibility = View.INVISIBLE // invisible, not gone: it holds the space that keeps the other chips on the right
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        }
+        bar.addView(statusChip, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        bar.addView(gap())
+        qualityChip = chip(StreamSettings.presets[presetIndex].first.substringBefore(" ")) { showQualityPicker() }
         bar.addView(qualityChip)
         bar.addView(gap())
         bar.addView(chip("Keyboard") { setKeyboardVisible(keyboardBox.visibility != View.VISIBLE) })
         return bar
+    }
+
+    /**
+     * The controls (Close, status, quality, Keyboard) sit in a bar that can be pulled up out of the way by the small
+     * arrow tab under it, leaving the desktop truly full screen. The tab itself stays, so the controls are one tap away.
+     */
+    private fun buildTopPanel(): View {
+        val panel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        controlBar = buildTopBar()
+        panel.addView(controlBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        chevron = ChevronView(this)
+        val tab = FrameLayout(this).apply {
+            background = Ui.box(this@StreamActivity, fill = Color.argb(150, 11, 11, 12), radiusDp = 12)
+            isClickable = true
+            setOnClickListener { setControlsExpanded(!controlsExpanded) }
+        }
+        tab.addView(chevron, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        panel.addView(tab, LinearLayout.LayoutParams(Ui.dp(this, 64), Ui.dp(this, 30)).apply { gravity = Gravity.CENTER_HORIZONTAL })
+        setControlsExpandedNow(true)
+        return panel
+    }
+
+    private fun setControlsExpanded(expanded: Boolean) = setControlsExpandedNow(expanded)
+
+    private fun setControlsExpandedNow(expanded: Boolean) {
+        controlsExpanded = expanded
+        controlBar.visibility = if (expanded) View.VISIBLE else View.GONE
+        chevron.pointingUp = expanded
     }
 
     /**
@@ -315,6 +355,7 @@ class StreamActivity : Activity() {
         openPinPage.visibility = if (pin == null) View.GONE else View.VISIBLE
         retryButton.visibility = if (retry) View.VISIBLE else View.GONE
         messagePanel.visibility = View.VISIBLE
+        setControlsExpanded(true)
     }
 
     private fun showError(text: String) = showMessage("Could not show the desktop", text, retry = true)
@@ -348,6 +389,7 @@ class StreamActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
+        acquireWifiLock()
         begin()
     }
 
@@ -359,7 +401,34 @@ class StreamActivity : Activity() {
         host = null
         paired = false
         handler.removeCallbacksAndMessages(null)
+        releaseWifiLock()
         super.onStop()
+    }
+
+    /**
+     * Phones put the Wi-Fi radio to sleep between bursts to save power, which shows up as stutter and delay in a
+     * stream. A low-latency Wi-Fi lock (as Moonlight holds) keeps it awake while this screen is open.
+     */
+    @Suppress("DEPRECATION")
+    private fun acquireWifiLock() {
+        try {
+            val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            val mode = if (Build.VERSION.SDK_INT >= 29) WifiManager.WIFI_MODE_FULL_LOW_LATENCY else WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            val lock = wifi.createWifiLock(mode, "mesh:stream")
+            lock.setReferenceCounted(false)
+            lock.acquire()
+            wifiLock = lock
+        } catch (e: Exception) {
+            wifiLock = null // not fatal: the stream just runs without the lock
+        }
+    }
+
+    private fun releaseWifiLock() {
+        try {
+            wifiLock?.takeIf { it.isHeld }?.release()
+        } catch (_: Exception) {
+        }
+        wifiLock = null
     }
 
     private fun begin() {
@@ -459,6 +528,7 @@ class StreamActivity : Activity() {
         override fun onFirstFrame(width: Int, height: Int) = ui {
             streaming = true
             hideMessage()
+            setControlsExpanded(false) // full screen: the arrow tab at the top brings the controls back
             statusChip.visibility = View.VISIBLE
             statusChip.setTextColor(Ui.OK)
             scheduleDiagnostics()
@@ -492,7 +562,7 @@ class StreamActivity : Activity() {
         handler.removeCallbacksAndMessages(null)
         session?.stop()
         session = null
-        if (::statusChip.isInitialized) statusChip.visibility = View.GONE
+        if (::statusChip.isInitialized) statusChip.visibility = View.INVISIBLE
     }
 
     private fun scheduleDiagnostics() {
@@ -505,11 +575,27 @@ class StreamActivity : Activity() {
         }, 1000)
     }
 
-    private fun cycleQuality() {
-        presetIndex = (presetIndex + 1) % StreamSettings.presets.size
+    private fun showQualityPicker() {
+        val names = StreamSettings.presets.map { it.first }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Stream quality")
+            .setSingleChoiceItems(names, presetIndex) { dialog, which ->
+                dialog.dismiss()
+                chooseQuality(which)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun chooseQuality(index: Int) {
+        if (index == presetIndex) return
+        presetIndex = index
         qualityChip.text = StreamSettings.presets[presetIndex].first.substringBefore(" ")
         // A running stream is restarted so the new size is really used; before that the choice just applies to the start.
-        if (session != null || messagePanel.visibility == View.VISIBLE) restart()
+        if (session != null || messagePanel.visibility == View.VISIBLE) {
+            showMessage("Switching to ${StreamSettings.presets[presetIndex].first}", "")
+            restart()
+        }
     }
 
     private fun restart() {

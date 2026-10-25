@@ -2,6 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Needed to hold the low-latency Wi-Fi lock while the desktop view is open -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.VIBRATE" />
 
     <!-- usesCleartextTraffic: Sunshine answers discovery and the first step of pairing (port 47989) over plain HTTP by
@@ -25,6 +27,11 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".ComputerFormActivity"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize" />
 
         <!-- The desktop view: landscape, full screen. Video and audio come from the streaming core, input goes over Mesh's own channel. -->
         <activity

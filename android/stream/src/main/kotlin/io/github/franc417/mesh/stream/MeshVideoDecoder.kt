@@ -49,6 +49,12 @@ class MeshVideoDecoder(
     @Volatile var framesDropped = 0L; private set
     @Volatile var decoderName: String = ""; private set
 
+    /** Per-second numbers that explain lag (frame rate, decode time, host encode time, drops). */
+    val stats = StreamStats()
+
+    private var h264 = false
+    private var baseTimestampUs = 0L
+
     override fun setup(format: Int, width: Int, height: Int, redrawRate: Int): Int {
         val mime = when {
             (format and MoonBridge.VIDEO_FORMAT_MASK_H264) != 0 -> MediaFormat.MIMETYPE_VIDEO_AVC
@@ -60,6 +66,7 @@ class MeshVideoDecoder(
         }
         this.width = width
         this.height = height
+        h264 = (format and MoonBridge.VIDEO_FORMAT_MASK_H264) != 0
         return try {
             val mf = MediaFormat.createVideoFormat(mime, width, height)
             if (Build.VERSION.SDK_INT >= 30) mf.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
@@ -140,8 +147,18 @@ class MeshVideoDecoder(
     ): Int {
         if (stopping || failed) return MoonBridge.DR_OK
 
+        if (decodeUnitType == CsdAccumulator.BUFFER_TYPE_PICDATA) {
+            stats.onHostLatency(frameHostProcessingLatency.code)
+        }
+
         if (frameType == MoonBridge.FRAME_TYPE_IDR) {
             csd.beginFrame(frameNumber)
+            if (h264 && decodeUnitType == CsdAccumulator.BUFFER_TYPE_SPS) {
+                // Tell the decoder there is no reordering, so it shows frames at once instead of buffering several.
+                val patched = H264SpsPatcher.patch(decodeUnitData, decodeUnitLength)
+                csd.add(decodeUnitType, patched, patched.size)
+                return MoonBridge.DR_OK
+            }
             if (csd.add(decodeUnitType, decodeUnitData, decodeUnitLength)) {
                 return MoonBridge.DR_OK // parameter set: held until the picture data of this IDR arrives
             }
@@ -151,8 +168,10 @@ class MeshVideoDecoder(
             }
         }
 
-        // The timestamps from the C side have an undefined epoch; MediaCodec only needs them to increase.
-        var ts = enqueueTimeUs
+        // The timestamps from the C side have an undefined epoch, so rebase them to uptime. MediaCodec only needs them to
+        // increase, and this way the time a frame spent in the phone can be read back when it is shown.
+        if (baseTimestampUs == 0L) baseTimestampUs = SystemClock.uptimeMillis() * 1000 - enqueueTimeUs
+        var ts = baseTimestampUs + enqueueTimeUs
         if (ts <= lastTimestampUs) ts = lastTimestampUs + 1
         lastTimestampUs = ts
 
@@ -184,6 +203,7 @@ class MeshVideoDecoder(
                 }
                 if (SystemClock.uptimeMillis() > deadline) {
                     framesDropped++
+                    stats.onDropped()
                     return false
                 }
             }
@@ -196,21 +216,29 @@ class MeshVideoDecoder(
     private fun outputLoop(c: MediaCodec) {
         val info = MediaCodec.BufferInfo()
         try {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
+        } catch (_: Exception) {
+        }
+        try {
             while (!stopping) {
                 val index = c.dequeueOutputBuffer(info, 10_000)
                 if (index < 0) continue // timeout, format change or buffers changed: nothing to draw
 
                 // Newest frame wins: if more frames are already waiting, the older ones are released unseen.
                 var newest = index
+                var newestPts = info.presentationTimeUs
                 while (true) {
                     val more = c.dequeueOutputBuffer(info, 0)
                     if (more < 0) break
                     c.releaseOutputBuffer(newest, false)
                     framesDropped++
+                    stats.onDropped()
                     newest = more
+                    newestPts = info.presentationTimeUs
                 }
                 c.releaseOutputBuffer(newest, true)
                 framesRendered++
+                if (newestPts > 0) stats.onRendered(SystemClock.uptimeMillis() - newestPts / 1000)
                 if (!reportedFirstFrame) {
                     reportedFirstFrame = true
                     events.onFirstFrame(width, height)

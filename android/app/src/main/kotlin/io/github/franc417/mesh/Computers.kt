@@ -47,6 +47,9 @@ class ComputerStore(context: Context) {
 
     fun add(computer: Computer) = save(all() + computer)
 
+    /** Replaces the saved computer that has the same id (nothing happens if it is gone). */
+    fun update(computer: Computer) = save(all().map { if (it.id == computer.id) computer else it })
+
     fun remove(id: String) = save(all().filter { it.id != id })
 
     private fun save(list: List<Computer>) {

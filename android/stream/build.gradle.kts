@@ -55,6 +55,8 @@ dependencies {
     // OkHttp 4.12 on purpose: 5.x is built with a newer Kotlin than the 2.0.20 this project compiles with, and the
     // vendored NvHTTP only uses APIs that 4.12 has too.
     api("com.squareup.okhttp3:okhttp:4.12.0")
+    // Rewrites the video's H.264 header so the phone's decoder does not hold back frames (same library and version Moonlight uses).
+    implementation("org.jcodec:jcodec:0.2.5")
 
     testImplementation("junit:junit:4.13.2")
 }

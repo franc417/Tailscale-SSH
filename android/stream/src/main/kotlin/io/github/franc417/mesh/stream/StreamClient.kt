@@ -1,6 +1,8 @@
 package io.github.franc417.mesh.stream
 
 import android.content.Context
+import android.os.Build
+import android.os.SystemClock
 import android.view.Surface
 import com.limelight.LimeLog
 import com.limelight.binding.crypto.AndroidCryptoProvider
@@ -123,7 +125,7 @@ class StreamSession internal constructor(
     private val client: StreamClient,
     private val host: String,
     private val settings: StreamSettings,
-    surface: Surface,
+    private val surface: Surface,
     private val events: StreamEvents,
 ) {
     @Volatile private var stopped = false
@@ -144,9 +146,23 @@ class StreamSession internal constructor(
     )
     private val audio = MeshAudioRenderer()
 
-    /** One line for a diagnostics overlay. */
-    fun diagnostics(): String =
-        "${video.decoderName} · ${video.framesRendered} shown, ${video.framesDropped} dropped"
+    private var lastDiagnosticsAt = SystemClock.uptimeMillis()
+
+    /**
+     * One line for the status chip, covering the time since the previous call (the screen calls it once a second):
+     * frames per second, network round trip, the computer's encode time, the phone's decode time, dropped frames.
+     */
+    fun diagnostics(): String {
+        val now = SystemClock.uptimeMillis()
+        val snapshot = video.stats.take(now - lastDiagnosticsAt)
+        lastDiagnosticsAt = now
+        val rtt = try {
+            (MoonBridge.getEstimatedRttInfo() shr 32).toInt()
+        } catch (e: Throwable) {
+            null // the streaming core is not running (yet or any more)
+        }
+        return StreamStats.describe(snapshot, rtt)
+    }
 
     internal fun begin() {
         Thread({ run() }, "mesh-stream-start").start()
@@ -154,6 +170,7 @@ class StreamSession internal constructor(
 
     private fun run() {
         try {
+            awaitPreviousStop()
             events.onStatus("Contacting the computer")
             val info = client.probe(host)
             if (stopped) return
@@ -199,6 +216,15 @@ class StreamSession internal constructor(
                 .setAttachedGamepadMask(0)
                 .build()
 
+            // Ask the display to run at the stream's frame rate, so a 90 or 120 Hz screen does not judder a 60 fps picture.
+            if (Build.VERSION.SDK_INT >= 30) {
+                try {
+                    surface.setFrameRate(settings.fps.toFloat(), Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
+                } catch (e: Exception) {
+                    LimeLog.warning("StreamSession: setFrameRate failed: $e")
+                }
+            }
+
             events.onStatus("Starting ${app.appName}")
             val c = NvConnection(appContext, addr, info.httpsPort, StreamClient.UNIQUE_ID, config, client.crypto, cert)
             connection = c
@@ -231,14 +257,35 @@ class StreamSession internal constructor(
         video.prepareForStop() // synchronous and cheap, so the surface can go away right after this returns
         val c = connection
         if (c != null) {
-            Thread({
+            val t = Thread({
                 try {
                     c.stop()
                 } catch (e: Exception) {
                     LimeLog.warning("StreamSession: stop failed: $e")
                 }
-            }, "mesh-stream-stop").start()
+            }, "mesh-stream-stop")
+            // The streaming core keeps its state in globals, so a new session must not start until this one is fully gone.
+            synchronized(stopLock) { lastStop = t }
+            t.start()
         }
+    }
+
+    private fun awaitPreviousStop() {
+        val previous = synchronized(stopLock) { lastStop } ?: return
+        if (previous.isAlive) {
+            events.onStatus("Closing the previous stream")
+            try {
+                previous.join(10_000)
+            } catch (_: InterruptedException) {
+            }
+        }
+    }
+
+    private companion object {
+        val stopLock = Any()
+
+        /** The shutdown thread of the most recent session that was stopped. */
+        var lastStop: Thread? = null
     }
 
     private inner class Listener : NvConnectionListener {
