@@ -49,7 +49,9 @@ class StreamActivity : Activity() {
     private lateinit var keyboardBox: LinearLayout
     private lateinit var keyFrame: FrameLayout
     private lateinit var sizeButton: TextView
+    private lateinit var layoutChip: TextView
     private var keyboardEnlarged = false
+    private var enlargedBeforeEditing = false
     private lateinit var messagePanel: LinearLayout
     private lateinit var messageTitle: TextView
     private lateinit var messageBody: TextView
@@ -216,11 +218,13 @@ class StreamActivity : Activity() {
      */
     private fun buildKeyboardBox(): View {
         keyboard = KeyboardView(this).apply { onEvent = { inputLink?.bridge?.handle(it) } }
+        // The saved layout (made with the layout editor) is loaded, and every edit is saved for next time.
+        KeyboardPrefs.attach(this, keyboard)
         keyFrame = FrameLayout(this)
         keyFrame.addView(keyboard, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         val pad = Ui.dp(this, 6)
-        val handle = Ui.text(this, "Keyboard  \u00B7  drag here to move", 12f, Ui.MUTED).apply {
+        val handle = Ui.text(this, "Drag to move", 12f, Ui.MUTED).apply {
             setPadding(pad, pad, pad, pad)
         }
         var downX = 0f
@@ -246,11 +250,15 @@ class StreamActivity : Activity() {
         }
 
         sizeButton = chip("Bigger") { toggleKeyboardSize() }
+        layoutChip = chip("Layout") { keyboard.setEditMode(!keyboard.editMode) }
+        keyboard.onEditModeChanged = { editing -> onKeyboardEditChanged(editing) }
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
         header.addView(handle, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        header.addView(layoutChip)
+        header.addView(View(this), LinearLayout.LayoutParams(Ui.dp(this, 6), 1))
         header.addView(sizeButton)
         header.addView(View(this), LinearLayout.LayoutParams(Ui.dp(this, 6), 1))
         header.addView(chip("Hide") { setKeyboardVisible(false) })
@@ -268,8 +276,24 @@ class StreamActivity : Activity() {
     }
 
     private fun setKeyboardVisible(visible: Boolean) {
+        // Hiding the keyboard while it is being edited ends the editing, so it never comes back half-edited.
+        if (!visible && keyboard.editMode) keyboard.setEditMode(false)
         keyboardBox.visibility = if (visible) View.VISIBLE else View.GONE
         if (visible) layoutKeyboard()
+    }
+
+    /** Editing needs room, so the box grows to its enlarged size while editing and goes back afterwards. */
+    private fun onKeyboardEditChanged(editing: Boolean) {
+        layoutChip.text = if (editing) "Done" else "Layout"
+        if (editing) {
+            enlargedBeforeEditing = keyboardEnlarged
+            keyboardEnlarged = true
+        } else {
+            keyboardEnlarged = enlargedBeforeEditing
+        }
+        sizeButton.text = if (keyboardEnlarged) "Smaller" else "Bigger"
+        // The keyboard's own height changes when its edit bar appears or goes, so measure again once it has been rebuilt.
+        keyboard.post { layoutKeyboard() }
     }
 
     private fun toggleKeyboardSize() {
@@ -493,11 +517,10 @@ class StreamActivity : Activity() {
 
     private fun pair(host: String, hostName: String, g: Int) {
         val pin = String.format("%04d", SecureRandom().nextInt(10_000))
-        showMessage(
-            "Pair with $hostName",
-            "Enter this PIN in Sunshine's web page (Sunshine > PIN), then the desktop appears here. Waiting for the PIN...",
-            pin = pin,
-        )
+        // The computer's Mesh agent approves this pairing in Sunshine for us when it can, so there is nothing to type.
+        // The PIN is shown only if that does not work, and the same PIN is already being waited on below, so typing it
+        // into Sunshine's web page still completes the pairing.
+        showMessage("Pairing with $hostName", "Asking the computer to approve this phone...")
         Thread({
             val result = streamClient.pair(host, pin)
             runOnUiThread {
@@ -513,6 +536,38 @@ class StreamActivity : Activity() {
                 }
             }
         }, "mesh-pair").start()
+        askAgentToApprove(pin, hostName, g, attemptsLeft = 25)
+    }
+
+    /** Sends the PIN to the computer's agent over the secure input channel (waiting a moment for it to connect). */
+    private fun askAgentToApprove(pin: String, hostName: String, g: Int, attemptsLeft: Int) {
+        if (g != generation || paired) return
+        val link = inputLink
+        val mip = link?.connected
+        when {
+            mip != null && mip.canPairSunshine -> mip.pairSunshine(pin, Build.MODEL ?: "Android phone") { result ->
+                runOnUiThread {
+                    if (g != generation || paired) return@runOnUiThread
+                    if (result.ok) {
+                        showMessage("Pairing with $hostName", "Approved by the computer. Finishing...")
+                    } else {
+                        showManualPin(pin, hostName, result.text)
+                    }
+                }
+            }
+            mip != null -> showManualPin(pin, hostName, "The Mesh agent on this computer is too old to approve it automatically. Update it with git pull and restart it.")
+            link != null && link.connecting && attemptsLeft > 0 ->
+                handler.postDelayed({ askAgentToApprove(pin, hostName, g, attemptsLeft - 1) }, 200)
+            else -> showManualPin(pin, hostName, "The input connection to the computer is not up, so it could not approve this automatically.")
+        }
+    }
+
+    private fun showManualPin(pin: String, hostName: String, reason: String) {
+        showMessage(
+            "Pair with $hostName",
+            "$reason\n\nEnter this PIN in Sunshine's web page (Sunshine > PIN), then the desktop appears here. Waiting for the PIN...",
+            pin = pin,
+        )
     }
 
     // ---------------------------------------------------------------- stream

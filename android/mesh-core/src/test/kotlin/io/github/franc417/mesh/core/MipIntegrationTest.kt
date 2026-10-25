@@ -124,8 +124,27 @@ class MipIntegrationTest {
         val hello = client.connect()
         assertEquals(Mip.VERSION, hello.version)
         assertTrue(hello.features and Mip.FEATURE_TEXT != 0 && hello.features and Mip.FEATURE_HIRES_SCROLL != 0)
+        assertTrue(hello.features and Mip.FEATURE_SUNSHINE_PAIR != 0)
+        assertTrue(client.canPairSunshine)
         assertTrue(hello.hostName.isNotEmpty())
         assertTrue(client.isConnected)
+        client.close()
+    }
+
+    @Test
+    fun `the real agent answers a sunshine pairing request, here with how to set the login up`() = withAgent { agent ->
+        val client = MipClient(config(agent), Recorder())
+        client.connect()
+        val answer = AtomicReference<HostMessage.SunshineResult?>(null)
+        client.pairSunshine("1234", "Test phone") { answer.set(it) }
+        val end = System.currentTimeMillis() + 8000
+        while (answer.get() == null && System.currentTimeMillis() < end) Thread.sleep(25)
+        val result = answer.get()
+        assertNotNull("the agent never answered", result)
+        // This agent has no saved Sunshine login, so the answer says how to get one; nothing was sent to a Sunshine.
+        assertEquals(Mip.SUNSHINE_NOT_CONFIGURED, result!!.status)
+        assertTrue(result.text, result.text.contains("sunshine-login"))
+        assertTrue("the channel still works afterwards", client.isConnected)
         client.close()
     }
 

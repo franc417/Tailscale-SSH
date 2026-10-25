@@ -77,9 +77,13 @@ streaming engine inside the app. Typing and the trackpad still go over the Mesh 
 
 1. Install the newest **mesh-debug** APK (it replaces the old one, your saved computers stay).
 2. Tap **Open desktop** on the computer's card. The phone goes landscape.
-3. The first time, the phone shows a 4-digit PIN. Tap **Open Sunshine's PIN page** (or open
-   `https://<computer address>:47990/pin` on any device), log in, type the PIN and any device name, and send it.
-   The phone then continues by itself. This happens once per computer.
+3. The first time, the phone pairs with Sunshine **by itself**: it sends a PIN to the Mesh agent over the secure input
+   channel and the agent approves it in Sunshine. This needs one setup step on the computer, once:
+   `python3 mesh_input.py sunshine-login` (it asks for the username and password you use on Sunshine's web page,
+   or, if Sunshine has no login yet, makes one for itself). After that there is nothing to type, ever.
+   If the automatic way cannot work (for example the login was not set up), the phone says why and shows a 4-digit
+   PIN instead: tap **Open Sunshine's PIN page** (or open `https://<computer address>:47990/pin`), log in, type the PIN and
+   any device name. That is the old way and still works.
 4. The desktop appears and the controls tuck away so the picture is full screen. Tap the small **arrow tab** at the top
    centre to bring the bar back (and again to hide it). The bar has **Close**, a status line, **Smooth** (a menu to
    pick Smooth 720p60 / Sharp 1080p60 / Light 720p30) and **Keyboard**. Changing the quality restarts the stream.
@@ -101,6 +105,6 @@ streaming engine inside the app. Typing and the trackpad still go over the Mesh 
 
 ## What is not done in the desktop view
 
-- Pairing needs you to type the PIN into Sunshine's web page once (automatic PIN entry through the agent comes later).
+- Automatic pairing needs the one-time `sunshine-login` on the computer and a Sunshine from 2026 or newer (its PIN page changed that year).
 - H.264 only, stereo sound only, no HDR, no gamepad, no mouse through the streaming engine (input is Mesh's own channel).
 - No virtual display: with no monitor attached or a locked screen the picture may be black (Linux specific).

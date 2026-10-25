@@ -43,6 +43,7 @@ class InputLink(
         mine = mip
         client = mip
         val bridgeForThis = InputBridge(mip)
+        connecting = true
         Thread({
             try {
                 mip.connect()
@@ -52,12 +53,22 @@ class InputLink(
                 }
             } catch (e: MipException) {
                 if (client === mip) report(e.message ?: "Input could not connect", false)
+            } finally {
+                if (client === mip) connecting = false
             }
         }, "mesh-input-connect").start()
     }
 
+    /** The channel once it is connected (null while connecting and after it ended); use it for requests beyond plain input. */
+    val connected: MipClient? get() = if (bridge != null) client else null
+
+    /** True from the moment connect() is called until the channel is up or has failed. */
+    @Volatile var connecting: Boolean = false
+        private set
+
     /** Closing tells the computer to release any key still held down. */
     fun close() {
+        connecting = false
         bridge = null
         client?.close()
         client = null

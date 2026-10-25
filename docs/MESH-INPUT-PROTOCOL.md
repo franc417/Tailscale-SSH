@@ -53,6 +53,7 @@ u16 length | u8 type | payload          (big-endian; length counts type + payloa
 | 0x07 | PING | `u32 id` |
 | 0x08 | RELEASE_ALL | none |
 | 0x09 | BYE | none |
+| 0x0A | SUNSHINE_PAIR | `u8 n` `pin[n]` (4 ASCII digits) `u8 m` `name[m]` (UTF-8; what Sunshine should call the phone) |
 
 The first frame must be HELLO, within 3 seconds. Send a PING at least every 15 seconds (the app sends one
 every 5) or the host treats the phone as gone. Unknown types are ignored, so a newer phone can talk to an
@@ -62,11 +63,33 @@ older agent. Key names are listed in `KEY_CODES` in `mesh_input.py`; unknown nam
 
 | Type | Name | Payload |
 |---|---|---|
-| 0x81 | HELLO_OK | `u8 version` `u8 features` (1 text, 2 hi-res scroll) `u8 n` `host name[n]` |
+| 0x81 | HELLO_OK | `u8 version` `u8 features` (1 text, 2 hi-res scroll, 4 Sunshine pairing) `u8 n` `host name[n]` |
 | 0x82 | ERROR | `u8 code` `u8 n` `text[n]`, then the connection closes |
 | 0x87 | PONG | `u32 id` |
+| 0x8A | SUNSHINE_RESULT | `u8 status` `u8 n` `text[n]` (a sentence for a person) |
 
 Error codes: 1 bad token, 2 bad version, 3 replaced by another phone, 4 bad frame, 5 no HELLO.
+
+## Pairing the desktop view without a PIN (SUNSHINE_PAIR / SUNSHINE_RESULT)
+
+Sunshine pairs a viewer by holding its first request until a PIN is entered on Sunshine's web page. The agent can enter
+it instead, because the phone already holds the agent's pairing token:
+
+1. The phone picks a 4-digit PIN, sends `SUNSHINE_PAIR` (PIN and a name) over this channel, and at the same moment starts
+   the normal Moonlight-style pairing with Sunshine, using the same PIN.
+2. The agent looks (through Sunshine's web interface on 127.0.0.1, with a login saved once by
+   `python3 mesh_input.py sunshine-login`) for the phone's pending pairing request: the one whose address is the
+   address this phone connected from. It approves that request with the PIN. A request from any other address is never approved.
+3. The agent answers `SUNSHINE_RESULT`. Status 0 means approved; the phone's own pairing with Sunshine then completes by itself.
+   The request runs beside normal traffic, so pings keep being answered while it waits (up to about 20 seconds).
+
+Status codes: 0 paired, 1 the agent has no saved Sunshine login (the text says how to make one), 2 Sunshine's web interface
+does not answer, 3 the saved login is not accepted, 4 no pairing request arrived or Sunshine refused the PIN, 5 the PIN is not
+4 digits. Any failure leaves the phone's own pairing waiting, so the phone shows the same PIN and a person can still type it
+into Sunshine's web page. An agent that does not advertise feature bit 4 simply ignores the message.
+
+Sunshine versions: written against 2026.914 (`GET /api/pin` lists `{pairings: [{id, name, address}]}`, `POST /api/pin`
+takes `{pairing_id, pin, name}`). Older Sunshine versions that lack the pairing list are not supported by this path.
 
 ## Behaviour worth knowing
 
@@ -88,6 +111,8 @@ KEY(KeyA, down)            0007 05 01 04 4b657941
 TEXT("hé")                 0004 06 68c3a9
 PING(7)                    0005 07 00000007
 RELEASE_ALL                0001 08
+SUNSHINE_PAIR("1234","pixel") 000c 0a 04 31323334 05 706978656c
+SUNSHINE_RESULT(0,"paired")   0009 8a 00 06 706169726564
 HELLO(token aabb, "ph")    0008 01 01 02aabb 02 7068
 ```
 

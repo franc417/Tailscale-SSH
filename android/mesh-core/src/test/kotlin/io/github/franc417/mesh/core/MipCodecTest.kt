@@ -1,6 +1,7 @@
 package io.github.franc417.mesh.core
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -87,5 +88,48 @@ class MipCodecTest {
         val data = byteArrayOf(0, 1, 127, -128, -1)
         assertEquals("00017f80ff", data.toHex())
         assertTrue(data.contentEquals("00017f80ff".hexToBytes()))
+    }
+
+    @Test
+    fun `sunshine pairing frames match the agent's vectors`() {
+        // The agent's own tests check the same bytes (tests/test_sunshine_link.py).
+        assertEquals("000c0a043132333405706978656c", MipCodec.sunshinePair("1234", "pixel").toHex())
+        assertEquals(HostMessage.SunshineResult(Mip.SUNSHINE_OK, "paired"), decode("00098a0006706169726564"))
+        assertEquals(HostMessage.SunshineResult(Mip.SUNSHINE_NOT_CONFIGURED, "no"), decode("00058a01" + "02" + "6e6f"))
+        assertTrue(HostMessage.SunshineResult(0, "").ok)
+        assertFalse(HostMessage.SunshineResult(4, "").ok)
+    }
+
+    @Test
+    fun `a sunshine pairing needs a four digit pin`() {
+        for (bad in listOf("", "123", "12345", "12a4", "\u0661\u0662\u0663\u0664", " 123")) {
+            var failed = false
+            try {
+                MipCodec.sunshinePair(bad, "phone")
+            } catch (e: IllegalArgumentException) {
+                failed = true
+            }
+            assertTrue("pin '$bad' should be refused", failed)
+        }
+    }
+
+    @Test
+    fun `a long phone name is cut so the frame always fits`() {
+        val frame = MipCodec.sunshinePair("0000", "\uD83D\uDE00".repeat(200))
+        assertTrue(frame.size <= 2 + Mip.MAX_FRAME)
+    }
+
+    @Test
+    fun `truncated sunshine results are rejected rather than misread`() {
+        for (hex in listOf("00028a00", "00048a0005" + "6162")) {
+            val bytes = hex.hexToBytes()
+            var failed = false
+            try {
+                MipCodec.decodeHost(bytes[2].toInt() and 0xFF, bytes.copyOfRange(3, bytes.size))
+            } catch (e: IllegalArgumentException) {
+                failed = true
+            }
+            assertTrue("should reject $hex", failed)
+        }
     }
 }

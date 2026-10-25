@@ -141,6 +141,7 @@ class MipClient(private val config: Config, private val listener: Listener) : In
                     val (type, payload) = readFrame(inp)
                     when (val msg = MipCodec.decodeHost(type, payload)) {
                         is HostMessage.Pong -> pingSentAt.remove(msg.id)?.let { listener.onRtt((System.nanoTime() - it) / 1_000_000) }
+                        is HostMessage.SunshineResult -> sunshineWaiter.deliver(msg)
                         is HostMessage.Error -> {
                             listener.onError(msg.code, msg.text)
                             finish(if (msg.code == Mip.E_REPLACED) "another phone took over this computer" else msg.text)
@@ -198,6 +199,22 @@ class MipClient(private val config: Config, private val listener: Listener) : In
     }
 
     fun releaseAll() = send(MipCodec.releaseAll())
+
+    private val sunshineWaiter = SunshineWaiter()
+
+    /** True when the connected computer's agent can approve a Sunshine pairing for this phone (it is a recent enough agent). */
+    val canPairSunshine: Boolean get() = ((hello?.features ?: 0) and Mip.FEATURE_SUNSHINE_PAIR) != 0
+
+    /**
+     * Asks the computer's agent to approve this phone's pending Sunshine pairing with [pin], so nobody has to type it.
+     * The caller starts the normal pairing with Sunshine itself right after (using the same [pin]); [onResult] gets the
+     * agent's answer once, from a background thread, or a Mip.SUNSHINE_CONNECTION_LOST result if the connection ends first.
+     */
+    fun pairSunshine(pin: String, name: String, onResult: (HostMessage.SunshineResult) -> Unit) {
+        val frame = MipCodec.sunshinePair(pin, name)   // validates the PIN before anything is registered
+        sunshineWaiter.start(onResult)
+        send(frame)
+    }
 
     private fun send(frame: ByteArray) = post {
         flushMotion()
@@ -257,6 +274,7 @@ class MipClient(private val config: Config, private val listener: Listener) : In
 
     private fun finish(reason: String) {
         if (!finished.compareAndSet(false, true)) return
+        sunshineWaiter.deliver(HostMessage.SunshineResult(Mip.SUNSHINE_CONNECTION_LOST, "the connection to the computer ended before it answered"))
         closeQuietly(socket)
         scheduler.shutdownNow()
         writer.shutdownNow()

@@ -514,8 +514,10 @@ object DefaultLayout {
     private const val TALL = 1.34f
 
     private val lettersRows: List<RowDef> = listOf(
-        // esc is one key wide above the "1" column, prtsc one key wide above the "0" column.
-        RowDef(listOf(esc(), gap(8f), prtsc()), 0.7f),
+        // esc is one key wide above the "1" column and prtsc one key wide above the "0" column. "_" sits right after
+        // esc and "-" right before prtsc: the letters page had no underscore or hyphen at all. 1 + 1 + 6 + 1 + 1 = 10,
+        // the same total as the digits row, so esc and prtsc keep their places above 1 and 0.
+        RowDef(listOf(esc(), s("_", "Minus"), gap(6f), k("-", "Minus"), prtsc()), 0.7f),
         RowDef(digits()),
         RowDef(letters("qwertyuiop")),
         RowDef(listOf(gap(0.5f)) + letters("asdfghjkl") + gap(0.5f)),

@@ -26,11 +26,13 @@ object Mip {
     const val T_PING = 0x07
     const val T_RELEASE_ALL = 0x08
     const val T_BYE = 0x09
+    const val T_SUNSHINE_PAIR = 0x0A
 
     // host -> phone
     const val T_HELLO_OK = 0x81
     const val T_ERROR = 0x82
     const val T_PONG = 0x87
+    const val T_SUNSHINE_RESULT = 0x8A
 
     const val E_BAD_TOKEN = 1
     const val E_BAD_VERSION = 2
@@ -40,6 +42,18 @@ object Mip {
 
     const val FEATURE_TEXT = 0x01
     const val FEATURE_HIRES_SCROLL = 0x02
+    const val FEATURE_SUNSHINE_PAIR = 0x04
+
+    // T_SUNSHINE_RESULT status codes (the host agent's S_* values)
+    const val SUNSHINE_OK = 0
+    const val SUNSHINE_NOT_CONFIGURED = 1
+    const val SUNSHINE_UNREACHABLE = 2
+    const val SUNSHINE_LOGIN_REFUSED = 3
+    const val SUNSHINE_FAILED = 4
+    const val SUNSHINE_BAD_REQUEST = 5
+
+    /** Not sent by the host: used when the answer never came because the connection to the computer ended. */
+    const val SUNSHINE_CONNECTION_LOST = -1
 
     const val BUTTON_LEFT = 1
     const val BUTTON_MIDDLE = 2
@@ -53,6 +67,11 @@ sealed class HostMessage {
     data class HelloOk(val version: Int, val features: Int, val hostName: String) : HostMessage()
     data class Error(val code: Int, val text: String) : HostMessage()
     data class Pong(val id: Int) : HostMessage()
+
+    /** The answer to a Sunshine pairing request: [status] is a Mip.SUNSHINE_* value, [text] says why in plain words. */
+    data class SunshineResult(val status: Int, val text: String) : HostMessage() {
+        val ok: Boolean get() = status == Mip.SUNSHINE_OK
+    }
     data class Unknown(val type: Int) : HostMessage()
 }
 
@@ -120,6 +139,12 @@ object MipCodec {
 
     fun bye(): ByteArray = frame(Mip.T_BYE)
 
+    /** "Pair my desktop view with this PIN": [pin] is 4 digits, [name] what the computer should call this phone. */
+    fun sunshinePair(pin: String, name: String): ByteArray {
+        require(pin.length == 4 && pin.all { it in '0'..'9' }) { "the PIN must be 4 digits" }
+        return frame(Mip.T_SUNSHINE_PAIR, short(pin.toByteArray(Charsets.US_ASCII), "pin") + short(name.take(60).toByteArray(Charsets.UTF_8), "name"))
+    }
+
     fun decodeHost(type: Int, payload: ByteArray): HostMessage = when (type) {
         Mip.T_HELLO_OK -> {
             require(payload.size >= 3) { "HELLO_OK truncated" }
@@ -136,6 +161,12 @@ object MipCodec {
         Mip.T_PONG -> {
             require(payload.size == 4) { "PONG: bad payload" }
             HostMessage.Pong(ByteBuffer.wrap(payload).int)
+        }
+        Mip.T_SUNSHINE_RESULT -> {
+            require(payload.size >= 2) { "SUNSHINE_RESULT truncated" }
+            val n = payload[1].toInt() and 0xFF
+            require(payload.size >= 2 + n) { "SUNSHINE_RESULT truncated" }
+            HostMessage.SunshineResult(payload[0].toInt() and 0xFF, String(payload, 2, n, Charsets.UTF_8))
         }
         else -> HostMessage.Unknown(type)
     }

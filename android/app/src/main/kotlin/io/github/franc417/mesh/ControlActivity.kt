@@ -81,12 +81,17 @@ class ControlActivity : Activity() {
         bar.addView(titles, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         retry = Ui.button(this, "Reconnect") { connect() }.apply { visibility = View.GONE }
         bar.addView(retry)
-        root.addView(bar)
 
         val trackpad = TrackpadView(this)
         val keyboard = KeyboardView(this)
         trackpad.onEvent = { bridge?.handle(it) }
         keyboard.onEvent = { bridge?.handle(it) }
+        // The keyboard layout editor: the saved layout is loaded, every edit is saved, and the button turns editing on and off.
+        KeyboardPrefs.attach(this, keyboard)
+        val layoutButton = Ui.button(this, "Layout") { keyboard.setEditMode(!keyboard.editMode) }
+        keyboard.onEditModeChanged = { editing -> layoutButton.text = if (editing) "Done" else "Layout" }
+        bar.addView(layoutButton)
+        root.addView(bar)
         root.addView(trackpad, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         root.addView(keyboard, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         return root

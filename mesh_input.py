@@ -23,6 +23,7 @@ See docs/MESH-INPUT-PROTOCOL.md.
 Commands:
   python3 mesh_input.py init                 create the certificate and token
   python3 mesh_input.py pair-info            print what the phone needs, as JSON
+  python3 mesh_input.py sunshine-login       save Sunshine's web login once, so the phone pairs its desktop view with no PIN
   python3 mesh_input.py run [--port N]       serve (needs /dev/uinput access)
   python3 mesh_input.py install-service      start at every login and restart on failure (systemd user service)
   python3 mesh_input.py uninstall-service    stop and remove that service
@@ -30,12 +31,16 @@ Commands:
 
 import argparse
 import asyncio
+import base64
 import fcntl
+import getpass
 import hashlib
 import hmac
 import json
 import math
 import os
+import re
+import secrets
 import shutil
 import socket
 import ssl
@@ -44,6 +49,8 @@ import struct
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from typing import Callable, Dict, List, Optional, Tuple
 
 VERSION = 1
@@ -64,10 +71,12 @@ T_TEXT = 0x06
 T_PING = 0x07
 T_RELEASE_ALL = 0x08
 T_BYE = 0x09
+T_SUNSHINE_PAIR = 0x0A    # "pair my desktop view with this PIN" (see SunshineLink)
 # ---- host -> phone
 T_HELLO_OK = 0x81
 T_ERROR = 0x82
 T_PONG = 0x87
+T_SUNSHINE_RESULT = 0x8A
 
 # error codes
 E_BAD_TOKEN = 1
@@ -78,6 +87,15 @@ E_NO_HELLO = 5
 
 FEATURE_TEXT = 0x01
 FEATURE_HIRES_SCROLL = 0x02
+FEATURE_SUNSHINE_PAIR = 0x04
+
+# T_SUNSHINE_RESULT status codes
+S_OK = 0                # the phone is paired with Sunshine
+S_NOT_CONFIGURED = 1    # this agent has no saved Sunshine login yet
+S_UNREACHABLE = 2       # Sunshine's web interface does not answer
+S_LOGIN_REFUSED = 3     # the saved login is not accepted (changed in Sunshine?)
+S_FAILED = 4            # no pairing request arrived, the PIN was wrong, or it timed out
+S_BAD_REQUEST = 5       # the PIN is not 4 digits
 
 BUTTON_NAMES = {1: "left", 2: "middle", 3: "right", 4: "back", 5: "forward"}
 
@@ -161,7 +179,15 @@ def msg_bye() -> bytes:
     return encode_frame(T_BYE)
 
 
-def msg_hello_ok(host_name: str, features: int = FEATURE_TEXT | FEATURE_HIRES_SCROLL) -> bytes:
+def msg_sunshine_pair(pin: str, name: str) -> bytes:
+    return encode_frame(T_SUNSHINE_PAIR, _short_bytes(pin.encode("ascii"), "pin") + _short_bytes(name.encode()[:128], "name"))
+
+
+def msg_sunshine_result(code: int, text: str) -> bytes:
+    return encode_frame(T_SUNSHINE_RESULT, bytes([code]) + _short_bytes(text.encode()[:200], "result text"))
+
+
+def msg_hello_ok(host_name: str, features: int = FEATURE_TEXT | FEATURE_HIRES_SCROLL | FEATURE_SUNSHINE_PAIR) -> bytes:
     return encode_frame(T_HELLO_OK, bytes([VERSION, features]) + _short_bytes(host_name.encode(), "host name"))
 
 
@@ -220,6 +246,15 @@ def parse_key(payload: bytes) -> Tuple[str, bool]:
     if end != len(payload):
         raise ProtocolError("key: trailing bytes")
     return code.decode("ascii", "replace"), bool(payload[0])
+
+
+def parse_sunshine_pair(payload: bytes) -> Tuple[str, str]:
+    pin, end = _take_short(payload, 0, "pin")
+    name, end = _take_short(payload, end, "name")
+    try:
+        return pin.decode("ascii"), name.decode("utf-8", "replace")
+    except UnicodeDecodeError as exc:
+        raise ProtocolError("pin: not ASCII") from exc
 
 
 def parse_text(payload: bytes) -> str:
@@ -654,12 +689,245 @@ def reset_token(directory: str) -> None:
         pass
 
 
+# ---------------------------------------------------------------- Sunshine link (desktop view pairing without a PIN)
+
+SUNSHINE_URL = "https://127.0.0.1:47990"   # Sunshine's own web interface, on this computer only
+SUNSHINE_LOGIN_FILE = "sunshine.json"
+SUNSHINE_PIN_WAIT = 20.0                    # seconds to wait for the phone's pairing request to show up in Sunshine
+NOT_CONFIGURED_TEXT = "Mesh has no Sunshine login yet. On the computer run: python3 mesh_input.py sunshine-login"
+
+
+class SunshineError(Exception):
+    def __init__(self, code: int, text: str) -> None:
+        super().__init__(text)
+        self.code = code
+        self.text = text
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Sunshine answers "no login set yet" with a redirect to /welcome; that must be seen, not followed."""
+
+    def redirect_request(self, *args, **kwargs):  # noqa: D102
+        return None
+
+
+def _normalize_address(address: str) -> str:
+    """Makes the phone's address (from our socket) comparable to the one Sunshine reports for the same phone."""
+    a = (address or "").strip().lower()
+    if "%" in a:
+        a = a.split("%", 1)[0]
+    if a.startswith("::ffff:"):
+        a = a[len("::ffff:"):]
+    return a
+
+
+class SunshineLink:
+    """Lets a phone that already has this agent's pairing token pair its desktop view with Sunshine without anyone typing a PIN.
+
+    Sunshine holds a pairing request from a phone until a PIN is entered on its web page. This agent enters it instead:
+    the phone picks a PIN, tells it to the agent over the already authenticated, encrypted channel, and starts the
+    normal pairing with Sunshine; the agent finds that pending request through Sunshine's local web interface and
+    approves it with the PIN. Whoever holds the pairing token could already control this computer's keyboard and mouse,
+    so letting the same token also authorise a desktop viewer adds no new kind of access.
+
+    It talks to Sunshine only on this computer (127.0.0.1), with a login Sunshine's web interface accepts. The login is
+    kept in a private file next to the agent's certificate and token (see save_login).
+    """
+
+    def __init__(self, directory: str, url: Optional[str] = None, sleep: Callable[[float], None] = time.sleep,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self.directory = directory
+        self.url = (url or os.environ.get("MESH_SUNSHINE_URL") or SUNSHINE_URL).rstrip("/")
+        self._sleep = sleep
+        self._clock = clock
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False   # Sunshine's certificate is self-signed and this never leaves the computer
+        ctx.verify_mode = ssl.CERT_NONE
+        self._opener = urllib.request.build_opener(_NoRedirect, urllib.request.HTTPSHandler(context=ctx))
+
+    # -- the saved login
+
+    @property
+    def login_path(self) -> str:
+        return os.path.join(self.directory, SUNSHINE_LOGIN_FILE)
+
+    def load_login(self) -> Optional[Tuple[str, str]]:
+        try:
+            with open(self.login_path) as f:
+                data = json.load(f)
+            return str(data["username"]), str(data["password"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return None   # missing or damaged: both mean "not configured"
+
+    def has_login(self) -> bool:
+        return self.load_login() is not None
+
+    def save_login(self, username: str, password: str) -> None:
+        os.makedirs(self.directory, mode=0o700, exist_ok=True)
+        tmp = self.login_path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)   # private from the first byte
+        with os.fdopen(fd, "w") as f:
+            json.dump({"username": username, "password": password}, f)
+        os.replace(tmp, self.login_path)
+        os.chmod(self.login_path, 0o600)
+
+    def forget_login(self) -> None:
+        try:
+            os.remove(self.login_path)
+        except FileNotFoundError:
+            pass
+
+    # -- talking to Sunshine
+
+    @staticmethod
+    def _json(raw: bytes):
+        try:
+            return json.loads(raw.decode("utf-8", "replace"))
+        except ValueError:
+            return None
+
+    def _call(self, method: str, path: str, body=None, auth: bool = True, timeout: float = 10.0):
+        headers = {"Accept": "application/json"}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
+        if auth:
+            login = self.load_login()
+            if login is None:
+                raise SunshineError(S_NOT_CONFIGURED, NOT_CONFIGURED_TEXT)
+            headers["Authorization"] = "Basic " + base64.b64encode(f"{login[0]}:{login[1]}".encode()).decode()
+        request = urllib.request.Request(self.url + path, data=data, method=method, headers=headers)
+        try:
+            with self._opener.open(request, timeout=timeout) as response:
+                return response.status, self._json(response.read())
+        except urllib.error.HTTPError as exc:   # also carries the 3xx answers, because redirects are not followed
+            return exc.code, self._json(exc.read())
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            raise SunshineError(S_UNREACHABLE, f"Sunshine's web interface at {self.url} does not answer ({exc}). Is Sunshine running?")
+
+    @staticmethod
+    def _expect_ok(status: int) -> None:
+        if status == 200:
+            return
+        if status in (301, 302, 303, 307, 308):
+            raise SunshineError(S_NOT_CONFIGURED, "Sunshine has no web login yet. On the computer run: python3 mesh_input.py sunshine-login")
+        if status in (401, 403):
+            raise SunshineError(S_LOGIN_REFUSED, "Sunshine did not accept Mesh's saved login. On the computer run: python3 mesh_input.py sunshine-login")
+        raise SunshineError(S_UNREACHABLE, f"Sunshine's web interface answered with an error ({status})")
+
+    def check_login(self) -> None:
+        """Raises SunshineError unless Sunshine accepts the saved login."""
+        status, _ = self._call("GET", "/api/pin")
+        self._expect_ok(status)
+
+    def needs_first_login(self) -> bool:
+        """True when Sunshine has no web login at all yet (a fresh install), so one can be created."""
+        status, _ = self._call("GET", "/api/pin", auth=False)
+        return status in (301, 302, 303, 307, 308)
+
+    def create_login(self, username: str = "mesh") -> str:
+        """Sets Sunshine's first web login (only possible while it has none) and saves it. Returns the password."""
+        password = secrets.token_urlsafe(18)
+        status, data = self._call("POST", "/api/password", auth=False, body={
+            "newUsername": username, "newPassword": password, "confirmNewPassword": password})
+        if status != 200 or not (isinstance(data, dict) and data.get("status") is True):
+            raise SunshineError(S_FAILED, "Sunshine did not accept a new login")
+        self.save_login(username, password)
+        return password
+
+    def ensure_desktop_app(self) -> bool:
+        """Makes sure Sunshine has an application called Desktop (streams the whole screen). True if it was added."""
+        status, data = self._call("GET", "/api/apps")
+        self._expect_ok(status)
+        apps = data.get("apps", []) if isinstance(data, dict) else []
+        if any(isinstance(a, dict) and str(a.get("name", "")).strip().lower() == "desktop" for a in apps):
+            return False
+        status, data = self._call("POST", "/api/apps", body={"name": "Desktop", "output": "", "cmd": "", "index": -1, "image-path": "desktop.png"})
+        if status != 200:
+            raise SunshineError(S_FAILED, f"Sunshine would not add a Desktop application ({status})")
+        return True
+
+    # -- pairing
+
+    def pair(self, pin: str, name: str, peer: str = "", wait: float = SUNSHINE_PIN_WAIT) -> None:
+        """Approves the phone's pending pairing request with [pin]. Blocks; raises SunshineError with a reason a person can act on.
+
+        [peer] is the phone's address as this agent sees it: a pending request from any other address is ignored, so a
+        stranger's request that happens to arrive at the same moment is never approved."""
+        if not re.fullmatch(r"[0-9]{4}", pin or ""):
+            raise SunshineError(S_BAD_REQUEST, "the PIN must be exactly 4 digits")
+        name = (name or "").strip().encode()[:128].decode("utf-8", "ignore") or "Mesh phone"
+        peer = _normalize_address(peer)
+        deadline = self._clock() + wait
+        pairing_id = None
+        while pairing_id is None:
+            status, data = self._call("GET", "/api/pin")
+            self._expect_ok(status)
+            pending = data.get("pairings", []) if isinstance(data, dict) else []
+            ours = [p for p in pending if isinstance(p, dict) and p.get("id")
+                    and (not peer or _normalize_address(str(p.get("address", ""))) == peer)]
+            if ours:
+                pairing_id = str(ours[-1]["id"])
+                break
+            if self._clock() >= deadline:
+                if pending:
+                    raise SunshineError(S_FAILED, "Sunshine only has a pairing request from another device, which was left alone")
+                raise SunshineError(S_FAILED, "the phone's pairing request never reached Sunshine (is the phone able to reach Sunshine's port 47989?)")
+            self._sleep(0.25)
+        status, data = self._call("POST", "/api/pin", timeout=35.0,
+                                  body={"pairing_id": pairing_id, "pin": pin, "name": name})
+        if status == 200 and isinstance(data, dict) and data.get("status") is True:
+            return
+        if status in (401, 403):
+            raise SunshineError(S_LOGIN_REFUSED, "Sunshine did not accept Mesh's saved login. On the computer run: python3 mesh_input.py sunshine-login")
+        raise SunshineError(S_FAILED, "Sunshine did not complete the pairing (wrong PIN or it timed out)")
+
+
+def sunshine_login(directory: str, url: Optional[str] = None, username: Optional[str] = None,
+                   password: Optional[str] = None, ask: Callable[[str], str] = input,
+                   ask_secret: Callable[[str], str] = getpass.getpass, out: Callable[[str], None] = print) -> int:
+    """The `sunshine-login` command: lets the agent approve this computer's Sunshine pairings. Returns an exit code."""
+    link = SunshineLink(directory, url)
+    try:
+        if link.needs_first_login():
+            link.create_login()
+            out("Sunshine had no web login yet, so Mesh made one for itself (username: mesh).")
+            out(f"The password is in {link.login_path}; use it if you ever want Sunshine's own web page.")
+        else:
+            username = username or ask("Sunshine web username: ").strip()
+            password = password or ask_secret("Sunshine web password (not shown): ")
+            if not username or not password:
+                out("error: a username and a password are both needed")
+                return 1
+            link.save_login(username, password)
+            try:
+                link.check_login()
+            except SunshineError:
+                link.forget_login()   # never keep a login that does not work
+                raise
+            out("Sunshine accepted the login. It is saved privately, for this agent only.")
+        try:
+            if link.ensure_desktop_app():
+                out("Added a Desktop application to Sunshine.")
+        except SunshineError as exc:
+            out(f"note: could not check Sunshine's applications ({exc.text})")
+    except SunshineError as exc:
+        out(f"error: {exc.text}")
+        return 1
+    out("Done: from now on the phone pairs its desktop view with this computer automatically, with no PIN to type.")
+    return 0
+
+
 # ---------------------------------------------------------------- server
 
 class Server:
     def __init__(self, injector: Injector, token: bytes, host_name: str = "",
                  hello_timeout: float = HELLO_TIMEOUT, idle_timeout: float = IDLE_TIMEOUT,
-                 log: Callable[[str], None] = lambda s: None) -> None:
+                 log: Callable[[str], None] = lambda s: None, sunshine: Optional["SunshineLink"] = None) -> None:
+        self.sunshine = sunshine
+        self._tasks: set = set()          # running Sunshine pairings, kept so they are not garbage collected
+        self._active_peer = ""            # the authenticated phone's address, as this agent sees it
         self.injector = injector
         self.token = token
         self.host_name = host_name or socket.gethostname()
@@ -726,6 +994,7 @@ class Server:
                 pass
             self.injector.release_all()
         self._active = writer
+        self._active_peer = _normalize_address(str(peer[0])) if peer else ""
         self._active_name = name or str(peer)
         self.log(f"{self._active_name} connected")
         await self._send(writer, msg_hello_ok(self.host_name))
@@ -750,9 +1019,30 @@ class Server:
                 await self._send(writer, msg_pong(parse_id(payload)))
             elif msg_type == T_RELEASE_ALL:
                 self.injector.release_all()
+            elif msg_type == T_SUNSHINE_PAIR:
+                pin, name = parse_sunshine_pair(payload)
+                # Runs beside the normal traffic: pairing can take many seconds and pings must keep being answered.
+                task = asyncio.ensure_future(self._sunshine_pair(writer, pin, name, self._active_peer))
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
             elif msg_type == T_BYE:
                 return
             # unknown types are ignored so a newer phone can talk to an older agent
+
+    async def _sunshine_pair(self, writer, pin: str, name: str, peer: str) -> None:
+        if self.sunshine is None:
+            await self._send(writer, msg_sunshine_result(S_NOT_CONFIGURED, "this agent was started without the Sunshine link"))
+            return
+        link = self.sunshine
+        try:
+            await asyncio.get_running_loop().run_in_executor(None, lambda: link.pair(pin, name, peer))
+            code, text = S_OK, "paired"
+        except SunshineError as exc:
+            code, text = exc.code, exc.text
+        except Exception as exc:   # a bug here must never take the input channel down
+            code, text = S_FAILED, f"unexpected error: {exc}"
+        self.log(f"sunshine pairing for {self._active_name or peer}: {text}")
+        await self._send(writer, msg_sunshine_result(code, text))
 
     @staticmethod
     async def _send(writer, frame: bytes) -> None:
@@ -776,7 +1066,7 @@ def _log(message: str) -> None:
 
 async def serve(directory: str, port: int, injector: Injector, log=_log, host: str = "0.0.0.0") -> None:
     cert, key, token = ensure_identity(directory)
-    server = Server(injector, token, log=log)
+    server = Server(injector, token, log=log, sunshine=SunshineLink(directory))
     tls = await asyncio.start_server(server.handle, host, port, ssl=make_ssl_context(cert, key))
     log(f"mesh input channel listening on port {port}  (certificate {cert_fingerprint(cert)[:16]}...)")
     addresses = local_addresses()
@@ -853,12 +1143,19 @@ def uninstall_service(target_dir: Optional[str] = None, runner=subprocess.run) -
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Mesh input channel (host side)")
-    ap.add_argument("command", choices=["init", "pair-info", "run", "reset-token", "install-service", "uninstall-service"])
+    ap.add_argument("command", choices=["init", "pair-info", "run", "reset-token", "install-service", "uninstall-service", "sunshine-login"])
     ap.add_argument("--dir", default=default_dir())
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--dry-run", action="store_true", help="record events instead of injecting them")
     ap.add_argument("--no-start", action="store_true", help="install-service: write the unit but do not start it")
+    ap.add_argument("--sunshine-url", default=None, help="sunshine-login: Sunshine's web address (default https://127.0.0.1:47990)")
+    ap.add_argument("--sunshine-user", default=None, help="sunshine-login: the username, instead of being asked")
+    ap.add_argument("--password-stdin", action="store_true", help="sunshine-login: read the password from standard input")
     args = ap.parse_args(argv)
+
+    if args.command == "sunshine-login":
+        password = sys.stdin.readline().rstrip("\n") if args.password_stdin else None
+        return sunshine_login(args.dir, args.sunshine_url, args.sunshine_user, password)
 
     if args.command in ("install-service", "uninstall-service"):
         try:
@@ -882,6 +1179,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 1
         print(json.dumps(info) if args.command == "pair-info" else f"ready: certificate {info['fingerprint'][:16]}...")
+        if args.command == "pair-info" and not SunshineLink(args.dir).has_login():
+            # On stderr, so the JSON above can still be copied cleanly.
+            print("tip: run `python3 mesh_input.py sunshine-login` once so the phone can pair its desktop view with no PIN to type",
+                  file=sys.stderr)
         return 0
 
     try:

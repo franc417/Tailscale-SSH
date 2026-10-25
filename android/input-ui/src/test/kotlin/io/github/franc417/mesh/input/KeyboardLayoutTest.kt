@@ -124,10 +124,29 @@ class KeyboardLayoutTest {
             }
             error("no $code")
         }
-        assertEquals(listOf("esc", "prtsc"), rows[0].keys.filter { !it.isSpacer }.map { it.label })
+        assertEquals(listOf("esc", "_", "-", "prtsc"), rows[0].keys.filter { !it.isSpacer }.map { it.label })
         near(centre(rows[1], "Digit1"), centre(rows[0], "Escape"), 0.001f)
         near(centre(rows[1], "Digit0"), centre(rows[0], "PrintScreen"), 0.001f)
         assertEquals(10, rows[1].keys.size)
+    }
+
+    @Test
+    fun `underscore follows esc and hyphen precedes prtsc on the top row`() {
+        val top = default.layer("letters")!!.rows[0]
+        val real = top.keys.filter { !it.isSpacer }
+        assertEquals("esc", real.first().label)
+        assertEquals("prtsc", real.last().label)
+        // "_" is the key right after esc, "-" the key right before prtsc.
+        val underscore = real[1]
+        val hyphen = real[real.size - 2]
+        assertEquals("_", underscore.label)
+        assertEquals("Minus", underscore.code)
+        assertEquals(listOf("shift"), underscore.mods)
+        assertEquals("-", hyphen.label)
+        assertEquals("Minus", hyphen.code)
+        assertTrue(hyphen.mods.isEmpty())
+        // The top row is as wide as the digits row, so nothing above it shifts.
+        near(rowOf(default, "letters", 1).totalWeight, top.totalWeight, 0.001f)
     }
 
     @Test
