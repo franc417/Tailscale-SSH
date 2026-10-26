@@ -7,6 +7,9 @@ interface InputSink {
     fun button(button: Int, down: Boolean)
     fun key(code: String, down: Boolean)
     fun text(text: String)
+
+    /** Puts the pointer at a spot on the streamed screen (touch mode): [x] and [y] are fractions 0..1 from the top left. */
+    fun moveAbs(x: Float, y: Float) {}
 }
 
 /**
@@ -31,6 +34,11 @@ class InputBridge(private val sink: InputSink) {
             "scroll" -> {
                 val vertical = number(event["dy"]) ?: return
                 sink.scroll(vertical, number(event["dx"]) ?: 0f)
+            }
+            "moveabs" -> {
+                val x = number(event["x"])
+                val y = number(event["y"])
+                if (x != null && y != null) sink.moveAbs(x, y)
             }
             "click" -> click(event)
             "key" -> key(event)

@@ -12,6 +12,7 @@ class InputBridgeTest {
         override fun button(button: Int, down: Boolean) { calls.add("button $button ${if (down) "down" else "up"}") }
         override fun key(code: String, down: Boolean) { calls.add("key $code ${if (down) "down" else "up"}") }
         override fun text(text: String) { calls.add("text $text") }
+        override fun moveAbs(x: Float, y: Float) { calls.add("abs $x $y") }
     }
 
     private fun run(vararg events: Map<String, Any?>): List<String> {
@@ -27,6 +28,27 @@ class InputBridgeTest {
         assertEquals(listOf("move 3.0 4.0"), run(mapOf("t" to "move", "dx" to 3, "dy" to 4.0)))
         assertEquals(listOf("scroll 2.5 0.0"), run(mapOf("t" to "scroll", "dy" to 2.5f)))
         assertEquals(listOf("scroll 1.0 -1.0"), run(mapOf("t" to "scroll", "dy" to 1, "dx" to -1)))
+    }
+
+    @Test
+    fun `an absolute move passes the fractions through and a touch drag is press then moves then release`() {
+        assertEquals(listOf("abs 0.25 0.75"), run(mapOf("t" to "moveabs", "x" to 0.25f, "y" to 0.75)))
+        assertEquals(
+            listOf("abs 0.1 0.2", "button 1 down", "abs 0.3 0.2", "abs 0.5 0.2", "button 1 up"),
+            run(
+                mapOf("t" to "moveabs", "x" to 0.1f, "y" to 0.2f),
+                mapOf("t" to "click", "button" to "left", "action" to "down"),
+                mapOf("t" to "moveabs", "x" to 0.3f, "y" to 0.2f),
+                mapOf("t" to "moveabs", "x" to 0.5f, "y" to 0.2f),
+                mapOf("t" to "click", "button" to "left", "action" to "up"),
+            ),
+        )
+    }
+
+    @Test
+    fun `a damaged absolute move is ignored rather than thrown on`() {
+        assertEquals(emptyList<String>(), run(mapOf("t" to "moveabs"), mapOf("t" to "moveabs", "x" to 0.5f),
+            mapOf("t" to "moveabs", "x" to "left", "y" to 0.5f), mapOf("t" to "moveabs", "x" to Float.NaN, "y" to 0.5f)))
     }
 
     @Test

@@ -643,6 +643,10 @@ class KeyboardView @JvmOverloads constructor(
     }
 
     private fun sendRaw(code: String, mods: List<String>) {
+        if (code == CODE_RIGHT_CLICK) {   // not a key: a right click at the pointer (keys held down are not part of it)
+            onEvent?.invoke(mapOf("t" to "click", "button" to "right"))
+            return
+        }
         onEvent?.invoke(mapOf("t" to "key", "code" to code, "action" to "down", "mods" to mods))
         onEvent?.invoke(mapOf("t" to "key", "code" to code, "action" to "up", "mods" to mods))
     }

@@ -9,6 +9,7 @@ import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.Shader
 import android.util.AttributeSet
+import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
 import kotlin.math.abs
@@ -16,6 +17,10 @@ import kotlin.math.max
 
 private const val TAP_MOVE_THRESHOLD_PX = 12f
 private const val TAP_MAX_DURATION_MS = 200L
+private const val TOUCH_TAP_MAX_DURATION_MS = 450L   // pointing with a finger is slower than tapping a trackpad
+private const val OVERLAY_DOT_ALPHA = 70
+private const val OVERLAY_HELD_ALPHA = 150
+private const val LONG_PRESS_MS = 400L                // holding a finger still this long (Auto mode) starts a press-and-drag
 private const val SCROLL_DIVISOR = 4f
 private const val RELEASE_FADE_MS = 220L
 private const val RIPPLE_MS = 300L
@@ -82,8 +87,33 @@ class TrackpadView @JvmOverloads constructor(
             invalidate()
         }
 
+    /**
+     * How one finger is understood: as a trackpad, as a touchscreen, or as whichever fits (see [PointerPolicy]).
+     * Touch and Auto place the pointer by position, so they need [absoluteEnabled] and a [videoArea]; without them
+     * every finger is treated as a trackpad.
+     */
+    val pointerPolicy = PointerPolicy()
+
+    /** When on, one finger dragging selects: it holds the left button down while it moves (to highlight text, say). */
+    var selectMode: Boolean = false
+
+    /** Where the streamed picture is inside this view, in this view's pixels. Null when there is no picture. */
+    var videoArea: VideoArea? = null
+
+    /** True when the computer can place the pointer at an exact spot (the agent advertises it). */
+    var absoluteEnabled: Boolean = false
+
+    private enum class OneFinger { RELATIVE, DIRECT, IGNORED }
+    private enum class Jump { DONE, OUTSIDE, UNAVAILABLE }
+
+    private val twoFingerTap = TwoFingerTap()
+    private var oneFinger = OneFinger.RELATIVE
+    private var directPressed = false   // the left button is held by a touch-style drag
+    private val longPress = Runnable { onLongPress() }
+
     private var lastX = 0f
     private var lastY = 0f
+    private var lastTwoFingerX = 0f
     private var lastTwoFingerY = 0f
     private var downTime = 0L
     private var totalMovement = 0f
@@ -183,17 +213,29 @@ class TrackpadView @JvmOverloads constructor(
                 dragArmed = dt in 0..DOUBLE_TAP_WINDOW_MS &&
                     (ddx * ddx + ddy * ddy) < DOUBLE_TAP_DISTANCE_PX * DOUBLE_TAP_DISTANCE_PX
                 dragActive = false
+                directPressed = false
+
+                oneFinger = beginOneFinger(event.x, event.y)
+                removeCallbacks(longPress)
+                if (oneFinger == OneFinger.RELATIVE && pointerPolicy.longPressStartsDrag() && absoluteEnabled) {
+                    postDelayed(longPress, LONG_PRESS_MS)
+                }
 
                 postInvalidateOnAnimation()
             }
 
             MotionEvent.ACTION_POINTER_DOWN -> {
+                removeCallbacks(longPress)
+                if (directPressed) releaseDirect()   // a second finger ends a one-finger drag
                 syncPointers(event)
                 usedMultitouch = true
                 dragArmed = false
                 if (event.pointerCount == 2) {
+                    lastTwoFingerX = averageX(event)
                     lastTwoFingerY = averageY(event)
+                    twoFingerTap.begin(event.eventTime)
                 } else if (event.pointerCount == 3) {
+                    twoFingerTap.cancel()
                     threeFingerStartX = averageX(event)
                     threeFingerStartY = averageY(event)
                     threeFingerTriggered = false
@@ -201,6 +243,10 @@ class TrackpadView @JvmOverloads constructor(
             }
 
             MotionEvent.ACTION_POINTER_UP -> {
+                // Two fingers that touched briefly and barely moved are a right click.
+                if (event.pointerCount == 2 && twoFingerTap.end(event.eventTime)) {
+                    rightClick(averageX(event), averageY(event))
+                }
                 syncPointers(event, skip = event.actionIndex)
                 postInvalidateOnAnimation()
             }
@@ -210,44 +256,38 @@ class TrackpadView @JvmOverloads constructor(
                 when (event.pointerCount) {
                     3 -> handleThreeFingerSwipe(event)
                     2 -> {
+                        val x = averageX(event)
                         val y = averageY(event)
                         val dy = y - lastTwoFingerY
-                        if (dy != 0f) {
+                        twoFingerTap.move(abs(x - lastTwoFingerX) + abs(dy))
+                        // The first few pixels are held back: they are the wobble of a tap, not a scroll.
+                        if (dy != 0f && twoFingerTap.movedTooFar) {
                             onEvent?.invoke(mapOf("t" to "scroll", "dy" to (dy / SCROLL_DIVISOR)))
                         }
+                        lastTwoFingerX = x
                         lastTwoFingerY = y
                     }
-                    else -> {
-                        val dx = event.x - lastX
-                        val dy = event.y - lastY
-                        totalMovement += abs(dx) + abs(dy)
-
-                        if (dragArmed && !dragActive && totalMovement > TAP_MOVE_THRESHOLD_PX) {
-                            dragActive = true
-                            onEvent?.invoke(mapOf("t" to "click", "button" to "left", "action" to "down"))
-                        }
-
-                        if (dx != 0f || dy != 0f) {
-                            onEvent?.invoke(mapOf("t" to "move", "dx" to dx, "dy" to dy))
-                        }
-                        lastX = event.x
-                        lastY = event.y
-                    }
+                    else -> moveOneFinger(event)
                 }
                 postInvalidateOnAnimation()
             }
 
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                removeCallbacks(longPress)
                 val duration = event.eventTime - downTime
-                if (dragActive) {
+                if (directPressed) {
+                    releaseDirect()
+                } else if (dragActive) {
                     onEvent?.invoke(mapOf("t" to "click", "button" to "left", "action" to "up"))
-                } else if (event.actionMasked == MotionEvent.ACTION_UP &&
-                    !usedMultitouch && totalMovement < TAP_MOVE_THRESHOLD_PX && duration < TAP_MAX_DURATION_MS
+                } else if (event.actionMasked == MotionEvent.ACTION_UP && !usedMultitouch &&
+                    totalMovement < TAP_MOVE_THRESHOLD_PX &&
+                    duration < (if (oneFinger == OneFinger.DIRECT) TOUCH_TAP_MAX_DURATION_MS else TAP_MAX_DURATION_MS)
                 ) {
-                    onEvent?.invoke(mapOf("t" to "click", "button" to "left"))
-                    rippleX = event.x
-                    rippleY = event.y
-                    rippleStart = System.currentTimeMillis()
+                    if (tap(event.x, event.y)) {
+                        rippleX = event.x
+                        rippleY = event.y
+                        rippleStart = System.currentTimeMillis()
+                    }
                 }
                 if (!usedMultitouch) {
                     lastReleaseTime = event.eventTime
@@ -262,6 +302,103 @@ class TrackpadView @JvmOverloads constructor(
             }
         }
         return true
+    }
+
+    /** Decides at touch-down whether this finger works like a trackpad or like a touchscreen, and for touch moves the pointer under it. */
+    private fun beginOneFinger(x: Float, y: Float): OneFinger {
+        if (!pointerPolicy.dragIsDirect(selectMode)) return OneFinger.RELATIVE
+        return when (jumpTo(x, y, clamped = false)) {
+            Jump.DONE -> OneFinger.DIRECT
+            Jump.OUTSIDE -> OneFinger.IGNORED       // on the black bars: nothing to point at
+            Jump.UNAVAILABLE -> OneFinger.RELATIVE  // cannot place the pointer, so behave as a trackpad
+        }
+    }
+
+    private fun moveOneFinger(event: MotionEvent) {
+        val dx = event.x - lastX
+        val dy = event.y - lastY
+        totalMovement += abs(dx) + abs(dy)
+        val moved = totalMovement > TAP_MOVE_THRESHOLD_PX
+        if (moved) removeCallbacks(longPress)
+
+        when (oneFinger) {
+            OneFinger.IGNORED -> {}
+            OneFinger.DIRECT -> {
+                if (!directPressed && moved) {
+                    directPressed = true
+                    leftButton("down")
+                }
+                if (directPressed) jumpTo(event.x, event.y, clamped = true)
+            }
+            OneFinger.RELATIVE -> {
+                if ((dragArmed || selectMode) && !dragActive && moved) {
+                    dragActive = true
+                    leftButton("down")
+                }
+                if (moved) pointerPolicy.noteTrackpadUse()
+                if (dx != 0f || dy != 0f) {
+                    onEvent?.invoke(mapOf("t" to "move", "dx" to dx, "dy" to dy))
+                }
+            }
+        }
+        lastX = event.x
+        lastY = event.y
+    }
+
+    /** A finger held still in Auto mode becomes a touch-style press: from here a drag highlights. */
+    private fun onLongPress() {
+        if (!touching || usedMultitouch || oneFinger != OneFinger.RELATIVE || dragActive ||
+            totalMovement > TAP_MOVE_THRESHOLD_PX
+        ) return
+        if (jumpTo(lastX, lastY, clamped = false) != Jump.DONE) return
+        oneFinger = OneFinger.DIRECT
+        directPressed = true
+        leftButton("down")
+        performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        postInvalidateOnAnimation()
+    }
+
+    /** A tap. Returns false if it was ignored (a touch tap on the black bars). */
+    private fun tap(x: Float, y: Float): Boolean {
+        when (oneFinger) {
+            OneFinger.IGNORED -> return false
+            OneFinger.DIRECT -> {}   // the pointer already went to the finger when it touched down
+            OneFinger.RELATIVE -> if (pointerPolicy.tapAction() == PointerTap.JUMP_AND_CLICK) {
+                // Pointing at the screen. If it cannot be done the tap is a plain click where the pointer is.
+                if (jumpTo(x, y, clamped = false) == Jump.OUTSIDE) return false
+            }
+        }
+        onEvent?.invoke(mapOf("t" to "click", "button" to "left"))
+        return true
+    }
+
+    private fun rightClick(x: Float, y: Float) {
+        onEvent?.invoke(mapOf("t" to "click", "button" to "right"))
+        rippleX = x
+        rippleY = y
+        rippleStart = System.currentTimeMillis()
+    }
+
+    private fun leftButton(action: String) {
+        onEvent?.invoke(mapOf("t" to "click", "button" to "left", "action" to action))
+    }
+
+    private fun releaseDirect() {
+        directPressed = false
+        leftButton("up")
+    }
+
+    private fun jumpTo(x: Float, y: Float, clamped: Boolean): Jump {
+        val area = videoArea
+        if (!absoluteEnabled || area == null || !area.valid) return Jump.UNAVAILABLE
+        val f = (if (clamped) area.clamped(x, y) else area.fraction(x, y)) ?: return Jump.OUTSIDE
+        onEvent?.invoke(mapOf("t" to "moveabs", "x" to f.x, "y" to f.y))
+        return Jump.DONE
+    }
+
+    override fun onDetachedFromWindow() {
+        removeCallbacks(longPress)
+        super.onDetachedFromWindow()
     }
 
     private fun handleThreeFingerSwipe(event: MotionEvent) {
@@ -319,6 +456,19 @@ class TrackpadView @JvmOverloads constructor(
         } else {
             val since = now - releasedAt
             if (since >= RELEASE_FADE_MS) 0f else 1f - since.toFloat() / RELEASE_FADE_MS
+        }
+
+        // Over the desktop (overlay) the only mark is a small faint dot, a little stronger while the button is held;
+        // the ring and the ripple are for the standalone pad, where they are the whole picture.
+        if (overlay) {
+            if (presence > 0f) {
+                val held = dragActive || directPressed
+                fillPaint.alpha = ((if (held) OVERLAY_HELD_ALPHA else OVERLAY_DOT_ALPHA) * presence).toInt()
+                val radius = dp(if (held) 7f else 5f)
+                for (i in 0 until ptCount) canvas.drawCircle(ptX[i], ptY[i], radius, fillPaint)
+                postInvalidateOnAnimation()
+            }
+            return
         }
 
         // A ring and centre dot under each finger; the fill is brighter

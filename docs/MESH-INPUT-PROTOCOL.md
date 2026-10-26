@@ -53,6 +53,7 @@ u16 length | u8 type | payload          (big-endian; length counts type + payloa
 | 0x07 | PING | `u32 id` |
 | 0x08 | RELEASE_ALL | none |
 | 0x09 | BYE | none |
+| 0x0B | MOVE_ABS | `u16 x` `u16 y` (0..65535 across the streamed screen, from the top left; only if feature bit 8 was advertised) |
 | 0x0A | SUNSHINE_PAIR | `u8 n` `pin[n]` (4 ASCII digits) `u8 m` `name[m]` (UTF-8; what Sunshine should call the phone) |
 
 The first frame must be HELLO, within 3 seconds. Send a PING at least every 15 seconds (the app sends one
@@ -63,12 +64,25 @@ older agent. Key names are listed in `KEY_CODES` in `mesh_input.py`; unknown nam
 
 | Type | Name | Payload |
 |---|---|---|
-| 0x81 | HELLO_OK | `u8 version` `u8 features` (1 text, 2 hi-res scroll, 4 Sunshine pairing) `u8 n` `host name[n]` |
+| 0x81 | HELLO_OK | `u8 version` `u8 features` (1 text, 2 hi-res scroll, 4 Sunshine pairing, 8 absolute pointer) `u8 n` `host name[n]` |
 | 0x82 | ERROR | `u8 code` `u8 n` `text[n]`, then the connection closes |
 | 0x87 | PONG | `u32 id` |
 | 0x8A | SUNSHINE_RESULT | `u8 status` `u8 n` `text[n]` (a sentence for a person) |
 
 Error codes: 1 bad token, 2 bad version, 3 replaced by another phone, 4 bad frame, 5 no HELLO.
+
+## Absolute pointer (MOVE_ABS), for touch mode
+
+The phone's touch modes need the pointer to go to an exact spot, not move by an amount. `MOVE_ABS` carries a position as
+fractions of the streamed picture (0..65535 each way). The agent advertises feature bit 8 only when it could create a second
+virtual device (an absolute mouse: two axes plus mouse buttons, the kind a virtual machine's tablet is); clicks still go
+through the normal button messages, because the cursor is shared by both devices. An agent without the bit ignores
+`MOVE_ABS`, and the phone then treats every finger as a trackpad.
+
+The absolute device spans all monitors together, while the picture is one monitor. With several monitors set
+`MESH_MONITOR="x,y,w,h"` (the streamed monitor, in pixels) and `MESH_DESKTOP="w,h"` (all monitors together) in the
+agent's environment so a position is placed inside that monitor. `python3 mesh_input.py display-info` prints what the
+session looks like. Wayland compositors differ in how they map absolute devices; this is untested there.
 
 ## Pairing the desktop view without a PIN (SUNSHINE_PAIR / SUNSHINE_RESULT)
 
@@ -112,6 +126,7 @@ TEXT("hé")                 0004 06 68c3a9
 PING(7)                    0005 07 00000007
 RELEASE_ALL                0001 08
 SUNSHINE_PAIR("1234","pixel") 000c 0a 04 31323334 05 706978656c
+MOVE_ABS(0x1234,0xffff)    0005 0b 1234 ffff
 SUNSHINE_RESULT(0,"paired")   0009 8a 00 06 706169726564
 HELLO(token aabb, "ph")    0008 01 01 02aabb 02 7068
 ```

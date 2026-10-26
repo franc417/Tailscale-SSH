@@ -30,6 +30,12 @@ const val CODE_LAYER_PREFIX = "layer:"
  */
 const val CODE_FN = "fn"
 
+/**
+ * Mesh addition: a key that right-clicks the mouse. It is listed with the physical codes so layouts can use it, but it
+ * never reaches the desktop as a key: the keyboard view turns it into a right-button click.
+ */
+const val CODE_RIGHT_CLICK = "MouseRight"
+
 /** A character with no physical key, sent through the Ctrl+Shift+U sequence; needs `unicode` hex. */
 const val CODE_UNICODE = "unicode"
 
@@ -54,6 +60,7 @@ val PHYSICAL_CODES: Set<String> = buildSet {
             "Home", "End", "PageUp", "PageDown", "Meta",
             "Semicolon", "Quote", "Slash", "Backslash",
             "BracketLeft", "BracketRight", "Backquote",
+            CODE_RIGHT_CLICK,
         ),
     )
 }
@@ -517,7 +524,8 @@ object DefaultLayout {
         // esc is one key wide above the "1" column and prtsc one key wide above the "0" column. "_" sits right after
         // esc and "-" right before prtsc: the letters page had no underscore or hyphen at all. 1 + 1 + 6 + 1 + 1 = 10,
         // the same total as the digits row, so esc and prtsc keep their places above 1 and 0.
-        RowDef(listOf(esc(), s("_", "Minus"), gap(6f), k("-", "Minus"), prtsc()), 0.7f),
+        // Mesh: a right-click key sits between them, prtsc-sized (1 + 1 + 5 + 1 + 1 + 1 = 10).
+        RowDef(listOf(esc(), s("_", "Minus"), gap(5f), k("rclick", CODE_RIGHT_CLICK), k("-", "Minus"), prtsc()), 0.7f),
         RowDef(digits()),
         RowDef(letters("qwertyuiop")),
         RowDef(listOf(gap(0.5f)) + letters("asdfghjkl") + gap(0.5f)),

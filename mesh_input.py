@@ -24,6 +24,7 @@ Commands:
   python3 mesh_input.py init                 create the certificate and token
   python3 mesh_input.py pair-info            print what the phone needs, as JSON
   python3 mesh_input.py sunshine-login       save Sunshine's web login once, so the phone pairs its desktop view with no PIN
+  python3 mesh_input.py display-info         print what this desktop looks like (session type, monitors), to set up the screen shape
   python3 mesh_input.py run [--port N]       serve (needs /dev/uinput access)
   python3 mesh_input.py install-service      start at every login and restart on failure (systemd user service)
   python3 mesh_input.py uninstall-service    stop and remove that service
@@ -72,6 +73,7 @@ T_PING = 0x07
 T_RELEASE_ALL = 0x08
 T_BYE = 0x09
 T_SUNSHINE_PAIR = 0x0A    # "pair my desktop view with this PIN" (see SunshineLink)
+T_MOVE_ABS = 0x0B         # put the pointer at a spot on the streamed screen (touch mode)
 # ---- host -> phone
 T_HELLO_OK = 0x81
 T_ERROR = 0x82
@@ -88,6 +90,7 @@ E_NO_HELLO = 5
 FEATURE_TEXT = 0x01
 FEATURE_HIRES_SCROLL = 0x02
 FEATURE_SUNSHINE_PAIR = 0x04
+FEATURE_ABS_POINTER = 0x08   # this computer can place the pointer at an exact spot (T_MOVE_ABS)
 
 # T_SUNSHINE_RESULT status codes
 S_OK = 0                # the phone is paired with Sunshine
@@ -179,6 +182,10 @@ def msg_bye() -> bytes:
     return encode_frame(T_BYE)
 
 
+def msg_move_abs(x: int, y: int) -> bytes:
+    return encode_frame(T_MOVE_ABS, struct.pack("!HH", _clamp_abs(x), _clamp_abs(y)))
+
+
 def msg_sunshine_pair(pin: str, name: str) -> bytes:
     return encode_frame(T_SUNSHINE_PAIR, _short_bytes(pin.encode("ascii"), "pin") + _short_bytes(name.encode()[:128], "name"))
 
@@ -248,6 +255,12 @@ def parse_key(payload: bytes) -> Tuple[str, bool]:
     return code.decode("ascii", "replace"), bool(payload[0])
 
 
+def parse_move_abs(payload: bytes) -> Tuple[int, int]:
+    if len(payload) != 4:
+        raise ProtocolError("MOVE_ABS: bad payload")
+    return struct.unpack("!HH", payload)
+
+
 def parse_sunshine_pair(payload: bytes) -> Tuple[str, str]:
     pin, end = _take_short(payload, 0, "pin")
     name, end = _take_short(payload, end, "name")
@@ -301,7 +314,9 @@ KEY_CODES.update({"ctrl": 29, "shift": 42, "alt": 56, "meta": 125})
 
 BUTTON_CODES = {1: 0x110, 2: 0x112, 3: 0x111, 4: 0x113, 5: 0x114}  # BTN_LEFT/MIDDLE/RIGHT/SIDE/EXTRA
 
-EV_SYN, EV_KEY, EV_REL = 0, 1, 2
+EV_SYN, EV_KEY, EV_REL, EV_ABS = 0, 1, 2, 3
+ABS_X, ABS_Y = 0, 1
+ABS_MAX = 0xFFFF   # the absolute pointer works in 0..65535 on both axes, whatever the screen size
 REL_X, REL_Y, REL_HWHEEL, REL_WHEEL = 0, 1, 6, 8
 REL_WHEEL_HI_RES, REL_HWHEEL_HI_RES = 0x0B, 0x0C
 
@@ -360,6 +375,45 @@ def text_events(text: str) -> List[Tuple[str, bool]]:
     return events
 
 
+def _clamp_abs(value: int) -> int:
+    return min(max(int(value), 0), ABS_MAX)
+
+
+class AbsoluteMap:
+    """Maps a spot on the streamed screen onto the whole desktop the absolute pointer spans.
+
+    The phone sends positions as 0..65535 across the picture it is showing, which is one monitor. The absolute pointer
+    device spans every monitor together, so with more than one monitor the position has to be placed inside that
+    monitor's area. [monitor] is (x, y, width, height) of the streamed monitor and [desktop] is (width, height) of all
+    monitors together, both in pixels; with either missing, the streamed screen is taken to be the whole desktop."""
+
+    def __init__(self, monitor: Optional[Tuple[int, int, int, int]] = None, desktop: Optional[Tuple[int, int]] = None) -> None:
+        valid = (monitor is not None and desktop is not None and len(monitor) == 4 and len(desktop) == 2
+                 and monitor[2] > 0 and monitor[3] > 0 and desktop[0] > 0 and desktop[1] > 0)
+        self.monitor = monitor if valid else None
+        self.desktop = desktop if valid else None
+
+    def map(self, x: int, y: int) -> Tuple[int, int]:
+        x, y = _clamp_abs(x), _clamp_abs(y)
+        if self.monitor is None or self.desktop is None:
+            return x, y
+        mx, my, mw, mh = self.monitor
+        dw, dh = self.desktop
+        return (_clamp_abs(round((mx + x / ABS_MAX * mw) / dw * ABS_MAX)),
+                _clamp_abs(round((my + y / ABS_MAX * mh) / dh * ABS_MAX)))
+
+    @staticmethod
+    def from_env(environ=os.environ) -> "AbsoluteMap":
+        """MESH_MONITOR="x,y,w,h" and MESH_DESKTOP="w,h" (pixels); anything malformed means the whole desktop."""
+        def ints(name: str, count: int) -> Optional[Tuple[int, ...]]:
+            try:
+                values = tuple(int(part) for part in environ.get(name, "").split(","))
+            except ValueError:
+                return None
+            return values if len(values) == count else None
+        return AbsoluteMap(ints("MESH_MONITOR", 4), ints("MESH_DESKTOP", 2))
+
+
 class Carry:
     """Turns fractional deltas into whole counts without losing the remainder, so a
     slow drag made of sub-pixel steps still moves the cursor."""
@@ -386,6 +440,12 @@ class Injector:
     def text(self, text: str) -> None: ...
     def release_all(self) -> None: ...
     def close(self) -> None: ...
+
+    # Placing the pointer at an exact spot (touch mode). Injectors that cannot do it leave this off, and the agent then
+    # does not advertise FEATURE_ABS_POINTER, so the phone keeps to trackpad movement.
+    supports_absolute = False
+
+    def move_abs(self, x: int, y: int) -> None: ...
 
 
 class StatefulInjector(Injector):
@@ -435,6 +495,7 @@ class RecordingInjector(StatefulInjector):
         self.events: List[tuple] = []
         self._x, self._y = Carry(), Carry()
         self._on_event = on_event
+        self.abs_map = AbsoluteMap.from_env()
 
     def _record(self, event: tuple) -> None:
         self.events.append(event)
@@ -455,6 +516,11 @@ class RecordingInjector(StatefulInjector):
     def scroll(self, vertical: float, horizontal: float) -> None:
         self._record(("scroll", vertical, horizontal))
 
+    supports_absolute = True
+
+    def move_abs(self, x: int, y: int) -> None:
+        self._record(("moveabs", *self.abs_map.map(x, y)))
+
     def close(self) -> None:
         pass
 
@@ -467,6 +533,8 @@ def _ioc(direction: int, type_char: str, nr: int, size: int) -> int:
 UI_SET_EVBIT = _ioc(1, "U", 100, 4)
 UI_SET_KEYBIT = _ioc(1, "U", 101, 4)
 UI_SET_RELBIT = _ioc(1, "U", 102, 4)
+UI_SET_ABSBIT = _ioc(1, "U", 103, 4)
+UI_ABS_SETUP = _ioc(1, "U", 4, 28)   # struct uinput_abs_setup: u16 code (+2 padding) + struct input_absinfo (6 x s32)
 UI_DEV_SETUP = _ioc(1, "U", 3, 92)   # struct uinput_setup: input_id(8) + name[80] + ff_effects_max(4)
 UI_DEV_CREATE = _ioc(0, "U", 1, 0)
 UI_DEV_DESTROY = _ioc(0, "U", 2, 0)
@@ -477,8 +545,10 @@ INPUT_EVENT = struct.Struct("llHHi")  # struct input_event on 64-bit Linux (time
 class UinputInjector(StatefulInjector):
     """Injects through /dev/uinput with plain ioctls: no evdev package, nothing to compile."""
 
-    def __init__(self, path: str = "/dev/uinput", fd: Optional[int] = None) -> None:
+    def __init__(self, path: str = "/dev/uinput", fd: Optional[int] = None, abs_fd: Optional[int] = None) -> None:
         super().__init__()
+        self.abs_map = AbsoluteMap.from_env()
+        self.abs_fd: Optional[int] = abs_fd
         self._x, self._y = Carry(), Carry()
         self._wheel_hi, self._wheel_notch = Carry(), Carry()
         self._hwheel_hi, self._hwheel_notch = Carry(), Carry()
@@ -495,7 +565,16 @@ class UinputInjector(StatefulInjector):
                     f"`mesh gui` does this for you."
                 ) from exc
             self._setup(fd)
+            try:   # a second, separate device that can place the pointer at an exact spot; without it touch mode is simply off
+                abs_fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+                self._setup_abs(abs_fd)
+                self.abs_fd = abs_fd
+            except OSError:
+                if abs_fd is not None:
+                    os.close(abs_fd)
+                self.abs_fd = None
         self.fd = fd
+        self.supports_absolute = self.abs_fd is not None
 
     @staticmethod
     def _setup(fd: int) -> None:
@@ -511,12 +590,36 @@ class UinputInjector(StatefulInjector):
         fcntl.ioctl(fd, UI_DEV_CREATE)
         time.sleep(0.15)  # let the desktop notice the new device before the first event
 
-    def _emit(self, etype: int, code: int, value: int) -> None:
+    @staticmethod
+    def _setup_abs(fd: int) -> None:
+        """An absolute mouse, the kind a virtual machine's tablet is: axes plus mouse buttons, so the desktop treats it as a pointer."""
+        for ev in (EV_KEY, EV_ABS, EV_SYN):
+            fcntl.ioctl(fd, UI_SET_EVBIT, ev)
+        for button in (1, 2, 3):
+            fcntl.ioctl(fd, UI_SET_KEYBIT, BUTTON_CODES[button])
+        for axis in (ABS_X, ABS_Y):
+            fcntl.ioctl(fd, UI_SET_ABSBIT, axis)
+            fcntl.ioctl(fd, UI_ABS_SETUP, struct.pack("<H2xiiiiii", axis, 0, 0, ABS_MAX, 0, 0, 0))
+        name = b"Mesh absolute pointer"
+        setup = struct.pack("<HHHH80sI", 0x03, 0x1234, 0x5679, 1, name, 0)
+        fcntl.ioctl(fd, UI_DEV_SETUP, setup)
+        fcntl.ioctl(fd, UI_DEV_CREATE)
+        time.sleep(0.15)
+
+    def _emit(self, etype: int, code: int, value: int, fd: Optional[int] = None) -> None:
         now = time.time()
-        os.write(self.fd, INPUT_EVENT.pack(int(now), int((now % 1) * 1_000_000), etype, code, value))
+        os.write(self.fd if fd is None else fd, INPUT_EVENT.pack(int(now), int((now % 1) * 1_000_000), etype, code, value))
 
     def _sync(self) -> None:
         self._emit(EV_SYN, 0, 0)
+
+    def move_abs(self, x: int, y: int) -> None:
+        if self.abs_fd is None:
+            return
+        x, y = self.abs_map.map(x, y)
+        self._emit(EV_ABS, ABS_X, x, self.abs_fd)
+        self._emit(EV_ABS, ABS_Y, y, self.abs_fd)
+        self._emit(EV_SYN, 0, 0, self.abs_fd)
 
     def _key(self, code: str, down: bool) -> None:
         self._emit(EV_KEY, KEY_CODES[code], 1 if down else 0)
@@ -559,14 +662,19 @@ class UinputInjector(StatefulInjector):
             self.release_all()
             if self._owns_fd:
                 fcntl.ioctl(self.fd, UI_DEV_DESTROY)
+                if self.abs_fd is not None:
+                    fcntl.ioctl(self.abs_fd, UI_DEV_DESTROY)
         except OSError:
             pass
         finally:
             if self._owns_fd:
-                try:
-                    os.close(self.fd)
-                except OSError:
-                    pass
+                for fd in (self.fd, self.abs_fd):
+                    if fd is None:
+                        continue
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
 
 
 def _env_float(name: str, default: float) -> float:
@@ -884,6 +992,36 @@ class SunshineLink:
         raise SunshineError(S_FAILED, "Sunshine did not complete the pairing (wrong PIN or it timed out)")
 
 
+def display_info(runner=subprocess.run, which=shutil.which, environ=os.environ) -> str:
+    """Describes this computer's desktop session and monitors, for the person to paste when setting up the screen shape.
+
+    Everything is best effort: a missing tool or a failing command is mentioned and skipped, never fatal."""
+    lines = ["Mesh display info (paste all of this):", ""]
+    for name in ("XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP", "DESKTOP_SESSION", "WAYLAND_DISPLAY", "DISPLAY"):
+        lines.append(f"{name}={environ.get(name, '')}")
+    lines.append(f"MESH_MONITOR={environ.get('MESH_MONITOR', '')}")
+    lines.append(f"MESH_DESKTOP={environ.get('MESH_DESKTOP', '')}")
+    tools = (("xrandr", ["xrandr", "--query"]), ("wlr-randr", ["wlr-randr"]),
+             ("kscreen-doctor", ["kscreen-doctor", "-o"]), ("hyprctl", ["hyprctl", "monitors"]),
+             ("swaymsg", ["swaymsg", "-t", "get_outputs", "--raw"]), ("sunshine", ["sunshine", "--version"]))
+    for name, cmd in tools:
+        lines.append("")
+        if which(cmd[0]) is None:
+            lines.append(f"[{name}] not installed")
+            continue
+        try:
+            done = runner(cmd, capture_output=True, text=True, timeout=5)
+            output = (done.stdout or done.stderr or "").strip().splitlines()
+        except (OSError, subprocess.SubprocessError) as exc:
+            lines.append(f"[{name}] failed: {exc}")
+            continue
+        lines.append(f"[{name}]")
+        lines.extend(output[:40])
+        if len(output) > 40:
+            lines.append(f"... ({len(output) - 40} more lines)")
+    return "\n".join(lines)
+
+
 def sunshine_login(directory: str, url: Optional[str] = None, username: Optional[str] = None,
                    password: Optional[str] = None, ask: Callable[[str], str] = input,
                    ask_secret: Callable[[str], str] = getpass.getpass, out: Callable[[str], None] = print) -> int:
@@ -997,7 +1135,7 @@ class Server:
         self._active_peer = _normalize_address(str(peer[0])) if peer else ""
         self._active_name = name or str(peer)
         self.log(f"{self._active_name} connected")
-        await self._send(writer, msg_hello_ok(self.host_name))
+        await self._send(writer, msg_hello_ok(self.host_name, self._features()))
         return True
 
     async def _serve(self, reader, writer) -> None:
@@ -1007,6 +1145,10 @@ class Server:
                 return  # replaced by a newer phone
             if msg_type == T_MOVE:
                 self.injector.move(*parse_move(payload))
+            elif msg_type == T_MOVE_ABS:
+                x, y = parse_move_abs(payload)
+                if self.injector.supports_absolute:
+                    self.injector.move_abs(x, y)
             elif msg_type == T_SCROLL:
                 self.injector.scroll(*parse_scroll(payload))
             elif msg_type == T_BUTTON:
@@ -1028,6 +1170,12 @@ class Server:
             elif msg_type == T_BYE:
                 return
             # unknown types are ignored so a newer phone can talk to an older agent
+
+    def _features(self) -> int:
+        features = FEATURE_TEXT | FEATURE_HIRES_SCROLL | FEATURE_SUNSHINE_PAIR
+        if self.injector.supports_absolute:
+            features |= FEATURE_ABS_POINTER
+        return features
 
     async def _sunshine_pair(self, writer, pin: str, name: str, peer: str) -> None:
         if self.sunshine is None:
@@ -1143,7 +1291,7 @@ def uninstall_service(target_dir: Optional[str] = None, runner=subprocess.run) -
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Mesh input channel (host side)")
-    ap.add_argument("command", choices=["init", "pair-info", "run", "reset-token", "install-service", "uninstall-service", "sunshine-login"])
+    ap.add_argument("command", choices=["init", "pair-info", "run", "reset-token", "install-service", "uninstall-service", "sunshine-login", "display-info"])
     ap.add_argument("--dir", default=default_dir())
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--dry-run", action="store_true", help="record events instead of injecting them")
@@ -1152,6 +1300,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--sunshine-user", default=None, help="sunshine-login: the username, instead of being asked")
     ap.add_argument("--password-stdin", action="store_true", help="sunshine-login: read the password from standard input")
     args = ap.parse_args(argv)
+
+    if args.command == "display-info":
+        print(display_info())
+        return 0
 
     if args.command == "sunshine-login":
         password = sys.stdin.readline().rstrip("\n") if args.password_stdin else None

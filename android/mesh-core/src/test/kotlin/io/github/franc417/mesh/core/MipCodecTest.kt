@@ -132,4 +132,17 @@ class MipCodecTest {
             assertTrue("should reject $hex", failed)
         }
     }
+
+    @Test
+    fun `an absolute move matches the agent's vector and clamps its input`() {
+        // The agent's own tests check the same bytes (tests/test_absolute_pointer.py).
+        assertEquals("00050b0000ffff", MipCodec.moveAbs(0f, 1f).toHex())
+        assertEquals("00050b80008000", MipCodec.moveAbs(0.5f, 0.5f).toHex())
+        assertEquals(0x8000, MipCodec.toWire(0.5f))
+        assertEquals(0, MipCodec.toWire(-3f))
+        assertEquals(Mip.ABS_MAX, MipCodec.toWire(7f))
+        assertEquals(Mip.ABS_MAX, MipCodec.toWire(Float.POSITIVE_INFINITY))
+        assertEquals(0, MipCodec.toWire(Float.NEGATIVE_INFINITY))
+        assertEquals(0, MipCodec.toWire(Float.NaN))
+    }
 }

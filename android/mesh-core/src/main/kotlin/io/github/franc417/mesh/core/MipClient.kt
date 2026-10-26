@@ -59,6 +59,9 @@ class MipClient(private val config: Config, private val listener: Listener) : In
     private var pendingDy = 0f
     private var pendingScrollV = 0f
     private var pendingScrollH = 0f
+    private var pendingAbs = false
+    private var pendingAbsX = 0f
+    private var pendingAbsY = 0f
     private var motionQueued = false
 
     private val finished = AtomicBoolean(false)
@@ -189,6 +192,23 @@ class MipClient(private val config: Config, private val listener: Listener) : In
         post { flushMotion() }
     }
 
+    /** True when the computer's agent can put the pointer at an exact spot, which touch mode needs. */
+    val canMoveAbsolute: Boolean get() = ((hello?.features ?: 0) and Mip.FEATURE_ABS_POINTER) != 0
+
+    /** Latest wins: if the network is slower than the finger, only the newest position is sent. */
+    override fun moveAbs(x: Float, y: Float) {
+        synchronized(motionLock) {
+            pendingDx = 0f   // a jump to an exact spot replaces any movement that was waiting to be sent before it
+            pendingDy = 0f
+            pendingAbsX = x
+            pendingAbsY = y
+            pendingAbs = true
+            if (motionQueued) return
+            motionQueued = true
+        }
+        post { flushMotion() }
+    }
+
     override fun button(button: Int, down: Boolean) = send(MipCodec.button(button, down))
 
     override fun key(code: String, down: Boolean) = send(MipCodec.key(code, down))
@@ -227,11 +247,17 @@ class MipClient(private val config: Config, private val listener: Listener) : In
         var dy = 0f
         var sv = 0f
         var sh = 0f
+        var abs = false
+        var ax = 0f
+        var ay = 0f
         synchronized(motionLock) {
             dx = pendingDx; dy = pendingDy; sv = pendingScrollV; sh = pendingScrollH
-            pendingDx = 0f; pendingDy = 0f; pendingScrollV = 0f; pendingScrollH = 0f
+            abs = pendingAbs; ax = pendingAbsX; ay = pendingAbsY
+            pendingDx = 0f; pendingDy = 0f; pendingScrollV = 0f; pendingScrollH = 0f; pendingAbs = false
             motionQueued = false
         }
+        // An absolute jump comes before relative movement queued after it by the same gesture, and before clicks.
+        if (abs) write(MipCodec.moveAbs(ax, ay))
         if (dx != 0f || dy != 0f) write(MipCodec.move(dx, dy))
         if (sv != 0f || sh != 0f) write(MipCodec.scroll(sv, sh))
     }

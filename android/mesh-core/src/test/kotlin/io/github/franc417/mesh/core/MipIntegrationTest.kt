@@ -126,6 +126,8 @@ class MipIntegrationTest {
         assertTrue(hello.features and Mip.FEATURE_TEXT != 0 && hello.features and Mip.FEATURE_HIRES_SCROLL != 0)
         assertTrue(hello.features and Mip.FEATURE_SUNSHINE_PAIR != 0)
         assertTrue(client.canPairSunshine)
+        assertTrue(hello.features and Mip.FEATURE_ABS_POINTER != 0)
+        assertTrue(client.canMoveAbsolute)
         assertTrue(hello.hostName.isNotEmpty())
         assertTrue(client.isConnected)
         client.close()
@@ -165,6 +167,20 @@ class MipIntegrationTest {
             "[\"button\", 1, true]", "[\"button\", 1, false]"), e.take(6))
         assertEquals("[\"key\", \"KeyO\", true]", e[6])
         assertTrue(e.contains("[\"key\", \"KeyK\", false]"))
+        client.close()
+    }
+
+    @Test
+    fun `an absolute move arrives as a real event, in order with a click, and the newest position wins`() = withAgent { agent ->
+        val client = MipClient(config(agent), Recorder())
+        client.connect()
+        client.moveAbs(0.25f, 0.5f)
+        client.button(Mip.BUTTON_LEFT, true)
+        client.button(Mip.BUTTON_LEFT, false)
+        assertTrue(agent.waitFor { l -> l.count { it.startsWith("EVENT") } >= 3 })
+        val e = agent.events()
+        assertEquals("[\"moveabs\", 16384, 32768]", e[0])   // 0.25 and 0.5 of 65535, rounded
+        assertEquals(listOf("[\"button\", 1, true]", "[\"button\", 1, false]"), e.subList(1, 3))
         client.close()
     }
 

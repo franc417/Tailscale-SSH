@@ -91,6 +91,13 @@ class ControlActivity : Activity() {
         val layoutButton = Ui.button(this, "Layout") { keyboard.setEditMode(!keyboard.editMode) }
         keyboard.onEditModeChanged = { editing -> layoutButton.text = if (editing) "Done" else "Layout" }
         bar.addView(layoutButton)
+        // Select: one finger drag highlights (holds the left button down), for copying text.
+        lateinit var selectButton: android.widget.TextView
+        selectButton = Ui.button(this, "Select") {
+            trackpad.selectMode = !trackpad.selectMode
+            selectButton.text = if (trackpad.selectMode) "Select: on" else "Select"
+        }
+        bar.addView(selectButton)
         root.addView(bar)
         root.addView(trackpad, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         root.addView(keyboard, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))

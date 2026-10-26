@@ -60,6 +60,26 @@ The home screen has **+ Add desktop** at the top. Each saved computer has **Open
 was reinstalled or its pairing reset, paste its new `pair-info` there to replace the saved pairing. **Remove this
 computer** is at the bottom of the edit screen.
 
+# Fingers on the desktop
+
+The desktop view has several ways to use a finger. They are chosen from the bar (tap the arrow tab at the top to open it):
+
+- **Right click**: tap with **two fingers** at once (in the desktop view and on the input-only trackpad). On the keyboard
+  there is also an **rclick** key between `_` and `-` on the top row of the letters page.
+- **Pointer** (menu): **Trackpad** is the classic way (slide to move, tap to click where the pointer is). **Touch** works
+  like a touchscreen: the pointer goes where your finger is; tap to click, drag to drag. **Auto** mixes them: if you have
+  just slid the pointer (for example onto a small close button) a tap anywhere clicks right there, but after a pause a
+  tap jumps to the finger. In Auto, hold a finger still for a moment and then drag to select.
+  Touch and Auto need the Mesh agent on the computer to be up to date (`git pull`, then restart it); otherwise the app
+  says so and works like the trackpad. With more than one monitor see the `MESH_MONITOR` note in the protocol document.
+- **Select**: switch it on and a one-finger drag highlights (it holds the left button down), so you can copy text. The
+  old tap-then-drag still works too. The input-only screen has a **Select** button as well.
+- **View** (menu): **Fit** shows the whole picture; **Fill** zooms to cover the screen and crops the edges; **Stretch** fills
+  the screen exactly but distorts the picture. The picture keeps its own shape because Sunshine pads with black, so true
+  full-screen clarity needs the computer's screen mode to match the stream: run `python3 mesh_input.py display-info`
+  on the computer and send the output, and that can be set up.
+- The pointer mark in the desktop view is now only a small faint dot (a bit stronger while the button is held).
+
 # Trying the desktop view
 
 Mesh shows the computer's screen by talking to **Sunshine** (the same program Moonlight uses), using Moonlight's

@@ -21,14 +21,19 @@ import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import io.github.franc417.mesh.core.Reach
 import io.github.franc417.mesh.input.FloatingKeyboardSizing
 import io.github.franc417.mesh.input.KeyboardView
+import io.github.franc417.mesh.input.PointerMode
 import io.github.franc417.mesh.input.TrackpadView
+import io.github.franc417.mesh.input.VideoArea
 import io.github.franc417.mesh.stream.StreamClient
 import io.github.franc417.mesh.stream.StreamEvents
 import io.github.franc417.mesh.stream.StreamSession
 import io.github.franc417.mesh.stream.StreamSettings
+import io.github.franc417.mesh.stream.ViewFit
+import io.github.franc417.mesh.stream.ViewMode
 import java.security.SecureRandom
 
 /**
@@ -74,6 +79,13 @@ class StreamActivity : Activity() {
     private var streaming = false
     private var generation = 0 // bumped whenever the screen (re)starts, so reports from an older run are ignored
     private var presetIndex = 0
+    private var pointerMode = PointerMode.TRACKPAD
+    private var viewMode = ViewMode.FIT
+    private lateinit var pointerChip: TextView
+    private lateinit var selectChip: TextView
+    private lateinit var viewChip: TextView
+    private var warnedNoAbsolute = false
+    private val viewPrefs by lazy { getSharedPreferences("mesh_stream_view", Context.MODE_PRIVATE) }
     private var inputStatus = ""
     private val handler = Handler(Looper.getMainLooper())
 
@@ -88,7 +100,9 @@ class StreamActivity : Activity() {
         }
         computer = found
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        loadViewPrefs()
         setContentView(build())
+        applyPointerMode(pointerMode)
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -129,6 +143,10 @@ class StreamActivity : Activity() {
             }
         })
 
+        // The trackpad needs to know where the picture is to turn a touch into a spot on the computer's screen.
+        surfaceView.addOnLayoutChangeListener { _, l, t, r, b, _, _, _, _ ->
+            trackpad.videoArea = VideoArea(l.toFloat(), t.toFloat(), (r - l).toFloat(), (b - t).toFloat())
+        }
         trackpad = TrackpadView(this).apply {
             overlay = true
             onEvent = { inputLink?.bridge?.handle(it) }
@@ -176,6 +194,15 @@ class StreamActivity : Activity() {
             ellipsize = android.text.TextUtils.TruncateAt.END
         }
         bar.addView(statusChip, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        bar.addView(gap())
+        pointerChip = chip("Pointer") { showPointerPicker() }
+        bar.addView(pointerChip)
+        bar.addView(gap())
+        selectChip = chip("Select") { toggleSelect() }
+        bar.addView(selectChip)
+        bar.addView(gap())
+        viewChip = chip("View: " + viewLabel(viewMode)) { showViewPicker() }
+        bar.addView(viewChip)
         bar.addView(gap())
         qualityChip = chip(StreamSettings.presets[presetIndex].first.substringBefore(" ")) { showQualityPicker() }
         bar.addView(qualityChip)
@@ -394,12 +421,9 @@ class StreamActivity : Activity() {
         val h = stage.height
         if (w == 0 || h == 0) return
         val aspect = settings.width.toFloat() / settings.height
-        var cw = w
-        var ch = (w / aspect).toInt()
-        if (ch > h) {
-            ch = h
-            cw = (h * aspect).toInt()
-        }
+        val size = ViewFit.size(viewMode, w, h, aspect)
+        val cw = size.width
+        val ch = size.height
         val lp = surfaceView.layoutParams as FrameLayout.LayoutParams
         if (lp.width != cw || lp.height != ch) {
             lp.width = cw
@@ -486,6 +510,7 @@ class StreamActivity : Activity() {
             runOnUiThread {
                 inputStatus = text
                 if (!ok && streaming) statusChip.text = text
+                refreshAbsolute()
             }
         }
         inputLink = link
@@ -630,6 +655,94 @@ class StreamActivity : Activity() {
         }, 1000)
     }
 
+    // --------------------------------------------------- pointer, select and view
+
+    private fun loadViewPrefs() {
+        pointerMode = runCatching { PointerMode.valueOf(viewPrefs.getString("pointer", null) ?: "") }.getOrDefault(PointerMode.TRACKPAD)
+        viewMode = runCatching { ViewMode.valueOf(viewPrefs.getString("view", null) ?: "") }.getOrDefault(ViewMode.FIT)
+        presetIndex = viewPrefs.getInt("quality", 0).coerceIn(0, StreamSettings.presets.size - 1)
+    }
+
+    private fun pointerLabel(mode: PointerMode) = when (mode) {
+        PointerMode.TRACKPAD -> "Trackpad"
+        PointerMode.TOUCH -> "Touch"
+        PointerMode.AUTO -> "Auto"
+    }
+
+    private fun viewLabel(mode: ViewMode) = when (mode) {
+        ViewMode.FIT -> "Fit"
+        ViewMode.FILL -> "Fill"
+        ViewMode.STRETCH -> "Stretch"
+    }
+
+    private fun applyPointerMode(mode: PointerMode) {
+        pointerMode = mode
+        trackpad.pointerPolicy.mode = mode
+        pointerChip.text = "Pointer: " + pointerLabel(mode)
+        viewPrefs.edit().putString("pointer", mode.name).apply()
+        refreshAbsolute()
+    }
+
+    /** Touch and Auto place the pointer by position, which only works if the computer's agent can do that. */
+    private fun refreshAbsolute() {
+        if (!::trackpad.isInitialized) return
+        val connected = inputLink?.connected
+        val can = connected?.canMoveAbsolute == true
+        trackpad.absoluteEnabled = can
+        if (connected != null && !can && pointerMode != PointerMode.TRACKPAD && !warnedNoAbsolute) {
+            warnedNoAbsolute = true
+            Toast.makeText(
+                this,
+                "This computer's Mesh agent cannot place the pointer yet, so Touch and Auto work like the trackpad. Update it with git pull and restart it.",
+                Toast.LENGTH_LONG,
+            ).show()
+        }
+    }
+
+    private fun showPointerPicker() {
+        val modes = PointerMode.values()
+        val names = arrayOf(
+            "Trackpad: slide to move the pointer, tap to click where it is",
+            "Touch: tap where you want to click, drag to drag from there",
+            "Auto: tap jumps there when you have not just slid the pointer, hold then drag to select",
+        )
+        AlertDialog.Builder(this)
+            .setTitle("Pointer")
+            .setSingleChoiceItems(names, modes.indexOf(pointerMode)) { dialog, which ->
+                dialog.dismiss()
+                applyPointerMode(modes[which])
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun toggleSelect() {
+        trackpad.selectMode = !trackpad.selectMode
+        val on = trackpad.selectMode
+        selectChip.text = if (on) "Select: on" else "Select"
+        selectChip.background = Ui.box(this, fill = if (on) Color.argb(240, 74, 74, 80) else Color.argb(150, 11, 11, 12), radiusDp = 10)
+    }
+
+    private fun showViewPicker() {
+        val modes = ViewMode.values()
+        val names = arrayOf(
+            "Fit: the whole picture, with bars where the shapes differ",
+            "Fill: zoom to cover the screen, cropping the edges",
+            "Stretch: fill the screen exactly (the picture is distorted)",
+        )
+        AlertDialog.Builder(this)
+            .setTitle("View")
+            .setSingleChoiceItems(names, modes.indexOf(viewMode)) { dialog, which ->
+                dialog.dismiss()
+                viewMode = modes[which]
+                viewChip.text = "View: " + viewLabel(viewMode)
+                viewPrefs.edit().putString("view", viewMode.name).apply()
+                fitSurface()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     private fun showQualityPicker() {
         val names = StreamSettings.presets.map { it.first }.toTypedArray()
         AlertDialog.Builder(this)
@@ -645,6 +758,7 @@ class StreamActivity : Activity() {
     private fun chooseQuality(index: Int) {
         if (index == presetIndex) return
         presetIndex = index
+        viewPrefs.edit().putInt("quality", presetIndex).apply()
         qualityChip.text = StreamSettings.presets[presetIndex].first.substringBefore(" ")
         // A running stream is restarted so the new size is really used; before that the choice just applies to the start.
         if (session != null || messagePanel.visibility == View.VISIBLE) {

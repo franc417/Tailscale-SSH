@@ -124,7 +124,7 @@ class KeyboardLayoutTest {
             }
             error("no $code")
         }
-        assertEquals(listOf("esc", "_", "-", "prtsc"), rows[0].keys.filter { !it.isSpacer }.map { it.label })
+        assertEquals(listOf("esc", "_", "rclick", "-", "prtsc"), rows[0].keys.filter { !it.isSpacer }.map { it.label })
         near(centre(rows[1], "Digit1"), centre(rows[0], "Escape"), 0.001f)
         near(centre(rows[1], "Digit0"), centre(rows[0], "PrintScreen"), 0.001f)
         assertEquals(10, rows[1].keys.size)
@@ -145,6 +145,13 @@ class KeyboardLayoutTest {
         assertEquals("-", hyphen.label)
         assertEquals("Minus", hyphen.code)
         assertTrue(hyphen.mods.isEmpty())
+        // The right-click key sits between them, the same size as prtsc.
+        val rclick = real[2]
+        assertEquals("rclick", rclick.label)
+        assertEquals(CODE_RIGHT_CLICK, rclick.code)
+        assertEquals(real.last().weight, rclick.weight, 0.0001f)
+        assertTrue(rclick.mods.isEmpty())
+        assertEquals(null, rclick.fnVariant())
         // The top row is as wide as the digits row, so nothing above it shifts.
         near(rowOf(default, "letters", 1).totalWeight, top.totalWeight, 0.001f)
     }
@@ -172,7 +179,8 @@ class KeyboardLayoutTest {
         assertEquals("F11", variant("Escape")!!.code)
         assertEquals("F12", variant("PrintScreen")!!.code)
         val top = default.layer("letters")!!.rows[0].keys.filter { !it.isSpacer }
-        assertEquals(listOf("F11", "F12"), top.map { it.fnVariant()!!.label })
+        // esc and prtsc become F11 and F12; the "_" and "-" keys between them are not changed by fn.
+        assertEquals(listOf("F11", null, null, null, "F12"), top.map { it.fnVariant()?.label })
     }
 
     @Test
@@ -460,5 +468,22 @@ class KeyboardLayoutTest {
         val parsed = LayoutText.parse(LayoutText.serialize(l))
         assertEquals(emptyList<String>(), parsed.errors)
         assertEquals(l, parsed.layout)
+    }
+
+    @Test
+    fun `the right click key is known to the layout text and survives saving and loading`() {
+        assertTrue(CODE_RIGHT_CLICK in PHYSICAL_CODES)
+        val saved = LayoutText.serialize(default)
+        assertTrue(saved.contains("rclick|MouseRight"))
+        val loaded = LayoutText.parse(saved)
+        assertTrue(loaded.errors.toString(), loaded.errors.isEmpty())
+        assertEquals(default, loaded.layout)
+    }
+
+    @Test
+    fun `tapping the right click key resolves to its code, which the view turns into a click`() {
+        val key = default.layer("letters")!!.rows[0].keys.first { it.label == "rclick" }
+        val action = resolveTap(key, false, false, "letters", default.defaultLayerName)
+        assertEquals(TapAction.SendKey(CODE_RIGHT_CLICK, emptyList()), action)
     }
 }

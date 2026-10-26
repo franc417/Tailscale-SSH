@@ -27,6 +27,7 @@ object Mip {
     const val T_RELEASE_ALL = 0x08
     const val T_BYE = 0x09
     const val T_SUNSHINE_PAIR = 0x0A
+    const val T_MOVE_ABS = 0x0B
 
     // host -> phone
     const val T_HELLO_OK = 0x81
@@ -43,6 +44,10 @@ object Mip {
     const val FEATURE_TEXT = 0x01
     const val FEATURE_HIRES_SCROLL = 0x02
     const val FEATURE_SUNSHINE_PAIR = 0x04
+    const val FEATURE_ABS_POINTER = 0x08
+
+    /** Absolute pointer positions are 0..65535 across the streamed screen on both axes. */
+    const val ABS_MAX = 0xFFFF
 
     // T_SUNSHINE_RESULT status codes (the host agent's S_* values)
     const val SUNSHINE_OK = 0
@@ -138,6 +143,14 @@ object MipCodec {
     fun releaseAll(): ByteArray = frame(Mip.T_RELEASE_ALL)
 
     fun bye(): ByteArray = frame(Mip.T_BYE)
+
+    /** A spot on the streamed screen as a fraction (0..1 from the top left); values outside are clamped to the edge. */
+    fun moveAbs(x: Float, y: Float): ByteArray =
+        frame(Mip.T_MOVE_ABS, ByteBuffer.allocate(4).putShort(toWire(x).toShort()).putShort(toWire(y).toShort()).array())
+
+    /** 0..1 becomes 0..65535; NaN, infinity and out-of-range values become the nearest edge (NaN: the top left). */
+    fun toWire(fraction: Float): Int =
+        if (fraction.isNaN()) 0 else Math.round(fraction.coerceIn(0f, 1f) * Mip.ABS_MAX)
 
     /** "Pair my desktop view with this PIN": [pin] is 4 digits, [name] what the computer should call this phone. */
     fun sunshinePair(pin: String, name: String): ByteArray {
