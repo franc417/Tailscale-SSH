@@ -129,6 +129,9 @@ class StreamSession internal constructor(
     private val events: StreamEvents,
 ) {
     @Volatile private var stopped = false
+    private val startedAt = SystemClock.uptimeMillis()
+    @Volatile private var firstFrameAt = 0L
+    private val history = ArrayDeque<StreamReport.Sample>()   // the last seconds of statistics, for the report
     @Volatile private var connection: NvConnection? = null
     @Volatile private var lastMessage: String? = null
 
@@ -136,6 +139,7 @@ class StreamSession internal constructor(
         surface,
         object : MeshVideoDecoder.Events {
             override fun onFirstFrame(width: Int, height: Int) {
+                firstFrameAt = SystemClock.uptimeMillis()
                 if (!stopped) events.onFirstFrame(width, height)
             }
 
@@ -161,8 +165,35 @@ class StreamSession internal constructor(
         } catch (e: Throwable) {
             null // the streaming core is not running (yet or any more)
         }
+        synchronized(history) {
+            history.addLast(StreamReport.Sample(snapshot, rtt))
+            while (history.size > REPORT_SECONDS) history.removeFirst()
+        }
         return StreamStats.describe(snapshot, rtt)
     }
+
+    /**
+     * Everything needed to say where a delay comes from, as text to paste: phone, decoder, whether the low-latency
+     * header rewrite worked, the stream settings, the kind of address, and the last seconds of statistics.
+     */
+    fun report(view: String, pointer: String): String = StreamReport.build(
+        StreamReport.Input(
+            phone = "${Build.MANUFACTURER} ${Build.MODEL}",
+            android = "${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})",
+            decoder = video.decoderName,
+            spsPatched = video.spsPatched,
+            spsPatchFailed = video.spsPatchFailed,
+            spsPatchError = video.spsPatchError,
+            settings = settings,
+            view = view,
+            pointer = pointer,
+            host = host,
+            firstPictureMs = if (firstFrameAt > 0) firstFrameAt - startedAt else null,
+            samples = synchronized(history) { history.toList() },
+            totalShown = video.framesRendered,
+            totalDropped = video.framesDropped,
+        ),
+    )
 
     internal fun begin() {
         Thread({ run() }, "mesh-stream-start").start()
@@ -282,6 +313,7 @@ class StreamSession internal constructor(
     }
 
     private companion object {
+        const val REPORT_SECONDS = 12
         val stopLock = Any()
 
         /** The shutdown thread of the most recent session that was stopped. */

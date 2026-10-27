@@ -74,10 +74,19 @@ The desktop view has several ways to use a finger. They are chosen from the bar 
   says so and works like the trackpad. With more than one monitor see the `MESH_MONITOR` note in the protocol document.
 - **Select**: switch it on and a one-finger drag highlights (it holds the left button down), so you can copy text. The
   old tap-then-drag still works too. The input-only screen has a **Select** button as well.
-- **View** (menu): **Fit** shows the whole picture; **Fill** zooms to cover the screen and crops the edges; **Stretch** fills
-  the screen exactly but distorts the picture. The picture keeps its own shape because Sunshine pads with black, so true
-  full-screen clarity needs the computer's screen mode to match the stream: run `python3 mesh_input.py display-info`
-  on the computer and send the output, and that can be set up.
+- **View** (menu): **Fit** shows the whole picture without distortion, with black bars where the shapes differ. **Fill** shows the
+  whole picture over the whole screen with nothing cropped, stretched a little where the shapes differ (a 16:9 desktop on a
+  20:9 phone looks about a quarter wider). **Zoom** covers the screen without stretching and crops the edges. The picture keeps
+  its own shape because Sunshine pads with black, so a stretch-free full screen needs the computer's screen shape to match.
+  Your choice is remembered.
+- **Finding out why it is slow**: tap the **status line** in the bar (it appears once the picture is showing). That copies a
+  report with the phone, the decoder, whether the low-latency video header rewrite worked, the stream settings, the kind of
+  address (home network or Tailscale) and the last seconds of frames per second, network round trip, the computer's encode time
+  and the phone's decode time. Paste it into the chat. The **Quick** quality preset is a small, fast stream: if the delay
+  disappears there, the computer's encoder or the network was the limit rather than the phone.
+- **On the computer** run `python3 mesh_input.py diagnose` in a terminal **inside the desktop** (it also works over SSH) right
+  after a stream, and paste what it prints. It shows the desktop and monitors, Sunshine's settings and the lines of its log about
+  capture and encoding (this is where "software encoding" or a slow capture shows up), and the processor and graphics hardware.
 - The pointer mark in the desktop view is now only a small faint dot (a bit stronger while the button is held).
 
 # Trying the desktop view

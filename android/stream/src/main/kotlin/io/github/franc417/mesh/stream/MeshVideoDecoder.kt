@@ -49,6 +49,11 @@ class MeshVideoDecoder(
     @Volatile var framesDropped = 0L; private set
     @Volatile var decoderName: String = ""; private set
 
+    /** How the low-latency rewrite of the video header went: how many times it worked, how many times it failed, and why. */
+    @Volatile var spsPatched = 0; private set
+    @Volatile var spsPatchFailed = 0; private set
+    @Volatile var spsPatchError: String? = null; private set
+
     /** Per-second numbers that explain lag (frame rate, decode time, host encode time, drops). */
     val stats = StreamStats()
 
@@ -155,8 +160,14 @@ class MeshVideoDecoder(
             csd.beginFrame(frameNumber)
             if (h264 && decodeUnitType == CsdAccumulator.BUFFER_TYPE_SPS) {
                 // Tell the decoder there is no reordering, so it shows frames at once instead of buffering several.
-                val patched = H264SpsPatcher.patch(decodeUnitData, decodeUnitLength)
-                csd.add(decodeUnitType, patched, patched.size)
+                val result = H264SpsPatcher.tryPatch(decodeUnitData, decodeUnitLength)
+                val bytes = result.getOrElse {
+                    spsPatchFailed++
+                    spsPatchError = it.toString().take(160)
+                    decodeUnitData.copyOf(decodeUnitLength)   // the stream still works, with the decoder's default delay
+                }
+                if (result.isSuccess) spsPatched++
+                csd.add(decodeUnitType, bytes, bytes.size)
                 return MoonBridge.DR_OK
             }
             if (csd.add(decodeUnitType, decodeUnitData, decodeUnitLength)) {

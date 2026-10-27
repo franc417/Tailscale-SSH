@@ -24,7 +24,8 @@ Commands:
   python3 mesh_input.py init                 create the certificate and token
   python3 mesh_input.py pair-info            print what the phone needs, as JSON
   python3 mesh_input.py sunshine-login       save Sunshine's web login once, so the phone pairs its desktop view with no PIN
-  python3 mesh_input.py display-info         print what this desktop looks like (session type, monitors), to set up the screen shape
+  python3 mesh_input.py diagnose             print the desktop, monitors, Sunshine settings/log and hardware, to find out why it is slow
+                                              (display-info is the same command)
   python3 mesh_input.py run [--port N]       serve (needs /dev/uinput access)
   python3 mesh_input.py install-service      start at every login and restart on failure (systemd user service)
   python3 mesh_input.py uninstall-service    stop and remove that service
@@ -992,33 +993,193 @@ class SunshineLink:
         raise SunshineError(S_FAILED, "Sunshine did not complete the pairing (wrong PIN or it timed out)")
 
 
-def display_info(runner=subprocess.run, which=shutil.which, environ=os.environ) -> str:
-    """Describes this computer's desktop session and monitors, for the person to paste when setting up the screen shape.
+def graphical_environment(environ=os.environ, listdir=os.listdir, exists=os.path.exists, uid=os.getuid) -> Dict[str, str]:
+    """The variables a tool needs to talk to this user's running desktop, found from the desktop's own sockets.
 
-    Everything is best effort: a missing tool or a failing command is mentioned and skipped, never fatal."""
-    lines = ["Mesh display info (paste all of this):", ""]
+    Over SSH none of them are set (the session type reads "tty"), which makes desktop tools fail; this finds the
+    ones that are missing. It only adds what is missing and never overrides what is already set."""
+    found: Dict[str, str] = {}
+    runtime = environ.get("XDG_RUNTIME_DIR") or f"/run/user/{uid()}"
+    if exists(runtime):
+        if not environ.get("XDG_RUNTIME_DIR"):
+            found["XDG_RUNTIME_DIR"] = runtime
+        if not environ.get("WAYLAND_DISPLAY"):
+            try:
+                names = sorted(n for n in listdir(runtime) if re.fullmatch(r"wayland-[0-9]+", n))
+            except OSError:
+                names = []
+            if names:
+                found["WAYLAND_DISPLAY"] = names[0]
+        bus = os.path.join(runtime, "bus")
+        if not environ.get("DBUS_SESSION_BUS_ADDRESS") and exists(bus):
+            found["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=" + bus
+    if not environ.get("DISPLAY"):
+        try:
+            sockets = sorted(n for n in listdir("/tmp/.X11-unix") if re.fullmatch(r"X[0-9]+", n))
+        except OSError:
+            sockets = []
+        if sockets:
+            found["DISPLAY"] = ":" + sockets[0][1:]
+    return found
+
+
+_MUTTER_MONITOR = re.compile(r"\(\('([^']+)', '([^']*)', '([^']*)', '([^']*)'\), \[")
+_MUTTER_MODE = re.compile(r"\('([0-9]+x[0-9]+@[0-9.]+)', ([0-9]+), ([0-9]+), ([0-9.]+), ([0-9.]+), \[([^\]]*)\], \{([^}]*)\}\)")
+_MUTTER_LOGICAL = re.compile(r"\((-?[0-9]+), (-?[0-9]+), ([0-9.]+), uint32 [0-9]+, (true|false), \[")
+
+
+def summarize_mutter_state(text: str) -> List[str]:
+    """Turns GNOME's `GetCurrentState` answer (one long line of GVariant text) into a few readable lines.
+
+    Best effort: anything that does not match is skipped, and an empty list means the text was not understood."""
+    lines: List[str] = []
+    starts = list(_MUTTER_MONITOR.finditer(text))
+    for index, match in enumerate(starts):
+        end = starts[index + 1].start() if index + 1 < len(starts) else len(text)
+        chunk = text[match.end():end]
+        modes = _MUTTER_MODE.findall(chunk)
+        current = next((m for m in modes if "'is-current'" in m[6]), None)
+        sizes: List[str] = []
+        for m in modes:
+            size = f"{m[1]}x{m[2]}"
+            if size not in sizes:
+                sizes.append(size)
+        line = f"monitor {match.group(1)} ({match.group(2)}): "
+        if current:
+            line += f"now {current[1]}x{current[2]} at {float(current[3]):.2f} Hz, scale {current[4]}, scales offered [{current[5]}]"
+        else:
+            line += "current mode not found"
+        line += f"; {len(modes)} modes; sizes offered: {', '.join(sizes[:14])}" + (" ..." if len(sizes) > 14 else "")
+        lines.append(line)
+    for m in _MUTTER_LOGICAL.finditer(text):
+        lines.append(f"logical monitor at ({m.group(1)}, {m.group(2)}) scale {m.group(3)}{', primary' if m.group(4) == 'true' else ''}")
+    return lines
+
+
+_SUNSHINE_LOG_INTEREST = re.compile(
+    r"(?i)encoder|capture|kms|pipewire|portal|wayland|x11|vaapi|nvenc|nvidia|software|x264|resolution|fps|frame|"
+    r"warn|error|fatal|cuda|monitor|display|session|bitrate|latency|client|launch|rtsp|found|detected|using|configuring|"
+    r"adapter|gpu|drm|cursor|idr|fec|packet")
+
+
+def filter_sunshine_log(text: str, keep: int = 50) -> List[str]:
+    """The lines of Sunshine's log that say how it captures and encodes and what went wrong, the newest [keep] of them."""
+    hits = [line.rstrip() for line in text.splitlines() if _SUNSHINE_LOG_INTEREST.search(line)]
+    return hits[-keep:]
+
+
+def _redact_config(text: str) -> List[str]:
+    """Sunshine's settings without comments, blank lines or anything that looks like a secret."""
+    kept = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key = line.split("=", 1)[0].strip().lower()
+        kept.append(f"{key} = (hidden)" if re.search(r"pass|secret|salt|cred|token|key", key) else line)
+    return kept
+
+
+def display_info(runner=subprocess.run, which=shutil.which, environ=os.environ, read_file=None,
+                 listdir=os.listdir, exists=os.path.exists, uid=os.getuid) -> str:
+    """Describes this computer's desktop, monitors, Sunshine and hardware, for the person to paste when something is slow
+    or the screen shape needs setting up.
+
+    Works over SSH too (it finds the running desktop's sockets). Everything is best effort: a missing tool or a failing
+    command is mentioned and skipped, never fatal."""
+    if read_file is None:
+        def read_file(path: str) -> str:
+            with open(path, errors="replace") as f:
+                return f.read()
+
+    graphical = graphical_environment(environ, listdir, exists, uid)
+    env = {**environ, **graphical}
+    lines = ["Mesh diagnostics (paste all of this):", ""]
     for name in ("XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP", "DESKTOP_SESSION", "WAYLAND_DISPLAY", "DISPLAY"):
         lines.append(f"{name}={environ.get(name, '')}")
     lines.append(f"MESH_MONITOR={environ.get('MESH_MONITOR', '')}")
     lines.append(f"MESH_DESKTOP={environ.get('MESH_DESKTOP', '')}")
-    tools = (("xrandr", ["xrandr", "--query"]), ("wlr-randr", ["wlr-randr"]),
-             ("kscreen-doctor", ["kscreen-doctor", "-o"]), ("hyprctl", ["hyprctl", "monitors"]),
-             ("swaymsg", ["swaymsg", "-t", "get_outputs", "--raw"]), ("sunshine", ["sunshine", "--version"]))
-    for name, cmd in tools:
-        lines.append("")
+    if graphical:
+        lines.append("found the running desktop, so tools below were run against it: " + ", ".join(f"{k}={v}" for k, v in graphical.items()))
+
+    def run(cmd: List[str], timeout: float = 8.0) -> Optional[str]:
+        """The command's output, or None if it is not installed or failed (the reason is added to the report)."""
         if which(cmd[0]) is None:
-            lines.append(f"[{name}] not installed")
-            continue
+            lines.append(f"[{cmd[0]}] not installed")
+            return None
         try:
-            done = runner(cmd, capture_output=True, text=True, timeout=5)
-            output = (done.stdout or done.stderr or "").strip().splitlines()
+            done = runner(cmd, capture_output=True, text=True, timeout=timeout, env=env)
         except (OSError, subprocess.SubprocessError) as exc:
-            lines.append(f"[{name}] failed: {exc}")
+            lines.append(f"[{cmd[0]}] failed: {exc}")
+            return None
+        return (done.stdout or done.stderr or "").strip()
+
+    def section(title: str, body: List[str], limit: int = 40) -> None:
+        lines.append("")
+        lines.append(f"[{title}]")
+        lines.extend(body[:limit])
+        if len(body) > limit:
+            lines.append(f"... ({len(body) - limit} more lines)")
+
+    # -- sessions and monitors
+    out = run(["loginctl", "list-sessions", "--no-legend"])
+    if out is not None:
+        section("loginctl sessions", out.splitlines(), 10)
+    state = run(["gdbus", "call", "--session", "--dest", "org.gnome.Mutter.DisplayConfig", "--object-path",
+                 "/org/gnome/Mutter/DisplayConfig", "--method", "org.gnome.Mutter.DisplayConfig.GetCurrentState"])
+    if state is not None:
+        summary = summarize_mutter_state(state)
+        section("GNOME monitors", summary or ["(not understood) " + state[:1500]])
+    for schema, key in (("org.gnome.desktop.interface", "text-scaling-factor"), ("org.gnome.desktop.interface", "scaling-factor"),
+                        ("org.gnome.mutter", "experimental-features")):
+        value = run(["gsettings", "get", schema, key])
+        if value is not None:
+            lines.append(f"{schema} {key} = {value}")
+    for cmd in (["xrandr", "--query"], ["wlr-randr"], ["hyprctl", "monitors"], ["swaymsg", "-t", "get_outputs", "--raw"]):
+        out = run(cmd)
+        if out is not None:
+            section(cmd[0], out.splitlines())
+
+    # -- Sunshine
+    out = run(["sunshine", "--version"])
+    if out is not None:
+        section("sunshine version", [l for l in out.splitlines() if "version" in l.lower()][:3])
+    for path in (os.path.join(environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "sunshine", "sunshine.conf"),):
+        try:
+            section("sunshine.conf (secrets hidden)", _redact_config(read_file(path)) or ["(empty: all defaults)"])
+        except OSError:
+            lines.append(f"[sunshine.conf] not readable at {path}")
+    log = run(["journalctl", "--user", "-u", "sunshine", "-n", "800", "--no-pager", "-o", "cat"], timeout=15)
+    if not log:
+        try:
+            log = read_file(os.path.join(environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "sunshine", "sunshine.log"))
+        except OSError:
+            log = ""
+    section("sunshine log (capture, encoder, warnings; newest last)", filter_sunshine_log(log or "") or ["(no log found)"], 50)
+
+    # -- the computer
+    hardware: List[str] = []
+    for path, wanted in (("/proc/cpuinfo", "model name"), ("/proc/meminfo", "MemTotal"), ("/proc/loadavg", "")):
+        try:
+            text = read_file(path)
+        except OSError:
             continue
-        lines.append(f"[{name}]")
-        lines.extend(output[:40])
-        if len(output) > 40:
-            lines.append(f"... ({len(output) - 40} more lines)")
+        if wanted:
+            first = next((l for l in text.splitlines() if l.startswith(wanted)), "")
+            if first:
+                hardware.append(first)
+        else:
+            hardware.append("load average: " + text.strip())
+    out = run(["lspci"])
+    if out is not None:
+        hardware += [l for l in out.splitlines() if re.search(r"(?i)vga|3d|display", l)]
+    out = run(["nvidia-smi", "-L"])
+    if out:
+        hardware += out.splitlines()[:4]
+    out = run(["vainfo"])
+    if out:
+        hardware += [l for l in out.splitlines() if re.search(r"(?i)driver version|H264.*Enc|HEVC.*Enc", l)][:8]
+    section("hardware", hardware)
     return "\n".join(lines)
 
 
@@ -1291,7 +1452,7 @@ def uninstall_service(target_dir: Optional[str] = None, runner=subprocess.run) -
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Mesh input channel (host side)")
-    ap.add_argument("command", choices=["init", "pair-info", "run", "reset-token", "install-service", "uninstall-service", "sunshine-login", "display-info"])
+    ap.add_argument("command", choices=["init", "pair-info", "run", "reset-token", "install-service", "uninstall-service", "sunshine-login", "display-info", "diagnose"])
     ap.add_argument("--dir", default=default_dir())
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--dry-run", action="store_true", help="record events instead of injecting them")
@@ -1301,7 +1462,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--password-stdin", action="store_true", help="sunshine-login: read the password from standard input")
     args = ap.parse_args(argv)
 
-    if args.command == "display-info":
+    if args.command in ("display-info", "diagnose"):
         print(display_info())
         return 0
 

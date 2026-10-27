@@ -21,6 +21,8 @@ data class StreamSettings(
             "Smooth · 720p 60 fps" to StreamSettings(1280, 720, 60, 10_000),
             "Sharp · 1080p 60 fps" to StreamSettings(1920, 1080, 60, 20_000),
             "Light · 720p 30 fps" to StreamSettings(1280, 720, 30, 5_000),
+            // Small and quick: if the delay goes away here the computer's encoder or the network was the limit, not the phone.
+            "Quick · 540p 60 fps" to StreamSettings(960, 540, 60, 6_000),
         )
     }
 }

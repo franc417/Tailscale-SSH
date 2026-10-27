@@ -144,4 +144,15 @@ class H264SpsPatcherTest {
         val patched = H264SpsPatcher.patch(input, input.size)
         assertTrue("size went from ${input.size} to ${patched.size}", patched.size in input.size - 4..input.size + 16)
     }
+
+    @Test
+    fun `tryPatch says whether it worked and why not`() {
+        val input = annexB(4)
+        assertTrue(H264SpsPatcher.tryPatch(input, input.size).isSuccess)
+        val failure = H264SpsPatcher.tryPatch(byteArrayOf(0, 0, 0, 1), 4)
+        assertTrue(failure.isFailure)
+        assertNotNull(failure.exceptionOrNull())
+        // and patch() still hands the original back in that case
+        assertArrayEquals(byteArrayOf(0, 0, 0, 1), H264SpsPatcher.patch(byteArrayOf(0, 0, 0, 1), 4))
+    }
 }

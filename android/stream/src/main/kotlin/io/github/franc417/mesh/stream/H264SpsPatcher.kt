@@ -23,40 +23,39 @@ object H264SpsPatcher {
      * [nal] holds one SPS NAL unit in Annex B form (a 3- or 4-byte start code, the NAL header byte, then the payload),
      * of which the first [length] bytes are valid.
      */
-    fun patch(nal: ByteArray, length: Int): ByteArray {
+    fun patch(nal: ByteArray, length: Int): ByteArray = tryPatch(nal, length).getOrElse { nal.copyOf(length) }
+
+    /** Like [patch], but says whether it worked: a failure carries the reason, so it can be reported. */
+    fun tryPatch(nal: ByteArray, length: Int): Result<ByteArray> = runCatching {
         val original = nal.copyOf(length)
-        return try {
-            val startSeqLen = if (original[2] == 0x01.toByte()) 3 else 4
-            val buf = ByteBuffer.wrap(original)
-            buf.position(startSeqLen + 1) // skip the start code and the NAL header byte
-            val sps = H264Utils.readSPS(buf) // handles emulation-prevention bytes
+        val startSeqLen = if (original[2] == 0x01.toByte()) 3 else 4
+        val buf = ByteBuffer.wrap(original)
+        buf.position(startSeqLen + 1) // skip the start code and the NAL header byte
+        val sps = H264Utils.readSPS(buf) // handles emulation-prevention bytes
 
-            sps.numRefFrames = 1
-            if (sps.vuiParams == null) sps.vuiParams = VUIParameters()
-            if (sps.vuiParams.bitstreamRestriction == null) {
-                val r = VUIParameters.BitstreamRestriction()
-                r.motionVectorsOverPicBoundariesFlag = true
-                r.maxBytesPerPicDenom = 2
-                r.maxBitsPerMbDenom = 1
-                r.log2MaxMvLengthHorizontal = 16
-                r.log2MaxMvLengthVertical = 16
-                r.numReorderFrames = 0
-                sps.vuiParams.bitstreamRestriction = r
-            }
-            // Sunshine never sends B-frames, so nothing is ever shown out of decode order. Setting this always (Moonlight
-            // only sets it when it adds the restrictions) also keeps the header valid: reorder frames may not exceed
-            // the buffering we declare next.
-            sps.vuiParams.bitstreamRestriction.numReorderFrames = 0
-            // Some decoders reject maxDecFrameBuffering < numRefFrames, so tie them together.
-            sps.vuiParams.bitstreamRestriction.maxDecFrameBuffering = sps.numRefFrames
-
-            val escaped = H264Utils.writeSPS(sps, length)
-            val out = ByteArray(startSeqLen + 1 + escaped.limit())
-            System.arraycopy(original, 0, out, 0, startSeqLen + 1)
-            escaped.get(out, startSeqLen + 1, escaped.limit())
-            out
-        } catch (e: Exception) {
-            original
+        sps.numRefFrames = 1
+        if (sps.vuiParams == null) sps.vuiParams = VUIParameters()
+        if (sps.vuiParams.bitstreamRestriction == null) {
+            val r = VUIParameters.BitstreamRestriction()
+            r.motionVectorsOverPicBoundariesFlag = true
+            r.maxBytesPerPicDenom = 2
+            r.maxBitsPerMbDenom = 1
+            r.log2MaxMvLengthHorizontal = 16
+            r.log2MaxMvLengthVertical = 16
+            r.numReorderFrames = 0
+            sps.vuiParams.bitstreamRestriction = r
         }
+        // Sunshine never sends B-frames, so nothing is ever shown out of decode order. Setting this always (Moonlight
+        // only sets it when it adds the restrictions) also keeps the header valid: reorder frames may not exceed
+        // the buffering we declare next.
+        sps.vuiParams.bitstreamRestriction.numReorderFrames = 0
+        // Some decoders reject maxDecFrameBuffering < numRefFrames, so tie them together.
+        sps.vuiParams.bitstreamRestriction.maxDecFrameBuffering = sps.numRefFrames
+
+        val escaped = H264Utils.writeSPS(sps, length)
+        val out = ByteArray(startSeqLen + 1 + escaped.limit())
+        System.arraycopy(original, 0, out, 0, startSeqLen + 1)
+        escaped.get(out, startSeqLen + 1, escaped.limit())
+        out
     }
 }

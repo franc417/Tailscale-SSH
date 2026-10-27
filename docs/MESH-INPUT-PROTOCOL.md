@@ -81,7 +81,7 @@ through the normal button messages, because the cursor is shared by both devices
 
 The absolute device spans all monitors together, while the picture is one monitor. With several monitors set
 `MESH_MONITOR="x,y,w,h"` (the streamed monitor, in pixels) and `MESH_DESKTOP="w,h"` (all monitors together) in the
-agent's environment so a position is placed inside that monitor. `python3 mesh_input.py display-info` prints what the
+agent's environment so a position is placed inside that monitor. `python3 mesh_input.py diagnose` prints what the
 session looks like. Wayland compositors differ in how they map absolute devices; this is untested there.
 
 ## Pairing the desktop view without a PIN (SUNSHINE_PAIR / SUNSHINE_RESULT)

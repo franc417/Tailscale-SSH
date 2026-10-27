@@ -188,7 +188,7 @@ class StreamActivity : Activity() {
         val gap = { View(this).apply { layoutParams = LinearLayout.LayoutParams(Ui.dp(this@StreamActivity, 6), 1) } }
         bar.addView(chip("\u2715  Close") { finish() })
         bar.addView(gap())
-        statusChip = chip("") {}.apply {
+        statusChip = chip("") { copyReport() }.apply {
             visibility = View.INVISIBLE // invisible, not gone: it holds the space that keeps the other chips on the right
             maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.END
@@ -659,7 +659,7 @@ class StreamActivity : Activity() {
 
     private fun loadViewPrefs() {
         pointerMode = runCatching { PointerMode.valueOf(viewPrefs.getString("pointer", null) ?: "") }.getOrDefault(PointerMode.TRACKPAD)
-        viewMode = runCatching { ViewMode.valueOf(viewPrefs.getString("view", null) ?: "") }.getOrDefault(ViewMode.FIT)
+        viewMode = ViewMode.parse(viewPrefs.getString("view", null))
         presetIndex = viewPrefs.getInt("quality", 0).coerceIn(0, StreamSettings.presets.size - 1)
     }
 
@@ -672,7 +672,7 @@ class StreamActivity : Activity() {
     private fun viewLabel(mode: ViewMode) = when (mode) {
         ViewMode.FIT -> "Fit"
         ViewMode.FILL -> "Fill"
-        ViewMode.STRETCH -> "Stretch"
+        ViewMode.ZOOM -> "Zoom"
     }
 
     private fun applyPointerMode(mode: PointerMode) {
@@ -726,9 +726,9 @@ class StreamActivity : Activity() {
     private fun showViewPicker() {
         val modes = ViewMode.values()
         val names = arrayOf(
-            "Fit: the whole picture, with bars where the shapes differ",
-            "Fill: zoom to cover the screen, cropping the edges",
-            "Stretch: fill the screen exactly (the picture is distorted)",
+            "Fit: the whole picture without distortion, black bars where the shapes differ",
+            "Fill: the whole picture over the whole screen, nothing cropped (stretched a little)",
+            "Zoom: cover the screen without stretching, cropping the edges",
         )
         AlertDialog.Builder(this)
             .setTitle("View")
@@ -741,6 +741,15 @@ class StreamActivity : Activity() {
             }
             .setNegativeButton("Cancel", null)
             .show()
+    }
+
+    /** Tapping the status line copies a report that shows where a delay comes from, ready to paste. */
+    private fun copyReport() {
+        val running = session
+        val text = running?.report(viewLabel(viewMode), pointerLabel(pointerMode)) ?: return
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Mesh stream report", text))
+        Toast.makeText(this, "Diagnostics copied. Paste them into the chat.", Toast.LENGTH_LONG).show()
     }
 
     private fun showQualityPicker() {
