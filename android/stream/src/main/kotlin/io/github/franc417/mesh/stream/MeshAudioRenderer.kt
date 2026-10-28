@@ -4,6 +4,8 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
+import android.os.Build
+import android.os.Process
 import com.limelight.LimeLog
 import com.limelight.nvstream.av.audio.AudioRenderer
 import com.limelight.nvstream.jni.MoonBridge
@@ -11,31 +13,51 @@ import com.limelight.nvstream.jni.MoonBridge
 /**
  * Plays the PCM that moonlight-common-c decodes from the host's Opus stream.
  *
- * Stereo only: Mesh asks the host for a stereo stream, so there is nothing to downmix. It follows the same policy as
- * Moonlight's own renderer: low-latency track, small buffer first, and never let more than ~40 ms of extra audio
- * queue up (it is dropped instead, so sound cannot drift behind the picture).
+ * Stereo only: Mesh asks the host for a stereo stream, so there is nothing to downmix. Unlike Moonlight's own renderer
+ * (a 10 ms buffer in low-latency mode) this one starts with a steadier 40 ms buffer in normal mode and grows it by
+ * 20 ms every time it ran dry (see [AudioBufferPolicy]): a dry buffer is the occasional scratch, and on a phone that is
+ * also busy decoding video it happens. The thread that feeds it runs at audio priority.
  */
 class MeshAudioRenderer : AudioRenderer {
     private var track: AudioTrack? = null
+    private var sampleRate = 48_000
+    private var samplesPerPacket = 240
+    private var capacityFrames = 0
+    private var sizeFrames = 0
+    private var lastUnderruns = 0
+    private var writesSinceCheck = 0
+    private var prioritySet = false
+
+    /** The buffer size now, in milliseconds (it grows when the buffer ran dry). */
+    @Volatile var bufferMs = 0; private set
+
+    /** How many times the buffer has run dry since the stream started (each is an audible gap). */
+    @Volatile var underruns = 0; private set
 
     override fun setup(audioConfiguration: MoonBridge.AudioConfiguration, sampleRate: Int, samplesPerFrame: Int): Int {
         if (audioConfiguration.channelCount != 2) {
             LimeLog.severe("MeshAudioRenderer: only stereo is supported, got ${audioConfiguration.channelCount} channels")
             return -1
         }
+        this.sampleRate = sampleRate
+        this.samplesPerPacket = samplesPerFrame
         val channelMask = AudioFormat.CHANNEL_OUT_STEREO
-        val bytesPerFrame = 2 * samplesPerFrame * 2
-        val minimum = AudioTrack.getMinBufferSize(sampleRate, channelMask, AudioFormat.ENCODING_PCM_16BIT)
+        val bytesPerSampleFrame = 2 * 2   // two channels, 16 bits
+        val minimumFrames = AudioTrack.getMinBufferSize(sampleRate, channelMask, AudioFormat.ENCODING_PCM_16BIT) / bytesPerSampleFrame
+        val steadyCapacity = AudioBufferPolicy.capacityFrames(sampleRate, samplesPerFrame, minimumFrames)
+        val steadyStart = AudioBufferPolicy.initialFrames(sampleRate, samplesPerFrame)
+        val packetFrames = samplesPerFrame
 
-        // 1) small buffer, low latency  2) larger buffer, low latency  3) larger buffer, normal mode
+        // 1) steady buffer that can grow, normal mode  2) minimum-size buffer, normal mode
+        // 3) small buffer, low-latency mode (Moonlight's own choice, if nothing else will start)
+        data class Attempt(val capacity: Int, val start: Int, val lowLatency: Boolean, val label: String)
         val attempts = listOf(
-            Triple(bytesPerFrame * 2, true, "small buffer, low latency"),
-            Triple(maxOf(minimum, bytesPerFrame * 2).roundUpTo(bytesPerFrame), true, "large buffer, low latency"),
-            Triple(maxOf(minimum, bytesPerFrame * 2).roundUpTo(bytesPerFrame), false, "large buffer, normal"),
+            Attempt(steadyCapacity, steadyStart, false, "steady 40 ms buffer that can grow"),
+            Attempt(maxOf(minimumFrames, steadyStart), maxOf(minimumFrames, steadyStart), false, "system minimum buffer"),
+            Attempt(packetFrames * 2, packetFrames * 2, true, "small buffer, low latency"),
         )
-        for ((size, lowLatency, label) in attempts) {
-            // A low-latency track only works when the content rate matches the hardware rate.
-            if (lowLatency && AudioTrack.getNativeOutputSampleRate(AudioManager.STREAM_MUSIC) != sampleRate) continue
+        for (attempt in attempts) {
+            if (attempt.lowLatency && AudioTrack.getNativeOutputSampleRate(AudioManager.STREAM_MUSIC) != sampleRate) continue
             try {
                 val builder = AudioTrack.Builder()
                     .setAudioAttributes(
@@ -52,19 +74,24 @@ class MeshAudioRenderer : AudioRenderer {
                             .build(),
                     )
                     .setTransferMode(AudioTrack.MODE_STREAM)
-                    .setBufferSizeInBytes(size)
-                if (lowLatency) builder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                    .setBufferSizeInBytes(attempt.capacity * bytesPerSampleFrame)
+                if (attempt.lowLatency) builder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
                 val t = builder.build()
                 if (t.state != AudioTrack.STATE_INITIALIZED) {
                     t.release()
                     continue
                 }
+                // The track may have been given more room than asked for; use only the starting size for now.
+                val set = t.setBufferSizeInFrames(attempt.start)
+                capacityFrames = t.bufferCapacityInFrames
+                sizeFrames = if (set > 0) set else t.bufferSizeInFrames
+                bufferMs = AudioBufferPolicy.toMs(sizeFrames, sampleRate)
                 t.play()
                 track = t
-                LimeLog.info("MeshAudioRenderer: $label ($size bytes)")
+                LimeLog.info("MeshAudioRenderer: ${attempt.label}: $bufferMs ms of ${AudioBufferPolicy.toMs(capacityFrames, sampleRate)} ms")
                 return 0
             } catch (e: Exception) {
-                LimeLog.warning("MeshAudioRenderer: $label failed: $e")
+                LimeLog.warning("MeshAudioRenderer: ${attempt.label} failed: $e")
             }
         }
         return -2
@@ -76,9 +103,39 @@ class MeshAudioRenderer : AudioRenderer {
 
     override fun playDecodedAudio(audioData: ShortArray) {
         val t = track ?: return
+        if (!prioritySet) {
+            prioritySet = true
+            try {
+                // This is the thread that keeps the buffer full, so it must not be starved by video work.
+                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+            } catch (_: Exception) {
+            }
+        }
         // write() blocks until there is room, which can build a backlog; the pending-duration check bounds it.
-        if (MoonBridge.getPendingAudioDuration() < 40) {
+        if (MoonBridge.getPendingAudioDuration() < PENDING_LIMIT_MS) {
             t.write(audioData, 0, audioData.size)
+        }
+        if (++writesSinceCheck >= CHECK_EVERY_WRITES) {
+            writesSinceCheck = 0
+            growIfItRanDry(t)
+        }
+    }
+
+    /** About once a second: if the buffer ran dry since the last look, make it a little bigger. */
+    private fun growIfItRanDry(t: AudioTrack) {
+        if (Build.VERSION.SDK_INT < 24) return
+        val total = t.underrunCount
+        val since = total - lastUnderruns
+        lastUnderruns = total
+        underruns = total
+        val next = AudioBufferPolicy.nextFrames(sizeFrames, capacityFrames, sampleRate, samplesPerPacket, since)
+        if (next != sizeFrames) {
+            val set = t.setBufferSizeInFrames(next)
+            if (set > 0) {
+                sizeFrames = set
+                bufferMs = AudioBufferPolicy.toMs(set, sampleRate)
+                LimeLog.info("MeshAudioRenderer: buffer ran dry $since time(s); now $bufferMs ms")
+            }
         }
     }
 
@@ -93,5 +150,8 @@ class MeshAudioRenderer : AudioRenderer {
         track = null
     }
 
-    private fun Int.roundUpTo(unit: Int): Int = ((this + unit - 1) / unit) * unit
+    private companion object {
+        const val PENDING_LIMIT_MS = 40
+        const val CHECK_EVERY_WRITES = 200   // 200 packets of 5 ms is about a second
+    }
 }

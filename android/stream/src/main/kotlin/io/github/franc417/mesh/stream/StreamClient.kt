@@ -192,6 +192,8 @@ class StreamSession internal constructor(
             samples = synchronized(history) { history.toList() },
             totalShown = video.framesRendered,
             totalDropped = video.framesDropped,
+            audioBufferMs = audio.bufferMs,
+            audioUnderruns = audio.underruns,
         ),
     )
 

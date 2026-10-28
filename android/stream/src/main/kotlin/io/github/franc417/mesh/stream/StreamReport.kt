@@ -41,6 +41,8 @@ object StreamReport {
         val samples: List<Sample>,
         val totalShown: Long,
         val totalDropped: Long,
+        val audioBufferMs: Int = 0,
+        val audioUnderruns: Int = 0,
     )
 
     fun build(i: Input): String {
@@ -77,6 +79,44 @@ object StreamReport {
             lines += "  frames dropped: ${snaps.sumOf { it.dropped }}"
         }
         lines += "since the start: ${i.totalShown} frames shown, ${i.totalDropped} dropped"
+        lines += if (i.audioBufferMs > 0) "audio: ${i.audioBufferMs} ms buffer, ran dry ${i.audioUnderruns} time(s) (each one is a scratch)" else "audio: not running"
+        val findings = verdicts(i)
+        lines += "what the numbers say:"
+        lines += findings.map { "  - $it" }
         return lines.joinToString("\n")
+    }
+
+    /** Plain-language reading of the numbers: the first entry is the biggest problem. */
+    fun verdicts(i: Input): List<String> {
+        val l = Locale.ROOT
+        val out = ArrayList<String>()
+        val snaps = i.samples.map { it.snapshot }
+        if (snaps.isEmpty()) return listOf("not enough time has passed to say anything yet")
+        val fps = i.settings.fps
+        val budgetMs = 1000.0 / fps
+        val avgFps = snaps.map { it.fps }.average()
+        val hosts = snaps.mapNotNull { it.hostMs }
+        val rtts = i.samples.mapNotNull { it.rttMs }.filter { it > 0 }
+        val avgDecode = snaps.map { it.decodeMs }.average()
+
+        if (hosts.isNotEmpty() && hosts.average() > budgetMs) {
+            out += String.format(l, "The computer's encoder is the main delay: %.0f ms to encode each frame, but only %.0f ms are available at %d fps. " +
+                "Encoding on the processor instead of the graphics chip is the usual cause. Try the Smooth or Quick preset, and run `python3 mesh_input.py diagnose` on the computer to see which encoder Sunshine uses.",
+                hosts.average(), budgetMs, fps)
+        }
+        if (avgFps < fps * 0.9) {
+            out += String.format(l, "Only %.0f of %d frames per second arrive, so motion is choppy and the delay grows.", avgFps, fps)
+        }
+        if (avgDecode > budgetMs) {
+            out += String.format(l, "The phone takes %.0f ms to decode a frame, more than the %.0f ms available: lower the resolution (Smooth or Quick).", avgDecode, budgetMs)
+        }
+        if (rtts.isNotEmpty() && rtts.average() > 30) {
+            out += String.format(l, "The network round trip is %.0f ms, which is slow for a home network: try the 5 GHz Wi-Fi band or move closer to the router.", rtts.average())
+        }
+        if (i.audioUnderruns > 0) {
+            out += "The sound ran dry ${i.audioUnderruns} time(s); the audio buffer grows each time, so it should settle (now ${i.audioBufferMs} ms)."
+        }
+        if (out.isEmpty()) out += "No bottleneck stands out in these numbers."
+        return out
     }
 }

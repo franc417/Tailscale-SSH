@@ -13,6 +13,7 @@ import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
 import kotlin.math.abs
+import kotlin.math.hypot
 import kotlin.math.max
 
 private const val TAP_MOVE_THRESHOLD_PX = 12f
@@ -20,6 +21,7 @@ private const val TAP_MAX_DURATION_MS = 200L
 private const val TOUCH_TAP_MAX_DURATION_MS = 450L   // pointing with a finger is slower than tapping a trackpad
 private const val OVERLAY_DOT_ALPHA = 70
 private const val OVERLAY_HELD_ALPHA = 150
+private const val PINCH_DECIDE_PX = 16f             // how far two fingers move before it is decided: scroll or pinch
 private const val LONG_PRESS_MS = 400L                // holding a finger still this long (Auto mode) starts a press-and-drag
 private const val SCROLL_DIVISOR = 4f
 private const val RELEASE_FADE_MS = 220L
@@ -103,7 +105,27 @@ class TrackpadView @JvmOverloads constructor(
     /** True when the computer can place the pointer at an exact spot (the agent advertises it). */
     var absoluteEnabled: Boolean = false
 
-    private enum class OneFinger { RELATIVE, DIRECT, IGNORED }
+    /** Receives pinch and pan gestures for the picture's zoom (the desktop view); null on screens with no picture. */
+    interface ViewGestures {
+        /** Two fingers pinched: [factor] is the change since the last call (above 1 = fingers moved apart), about ([focusX], [focusY]). */
+        fun onPinch(factor: Float, focusX: Float, focusY: Float)
+
+        /** One finger in pan mode moved the picture by ([dx], [dy]). */
+        fun onPan(dx: Float, dy: Float)
+    }
+
+    var viewGestures: ViewGestures? = null
+
+    /** When on, one finger drags the picture around instead of moving the pointer (use it when zoomed in). */
+    var panMode: Boolean = false
+
+    private enum class TwoFingers { UNDECIDED, SCROLL, PINCH }
+    private var twoFingers = TwoFingers.UNDECIDED
+    private var twoCentroidMoved = 0f
+    private var twoDistanceChanged = 0f
+    private var lastTwoFingerDistance = 0f
+
+    private enum class OneFinger { RELATIVE, DIRECT, IGNORED, PAN }
     private enum class Jump { DONE, OUTSIDE, UNAVAILABLE }
 
     private val twoFingerTap = TwoFingerTap()
@@ -233,6 +255,10 @@ class TrackpadView @JvmOverloads constructor(
                 if (event.pointerCount == 2) {
                     lastTwoFingerX = averageX(event)
                     lastTwoFingerY = averageY(event)
+                    lastTwoFingerDistance = pointerDistance(event)
+                    twoFingers = TwoFingers.UNDECIDED
+                    twoCentroidMoved = 0f
+                    twoDistanceChanged = 0f
                     twoFingerTap.begin(event.eventTime)
                 } else if (event.pointerCount == 3) {
                     twoFingerTap.cancel()
@@ -258,14 +284,34 @@ class TrackpadView @JvmOverloads constructor(
                     2 -> {
                         val x = averageX(event)
                         val y = averageY(event)
+                        val distance = pointerDistance(event)
+                        val dx = x - lastTwoFingerX
                         val dy = y - lastTwoFingerY
-                        twoFingerTap.move(abs(x - lastTwoFingerX) + abs(dy))
-                        // The first few pixels are held back: they are the wobble of a tap, not a scroll.
-                        if (dy != 0f && twoFingerTap.movedTooFar) {
-                            onEvent?.invoke(mapOf("t" to "scroll", "dy" to (dy / SCROLL_DIVISOR)))
+                        val dDistance = distance - lastTwoFingerDistance
+                        twoFingerTap.move(abs(dx) + abs(dy) + abs(dDistance))
+                        if (twoFingers == TwoFingers.UNDECIDED) {
+                            // The first few pixels decide what this gesture is, and it stays that for the whole gesture:
+                            // fingers moving together scroll, fingers moving apart or together pinch.
+                            twoCentroidMoved += abs(dx) + abs(dy)
+                            twoDistanceChanged += abs(dDistance)
+                            if (twoCentroidMoved + twoDistanceChanged > PINCH_DECIDE_PX) {
+                                twoFingers = if (twoDistanceChanged > twoCentroidMoved && viewGestures != null) {
+                                    TwoFingers.PINCH
+                                } else {
+                                    TwoFingers.SCROLL
+                                }
+                            }
+                        }
+                        when (twoFingers) {
+                            TwoFingers.SCROLL ->
+                                if (dy != 0f) onEvent?.invoke(mapOf("t" to "scroll", "dy" to (dy / SCROLL_DIVISOR)))
+                            TwoFingers.PINCH ->
+                                if (lastTwoFingerDistance > 0f && distance > 0f) viewGestures?.onPinch(distance / lastTwoFingerDistance, x, y)
+                            TwoFingers.UNDECIDED -> {}
                         }
                         lastTwoFingerX = x
                         lastTwoFingerY = y
+                        lastTwoFingerDistance = distance
                     }
                     else -> moveOneFinger(event)
                 }
@@ -306,6 +352,7 @@ class TrackpadView @JvmOverloads constructor(
 
     /** Decides at touch-down whether this finger works like a trackpad or like a touchscreen, and for touch moves the pointer under it. */
     private fun beginOneFinger(x: Float, y: Float): OneFinger {
+        if (panMode && viewGestures != null) return OneFinger.PAN
         if (!pointerPolicy.dragIsDirect(selectMode)) return OneFinger.RELATIVE
         return when (jumpTo(x, y, clamped = false)) {
             Jump.DONE -> OneFinger.DIRECT
@@ -323,6 +370,7 @@ class TrackpadView @JvmOverloads constructor(
 
         when (oneFinger) {
             OneFinger.IGNORED -> {}
+            OneFinger.PAN -> if (dx != 0f || dy != 0f) viewGestures?.onPan(dx, dy)
             OneFinger.DIRECT -> {
                 if (!directPressed && moved) {
                     directPressed = true
@@ -361,7 +409,7 @@ class TrackpadView @JvmOverloads constructor(
     /** A tap. Returns false if it was ignored (a touch tap on the black bars). */
     private fun tap(x: Float, y: Float): Boolean {
         when (oneFinger) {
-            OneFinger.IGNORED -> return false
+            OneFinger.IGNORED, OneFinger.PAN -> return false
             OneFinger.DIRECT -> {}   // the pointer already went to the finger when it touched down
             OneFinger.RELATIVE -> if (pointerPolicy.tapAction() == PointerTap.JUMP_AND_CLICK) {
                 // Pointing at the screen. If it cannot be done the tap is a plain click where the pointer is.
@@ -371,6 +419,9 @@ class TrackpadView @JvmOverloads constructor(
         onEvent?.invoke(mapOf("t" to "click", "button" to "left"))
         return true
     }
+
+    private fun pointerDistance(event: MotionEvent): Float =
+        if (event.pointerCount < 2) 0f else hypot(event.getX(0) - event.getX(1), event.getY(0) - event.getY(1))
 
     private fun rightClick(x: Float, y: Float) {
         onEvent?.invoke(mapOf("t" to "click", "button" to "right"))

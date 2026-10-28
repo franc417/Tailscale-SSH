@@ -79,8 +79,16 @@ The desktop view has several ways to use a finger. They are chosen from the bar 
   20:9 phone looks about a quarter wider). **Zoom** covers the screen without stretching and crops the edges. The picture keeps
   its own shape because Sunshine pads with black, so a stretch-free full screen needs the computer's screen shape to match.
   Your choice is remembered.
+- **Zoom and move the picture** (the answer to small text, and to a picture that is the wrong shape for the phone): **pinch with two
+  fingers** to zoom in, up to five times, about the spot between your fingers. Switch **Pan** on and one finger drags the picture
+  around (switch it off again to get the trackpad back). **View > Reset zoom** puts it back. Nothing is stretched or lost: whatever is
+  off screen is one drag away. A picture can only fill a screen of a different shape by being stretched, cropped or barred, which is why
+  RustDesk (its "Adaptive" is the same as Fit) and Moonlight (bars or stretch only) get a true full screen only by changing the remote
+  computer's own screen resolution. On this GNOME/Wayland computer that is limited to the screen modes the monitor already has.
+- **Sound**: the audio buffer starts at 40 ms (Moonlight uses 10 ms, which runs dry on a busy phone and scratches) and grows by
+  20 ms, up to 160 ms, each time it ran dry. The report says how many times that happened.
 - **Finding out why it is slow**: tap the **status line** in the bar (it appears once the picture is showing). That copies a
-  report with the phone, the decoder, whether the low-latency video header rewrite worked, the stream settings, the kind of
+  report, ending with a plain-language reading of the numbers (what is the main delay), with the phone, the decoder, whether the low-latency video header rewrite worked, the stream settings, the kind of
   address (home network or Tailscale) and the last seconds of frames per second, network round trip, the computer's encode time
   and the phone's decode time. Paste it into the chat. The **Quick** quality preset is a small, fast stream: if the delay
   disappears there, the computer's encoder or the network was the limit rather than the phone.

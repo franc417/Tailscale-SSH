@@ -34,6 +34,7 @@ import io.github.franc417.mesh.stream.StreamSession
 import io.github.franc417.mesh.stream.StreamSettings
 import io.github.franc417.mesh.stream.ViewFit
 import io.github.franc417.mesh.stream.ViewMode
+import io.github.franc417.mesh.stream.ViewTransform
 import java.security.SecureRandom
 
 /**
@@ -84,6 +85,8 @@ class StreamActivity : Activity() {
     private lateinit var pointerChip: TextView
     private lateinit var selectChip: TextView
     private lateinit var viewChip: TextView
+    private lateinit var panChip: TextView
+    private val viewTransform = ViewTransform()
     private var warnedNoAbsolute = false
     private val viewPrefs by lazy { getSharedPreferences("mesh_stream_view", Context.MODE_PRIVATE) }
     private var inputStatus = ""
@@ -150,6 +153,10 @@ class StreamActivity : Activity() {
         trackpad = TrackpadView(this).apply {
             overlay = true
             onEvent = { inputLink?.bridge?.handle(it) }
+            viewGestures = object : TrackpadView.ViewGestures {
+                override fun onPinch(factor: Float, focusX: Float, focusY: Float) = zoomView(factor, focusX, focusY)
+                override fun onPan(dx: Float, dy: Float) = panView(dx, dy)
+            }
         }
         stage.addView(trackpad, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
 
@@ -200,6 +207,9 @@ class StreamActivity : Activity() {
         bar.addView(gap())
         selectChip = chip("Select") { toggleSelect() }
         bar.addView(selectChip)
+        bar.addView(gap())
+        panChip = chip("Pan") { togglePan() }
+        bar.addView(panChip)
         bar.addView(gap())
         viewChip = chip("View: " + viewLabel(viewMode)) { showViewPicker() }
         bar.addView(viewChip)
@@ -420,17 +430,45 @@ class StreamActivity : Activity() {
         val w = stage.width
         val h = stage.height
         if (w == 0 || h == 0) return
-        val aspect = settings.width.toFloat() / settings.height
-        val size = ViewFit.size(viewMode, w, h, aspect)
-        val cw = size.width
-        val ch = size.height
+        val base = ViewFit.size(viewMode, w, h, settings.width.toFloat() / settings.height)
+        val r = viewTransform.rect(w, h, base.width, base.height)   // the mode's size, zoomed and moved by the person
+        val width = Math.round(r.width)
+        val height = Math.round(r.height)
+        val left = Math.round(r.left)
+        val top = Math.round(r.top)
         val lp = surfaceView.layoutParams as FrameLayout.LayoutParams
-        if (lp.width != cw || lp.height != ch) {
-            lp.width = cw
-            lp.height = ch
-            lp.gravity = Gravity.CENTER
+        if (lp.width != width || lp.height != height || lp.leftMargin != left || lp.topMargin != top) {
+            lp.width = width
+            lp.height = height
+            lp.gravity = Gravity.TOP or Gravity.START
+            lp.leftMargin = left
+            lp.topMargin = top
             surfaceView.layoutParams = lp
         }
+    }
+
+    private fun baseSize(): ViewFit.Size =
+        ViewFit.size(viewMode, stage.width, stage.height, settings.width.toFloat() / settings.height)
+
+    /** Two fingers pinched on the desktop: zoom the picture about the fingers. */
+    private fun zoomView(factor: Float, focusX: Float, focusY: Float) {
+        val base = baseSize()
+        viewTransform.zoomBy(factor, focusX, focusY, stage.width, stage.height, base.width, base.height)
+        fitSurface()
+    }
+
+    /** One finger in Pan mode moved the picture. */
+    private fun panView(dx: Float, dy: Float) {
+        val base = baseSize()
+        viewTransform.panBy(dx, dy, stage.width, stage.height, base.width, base.height)
+        fitSurface()
+    }
+
+    private fun togglePan() {
+        val on = !trackpad.panMode
+        trackpad.panMode = on
+        panChip.text = if (on) "Pan: on" else "Pan"
+        panChip.background = Ui.box(this, fill = if (on) Color.argb(240, 74, 74, 80) else Color.argb(150, 11, 11, 12), radiusDp = 10)
     }
 
     // ------------------------------------------------------------- lifecycle
@@ -735,8 +773,13 @@ class StreamActivity : Activity() {
             .setSingleChoiceItems(names, modes.indexOf(viewMode)) { dialog, which ->
                 dialog.dismiss()
                 viewMode = modes[which]
+                viewTransform.reset()
                 viewChip.text = "View: " + viewLabel(viewMode)
                 viewPrefs.edit().putString("view", viewMode.name).apply()
+                fitSurface()
+            }
+            .setNeutralButton("Reset zoom") { _, _ ->
+                viewTransform.reset()
                 fitSurface()
             }
             .setNegativeButton("Cancel", null)

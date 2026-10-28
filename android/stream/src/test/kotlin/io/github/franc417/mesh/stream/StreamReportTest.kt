@@ -16,11 +16,13 @@ class StreamReportTest {
         error: String? = null,
         firstPictureMs: Long? = 1800,
         host: String = "192.168.100.4",
+        settings: StreamSettings = StreamSettings(),
+        underruns: Int = 0,
     ) = StreamReport.Input(
         phone = "Xiaomi Redmi A5", android = "15 (API 35)", decoder = "c2.unisoc.avc.decoder",
         spsPatched = patched, spsPatchFailed = failed, spsPatchError = error,
-        settings = StreamSettings(), view = "Fill", pointer = "Auto", host = host, firstPictureMs = firstPictureMs,
-        samples = samples, totalShown = 7306, totalDropped = 1,
+        settings = settings, view = "Fill", pointer = "Auto", host = host, firstPictureMs = firstPictureMs,
+        samples = samples, totalShown = 7306, totalDropped = 1, audioBufferMs = 60, audioUnderruns = underruns,
     )
 
     @Test
@@ -97,5 +99,45 @@ class StreamReportTest {
     fun `no decoder yet is not printed as an empty name`() {
         val text = StreamReport.build(input().copy(decoder = ""))
         assertTrue(text, text.contains("decoder: none yet"))
+    }
+
+    @Test
+    fun `a slow computer encoder is named as the main cause, with what to do`() {
+        // The numbers from the first real report: 1080p at 60 fps, the computer needs about 37 ms per frame.
+        val samples = List(12) { sample(50, 23f, 36.7f, 0, 3) }
+        val v = StreamReport.verdicts(input(samples, settings = StreamSettings(1920, 1080, 60, 20_000)))
+        assertTrue(v.toString(), v[0].startsWith("The computer's encoder is the main delay: 37 ms"))
+        assertTrue(v[0].contains("only 17 ms are available at 60 fps") && v[0].contains("diagnose"))
+        assertTrue(v.toString(), v.any { it.startsWith("Only 50 of 60 frames per second arrive") })
+        assertTrue(v.toString(), v.any { it.startsWith("The phone takes 23 ms to decode") })   // also over the 17 ms budget
+        assertFalse(v.any { it.contains("network") })                                         // 3 ms is fine
+    }
+
+    @Test
+    fun `a healthy stream says nothing is wrong`() {
+        val samples = List(5) { sample(60, 6f, 4f, 0, 5) }
+        assertEquals(listOf("No bottleneck stands out in these numbers."), StreamReport.verdicts(input(samples)))
+    }
+
+    @Test
+    fun `a slow network is named and the budget follows the frame rate`() {
+        val samples = List(4) { sample(30, 8f, 5f, 0, 60) }
+        val v = StreamReport.verdicts(input(samples, settings = StreamSettings(1280, 720, 30, 5_000)))
+        assertTrue(v.toString(), v.any { it.startsWith("The network round trip is 60 ms") })
+        assertFalse("30 fps gives 33 ms, so 8 ms decode and 5 ms encode are fine", v.any { it.contains("encoder") || it.contains("decode") })
+    }
+
+    @Test
+    fun `audio gaps are reported and the report shows the audio buffer`() {
+        val samples = List(3) { sample(60, 6f, 4f, 0, 5) }
+        val report = StreamReport.build(input(samples, underruns = 4))
+        assertTrue(report, report.contains("audio: 60 ms buffer, ran dry 4 time(s)"))
+        assertTrue(report, report.contains("The sound ran dry 4 time(s)"))
+        assertTrue(report, report.contains("what the numbers say:"))
+    }
+
+    @Test
+    fun `no samples yet gives no verdict`() {
+        assertEquals(listOf("not enough time has passed to say anything yet"), StreamReport.verdicts(input()))
     }
 }
