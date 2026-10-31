@@ -28,6 +28,7 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         renderList() // also picks up what the form screen just added or changed
+        CrashReporter.showIfPending(this) // the last crash, if there was one, with a Copy button
     }
 
     private fun build(): View {

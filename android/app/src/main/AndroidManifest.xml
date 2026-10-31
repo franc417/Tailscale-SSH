@@ -10,6 +10,7 @@
          design; the pairing exchange itself is encrypted with the PIN and everything after it uses pinned HTTPS. Android
          blocks plain HTTP by default, which made the desktop view fail with "CLEARTEXT communication ... not permitted". -->
     <application
+        android:name=".MeshApp"
         android:allowBackup="false"
         android:usesCleartextTraffic="true"
         android:icon="@mipmap/ic_launcher"
