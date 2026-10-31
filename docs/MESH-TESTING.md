@@ -101,6 +101,11 @@ The desktop view has several ways to use a finger. They are chosen from the bar 
   recommended `encoder = ...` line into `~/.config/sunshine/sunshine.conf` (the old file is kept as `sunshine.conf.bak`); then run
   `systemctl --user restart sunshine`, stream again and compare the "computer encode" number in the report. It ranks encoders
   with a synthetic picture, so it does not replace the stream report.
+- **Trying the phone-shaped screen on the computer (spike S1, nothing permanent)**: run
+  `python3 mesh_input.py spike-virtual-monitor` (optionally `--size 2400x1080 --seconds 10`) on the computer inside the desktop. It asks
+  GNOME to create an extra virtual monitor of that size, checks that it appears (size, position, which monitor stays primary), keeps it for a few
+  seconds, removes it and checks it is gone, then prints `RESULT: YES/PARTIAL/NO` with the reasons. Needs `gjs` and `gst-launch-1.0` with the
+  PipeWire plugin. The monitor exists only while the command runs; Ctrl+C removes it too.
 - The pointer mark in the desktop view is now only a small faint dot (a bit stronger while the button is held).
 
 # Trying the desktop view

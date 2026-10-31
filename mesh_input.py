@@ -1476,6 +1476,188 @@ def apply_encoder_setting(best: dict, config_dir: str, read_file=None, write_fil
         "\n" + restart_advice
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# `spike-virtual-monitor` (spike S1 of the Mesh engine plan): can this GNOME create an extra phone-shaped monitor, and remove it?
+#
+# GNOME's own screen-capture service can create a virtual monitor whose size is chosen by whoever reads the video (here: GStreamer,
+# standing in for the future Mesh daemon). The script below is run by `gjs` (installed with GNOME), changes nothing permanent
+# (the monitor lives only as long as the script), and prints what it saw so it can be pasted back.
+# ---------------------------------------------------------------------------------------------------------------------
+
+VIRTUAL_MONITOR_SPIKE_JS = r'''// Mesh spike S1: can this GNOME create a phone-shaped virtual monitor, sized by a PipeWire consumer, and remove it again?
+// Run through `python3 mesh_input.py spike-virtual-monitor`. It changes nothing permanent: the virtual monitor lives only as long as this script.
+import Gio from 'gi://Gio';
+import GLib from 'gi://GLib';
+import System from 'system';
+
+const args = (typeof ARGV !== 'undefined') ? ARGV : System.programArgs;
+const [WIDTH, HEIGHT, SECONDS] = args.map(Number);
+const SC = 'org.gnome.Mutter.ScreenCast';
+const DC = 'org.gnome.Mutter.DisplayConfig';
+const bus = Gio.DBus.session;
+
+function call(name, path, iface, method, params, replyType) {
+  return bus.call_sync(name, path, iface, method, params, replyType ? new GLib.VariantType(replyType) : null,
+    Gio.DBusCallFlags.NONE, 15000, null);
+}
+
+function waitUntil(ms, predicate, tick = 100) {
+  const loop = new GLib.MainLoop(null, false);
+  let elapsed = 0;
+  let ok = false;
+  GLib.timeout_add(GLib.PRIORITY_DEFAULT, tick, () => {
+    elapsed += tick;
+    ok = predicate();
+    if (ok || elapsed >= ms) { loop.quit(); return GLib.SOURCE_REMOVE; }
+    return GLib.SOURCE_CONTINUE;
+  });
+  loop.run();
+  return ok;
+}
+
+function monitors() {
+  const reply = call(DC, '/org/gnome/Mutter/DisplayConfig', DC, 'GetCurrentState', null, null);
+  const [, mons, logical] = reply.recursiveUnpack();
+  const layout = {};
+  for (const l of logical) {
+    const [x, y, scale, , primary, specs] = l;
+    for (const s of specs) layout[s[0]] = { x, y, scale, primary };
+  }
+  return mons.map(m => {
+    const [spec, modes] = m;
+    const cur = modes.find(md => md[6] && md[6]['is-current']);
+    return { connector: spec[0], width: cur ? cur[1] : 0, height: cur ? cur[2] : 0, hz: cur ? cur[3] : 0, ...(layout[spec[0]] ?? {}) };
+  });
+}
+
+const describe = m => `${m.connector} ${m.width}x${m.height}@${Number(m.hz).toFixed(2)}${m.primary ? ' primary' : ''} at (${m.x ?? '?'},${m.y ?? '?'})`;
+const readLog = file => { try { return new TextDecoder().decode(GLib.file_get_contents(file)[1]); } catch (e) { return ''; } };
+
+print(`asked for a virtual monitor of ${WIDTH}x${HEIGHT}, kept for ${SECONDS} s`);
+const before = monitors();
+print(`before: ${before.map(describe).join('; ')}`);
+
+const logFile = GLib.build_filenamev([GLib.get_tmp_dir(), `mesh-spike-gst-${GLib.random_int()}.log`]);
+let sessionPath = null;
+let proc = null;
+let nodeId = null;
+let closed = false;
+let verdict = 'NO: did not get as far as creating the session';
+
+function startConsumer(property) {
+  const cmd = `exec gst-launch-1.0 -v pipewiresrc ${property}=${nodeId} ! video/x-raw,width=${WIDTH},height=${HEIGHT} ! fakesink silent=false sync=false > '${logFile}' 2>&1`;
+  return Gio.Subprocess.new(['/bin/sh', '-c', cmd], Gio.SubprocessFlags.NONE);
+}
+
+try {
+  const created = call(SC, '/org/gnome/Mutter/ScreenCast', SC, 'CreateSession', new GLib.Variant('(a{sv})', [{}]), '(o)');
+  sessionPath = created.deepUnpack()[0];
+  bus.signal_subscribe(SC, `${SC}.Session`, 'Closed', sessionPath, null, Gio.DBusSignalFlags.NONE, () => { closed = true; });
+  const recorded = call(SC, sessionPath, `${SC}.Session`, 'RecordVirtual',
+    new GLib.Variant('(a{sv})', [{ 'cursor-mode': new GLib.Variant('u', 1) }]), '(o)');
+  const streamPath = recorded.deepUnpack()[0];
+  bus.signal_subscribe(SC, `${SC}.Stream`, 'PipeWireStreamAdded', streamPath, null, Gio.DBusSignalFlags.NONE,
+    (_c, _s, _p, _i, _n, params) => { nodeId = params.deepUnpack()[0]; });
+  call(SC, sessionPath, `${SC}.Session`, 'Start', null, null);
+  print('GNOME accepted the virtual-monitor session');
+
+  if (!waitUntil(10000, () => nodeId !== null)) {
+    verdict = 'NO: GNOME started the session but never announced a PipeWire stream within 10 s';
+  } else {
+    print(`PipeWire stream node: ${nodeId}`);
+    proc = startConsumer('path');
+    waitUntil(2500, () => false);
+    if (/no property|unknown property/i.test(readLog(logFile))) {
+      print('this gst-plugin-pipewire has no "path" property, retrying with "target-object"');
+      proc.force_exit();
+      proc = startConsumer('target-object');
+    }
+    const known = new Set(before.map(m => m.connector));
+    const appeared = waitUntil(8000, () => monitors().some(m => !known.has(m.connector)), 500);
+    const after = monitors();
+    const fresh = after.filter(m => !known.has(m.connector));
+    print(`after: ${after.map(describe).join('; ')}`);
+    if (!appeared || fresh.length === 0) {
+      verdict = 'NO: the stream exists but no new monitor appeared (see the consumer log below)';
+    } else {
+      print(`new monitor(s): ${fresh.map(describe).join('; ')}`);
+      verdict = (fresh[0].width === WIDTH && fresh[0].height === HEIGHT)
+        ? `YES: a virtual monitor appeared at exactly ${WIDTH}x${HEIGHT}`
+        : `PARTIAL: a virtual monitor appeared but at ${fresh[0].width}x${fresh[0].height}, not the ${WIDTH}x${HEIGHT} asked for`;
+      const primary = after.find(m => m.primary);
+      print(`primary monitor during the test: ${primary ? primary.connector : '(none reported)'}`);
+      waitUntil(SECONDS * 1000, () => closed);
+      if (closed) print('note: GNOME closed the session by itself during the hold');
+    }
+  }
+} catch (e) {
+  verdict = `NO: ${e.message}`;
+} finally {
+  try { if (sessionPath) call(SC, sessionPath, `${SC}.Session`, 'Stop', null, null); } catch (e) { print(`stop failed: ${e.message}`); }
+  try { if (proc) proc.force_exit(); } catch (e) { /* already gone */ }
+}
+
+waitUntil(1500, () => false);
+let gone = [];
+try { gone = monitors(); } catch (e) { /* ignore */ }
+print(`after stopping: ${gone.map(describe).join('; ')}`);
+print(gone.length === before.length ? 'cleanup: the virtual monitor is gone again' : 'cleanup: WARNING the monitor count is not back to what it was');
+
+const log = readLog(logFile);
+const frames = (log.match(/last-message = chain/g) || []).length;
+const problems = log.split('\n').filter(l => /error|warning|no property|could not|failed/i.test(l)).slice(0, 4);
+print(`frames the consumer received: ${frames} (a still, empty screen sends few)`);
+for (const p of problems) print(`consumer log: ${p.slice(0, 200)}`);
+try { Gio.File.new_for_path(logFile).delete(null); } catch (e) { /* none */ }
+print(`RESULT: ${verdict}`);
+'''
+
+
+def parse_size(text: str) -> Tuple[int, int]:
+    """`1600x720` as (1600, 720); both sides even and between 320 and 7680."""
+    match = re.fullmatch(r"\s*(\d{3,4})\s*[xX]\s*(\d{3,4})\s*", text or "")
+    if not match:
+        raise ValueError(f"size must look like 1600x720, not {text!r}")
+    width, height = int(match.group(1)), int(match.group(2))
+    if not (320 <= width <= 7680 and 320 <= height <= 7680) or width % 2 or height % 2:
+        raise ValueError(f"size {width}x{height} must be even numbers between 320 and 7680")
+    return width, height
+
+
+def spike_virtual_monitor(size: str = "1600x720", seconds: int = 8, runner=subprocess.run, which=shutil.which, environ=os.environ,
+                          listdir=os.listdir, exists=os.path.exists, uid=os.getuid, make_temp=None) -> Tuple[int, str]:
+    """Runs the gjs spike. Returns (exit code, the text to paste)."""
+    try:
+        width, height = parse_size(size)
+    except ValueError as exc:
+        return 2, str(exc)
+    seconds = max(2, min(int(seconds), 60))
+    missing = [name for name in ("gjs", "gst-launch-1.0") if which(name) is None]
+    if missing:
+        hint = {"gjs": "sudo pacman -S gjs", "gst-launch-1.0": "sudo pacman -S gst-plugins-base gst-plugin-pipewire"}
+        return 1, "cannot run the test, missing: " + ", ".join(f"{m} ({hint[m]})" for m in missing)
+    env = {**environ, **graphical_environment(environ, listdir, exists, uid)}
+    if make_temp is None:
+        def make_temp(text: str) -> str:
+            import tempfile
+            handle = tempfile.NamedTemporaryFile("w", suffix=".mjs", prefix="mesh-spike-", delete=False)
+            with handle:
+                handle.write(text)
+            return handle.name
+    path = make_temp(VIRTUAL_MONITOR_SPIKE_JS)
+    try:
+        done = runner(["gjs", "-m", path, str(width), str(height), str(seconds)], capture_output=True, text=True, timeout=seconds + 60, env=env)
+    except subprocess.TimeoutExpired:
+        return 1, "the test did not finish in time (GNOME may be waiting for something); stop it with Ctrl+C and paste this line"
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    text = ((done.stdout or "") + (done.stderr or "")).strip()
+    return done.returncode, "Mesh virtual-monitor spike (paste all of this):\n\n" + (text or "(no output)")
+
+
 def sunshine_login(directory: str, url: Optional[str] = None, username: Optional[str] = None,
                    password: Optional[str] = None, ask: Callable[[str], str] = input,
                    ask_secret: Callable[[str], str] = getpass.getpass, out: Callable[[str], None] = print) -> int:
@@ -1745,13 +1927,15 @@ def uninstall_service(target_dir: Optional[str] = None, runner=subprocess.run) -
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Mesh input channel (host side)")
-    ap.add_argument("command", choices=["init", "pair-info", "run", "reset-token", "install-service", "uninstall-service", "sunshine-login", "display-info", "diagnose", "encoder-bench"])
+    ap.add_argument("command", choices=["init", "pair-info", "run", "reset-token", "install-service", "uninstall-service", "sunshine-login", "display-info", "diagnose", "encoder-bench", "spike-virtual-monitor"])
     ap.add_argument("--dir", default=default_dir())
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--dry-run", action="store_true", help="record events instead of injecting them")
     ap.add_argument("--no-start", action="store_true", help="install-service: write the unit but do not start it")
     ap.add_argument("--sunshine-url", default=None, help="sunshine-login: Sunshine's web address (default https://127.0.0.1:47990)")
     ap.add_argument("--sunshine-user", default=None, help="sunshine-login: the username, instead of being asked")
+    ap.add_argument("--size", default="1600x720", help="spike-virtual-monitor: size of the virtual monitor to ask for")
+    ap.add_argument("--seconds", type=int, default=8, help="spike-virtual-monitor: how long to keep it")
     ap.add_argument("--apply", action="store_true", help="encoder-bench: write the recommended encoder into Sunshine's sunshine.conf")
     ap.add_argument("--password-stdin", action="store_true", help="sunshine-login: read the password from standard input")
     args = ap.parse_args(argv)
@@ -1759,6 +1943,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command in ("display-info", "diagnose"):
         print(display_info())
         return 0
+
+    if args.command == "spike-virtual-monitor":
+        code, text = spike_virtual_monitor(args.size, args.seconds)
+        print(text)
+        return code
 
     if args.command == "encoder-bench":
         report, best = encoder_bench(progress=lambda text: print(text, file=sys.stderr, flush=True))
