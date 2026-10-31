@@ -1144,6 +1144,15 @@ def display_info(runner=subprocess.run, which=shutil.which, environ=os.environ, 
     out = run(["sunshine", "--version"])
     if out is not None:
         section("sunshine version", [l for l in out.splitlines() if "version" in l.lower()][:3])
+    out = run(["pgrep", "-a", "sunshine"])
+    section("sunshine process", (out or "(not running)").splitlines(), 6)
+    out = run(["systemctl", "--user", "list-unit-files", "sunshine*", "--no-legend"])
+    if out is not None:
+        section("sunshine as a service", out.splitlines() or ["(no sunshine unit: it is started some other way)"], 6)
+    sunshine_path = which("sunshine")
+    if sunshine_path:
+        owner = run(["pacman", "-Qo", sunshine_path])
+        lines.append(f"sunshine binary: {sunshine_path}" + (f"  ({owner})" if owner else ""))
     for path in (os.path.join(environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "sunshine", "sunshine.conf"),):
         try:
             section("sunshine.conf (secrets hidden)", _redact_config(read_file(path)) or ["(empty: all defaults)"])
@@ -1367,14 +1376,34 @@ def encoder_bench(runner=subprocess.run, which=shutil.which, clock=time.monotoni
                              "  AMD: libva-mesa-driver.  Then run `vainfo`: it must list an H264 line ending in EncSlice (or EncSliceLP). Run this benchmark again.")
             else:
                 lines.append("Fix the graphics driver (check `vainfo`), or lower the stream's size and frame rate.")
-        lines.append("Apply it with: python3 mesh_input.py encoder-bench --apply   (edits sunshine.conf, keeps a .bak, then restart Sunshine)")
+        lines.append("Apply it with: python3 mesh_input.py encoder-bench --apply   (edits sunshine.conf, keeps a .bak, then Sunshine must be restarted)")
     lines.append("")
     lines.append("This times FFmpeg encoding a moving test picture, including the upload to the graphics chip. A mostly still desktop is cheaper, and Sunshine's own"
                  " capture and packaging come on top, so treat it as a ranking of encoders, not an exact stream delay.")
     return "\n".join(lines), best
 
 
-def apply_encoder_setting(best: dict, config_dir: str, read_file=None, write_file=None) -> str:
+def sunshine_restart_advice(runner=subprocess.run, which=shutil.which) -> str:
+    """How to restart Sunshine on THIS computer: it may be a systemd user service, or just a program started by hand."""
+    def ok(cmd: List[str]) -> Optional[str]:
+        if which(cmd[0]) is None:
+            return None
+        try:
+            done = runner(cmd, capture_output=True, text=True, timeout=8)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return (done.stdout or "").strip() if done.returncode == 0 else None
+
+    if ok(["systemctl", "--user", "cat", "sunshine.service"]) is not None:
+        return "restart Sunshine to use it:  systemctl --user restart sunshine"
+    if ok(["pgrep", "-x", "sunshine"]):
+        return ("Sunshine is running but not as a service, so stop it (Ctrl+C in the terminal it runs in, or `pkill sunshine`)"
+                " and start it again with `sunshine`; it reads the new setting when it starts")
+    return "Sunshine is not running: start it with `sunshine`; it reads the new setting when it starts"
+
+
+def apply_encoder_setting(best: dict, config_dir: str, read_file=None, write_file=None,
+                          restart_advice: str = "restart Sunshine to use it:  systemctl --user restart sunshine") -> str:
     """Writes `encoder = <value>` into Sunshine's config (keeping a .bak of the old file). Returns what to tell the person."""
     path = os.path.join(config_dir, "sunshine.conf")
     if read_file is None:
@@ -1394,7 +1423,7 @@ def apply_encoder_setting(best: dict, config_dir: str, read_file=None, write_fil
         write_file(path + ".bak", old)
     write_file(path, set_config_option(old, "encoder", best["sunshine"]))
     return f"set encoder = {best['sunshine']} in {path}" + (f" (the old file is kept as {path}.bak)" if old else "") + \
-        "\nrestart Sunshine to use it:  systemctl --user restart sunshine"
+        "\n" + restart_advice
 
 
 def sunshine_login(directory: str, url: Optional[str] = None, username: Optional[str] = None,
@@ -1689,7 +1718,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print("nothing to apply", file=sys.stderr)
                 return 1
             config_dir = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "sunshine")
-            print(apply_encoder_setting(best, config_dir))
+            print(apply_encoder_setting(best, config_dir, restart_advice=sunshine_restart_advice()))
         return 0
 
     if args.command == "sunshine-login":

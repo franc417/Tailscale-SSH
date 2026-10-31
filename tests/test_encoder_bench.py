@@ -189,3 +189,36 @@ def test_applying_with_no_config_yet_creates_it_and_makes_no_backup(tmp_path):
     message = mi.apply_encoder_setting({"sunshine": "nvenc"}, str(tmp_path / "sunshine"))
     assert (tmp_path / "sunshine" / "sunshine.conf").read_text() == "encoder = nvenc\n"
     assert not (tmp_path / "sunshine" / "sunshine.conf.bak").exists() and ".bak" not in message
+
+
+# ------------------------------------------------------------------ how to restart Sunshine
+
+class Cmds:
+    def __init__(self, service=False, running=False):
+        self.service, self.running = service, running
+
+    def __call__(self, cmd, **kwargs):
+        if cmd[:3] == ["systemctl", "--user", "cat"]:
+            return Done(stdout="[Unit]\n" if self.service else "", returncode=0 if self.service else 1)
+        if cmd[0] == "pgrep":
+            return Done(stdout="4242\n" if self.running else "", returncode=0 if self.running else 1)
+        raise AssertionError(cmd)
+
+
+def test_a_sunshine_service_is_restarted_with_systemctl():
+    assert "systemctl --user restart sunshine" in mi.sunshine_restart_advice(Cmds(service=True), lambda n: "/usr/bin/" + n)
+
+
+def test_a_sunshine_started_by_hand_is_not_told_to_use_systemctl():
+    advice = mi.sunshine_restart_advice(Cmds(running=True), lambda n: "/usr/bin/" + n)
+    assert "systemctl" not in advice and "not as a service" in advice and "pkill sunshine" in advice
+
+
+def test_a_sunshine_that_is_not_running_is_just_started():
+    advice = mi.sunshine_restart_advice(Cmds(), lambda n: "/usr/bin/" + n)
+    assert "not running" in advice and "start it with `sunshine`" in advice
+
+
+def test_the_advice_is_part_of_what_apply_prints(tmp_path):
+    message = mi.apply_encoder_setting({"sunshine": "vaapi"}, str(tmp_path), restart_advice="do the thing")
+    assert message.endswith("do the thing") and "systemctl" not in message
