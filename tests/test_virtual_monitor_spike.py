@@ -66,8 +66,8 @@ def test_the_script_is_run_by_gjs_as_a_module_with_the_size_and_the_desktop_envi
 def test_the_hold_time_is_kept_within_sane_limits(tmp_path):
     held = []
     run_spike(tmp_path, lambda cmd, **k: (held.append(cmd[-1]), Done())[1], seconds=0)
-    run_spike(tmp_path, lambda cmd, **k: (held.append(cmd[-1]), Done())[1], seconds=9999)
-    assert held == ["2", "60"]
+    run_spike(tmp_path, lambda cmd, **k: (held.append(cmd[-1]), Done())[1], seconds=99999)
+    assert held == ["2", "3600"]
 
 
 def test_a_run_that_never_finishes_says_so(tmp_path):
@@ -94,3 +94,20 @@ def test_the_embedded_script_is_valid_javascript(tmp_path):
     path.write_text(mi.VIRTUAL_MONITOR_SPIKE_JS)
     done = subprocess.run(["node", "--check", str(path)], capture_output=True, text=True)
     assert done.returncode == 0, done.stderr
+
+
+def test_a_long_hold_shows_its_output_live_and_ctrl_c_ends_it_cleanly(tmp_path):
+    seen = {}
+
+    def runner(cmd, **kwargs):
+        seen["kwargs"] = kwargs
+        raise KeyboardInterrupt
+    code, text = run_spike(tmp_path, runner, seconds=600)
+    assert code == 130 and "removed" in text
+    assert "capture_output" not in seen["kwargs"] and "env" in seen["kwargs"]      # nothing is captured, so the person sees it as it happens
+    assert not any(p.name.startswith("spike") and p.exists() for p in tmp_path.iterdir())
+
+
+def test_a_long_hold_returns_the_exit_code_and_nothing_to_print(tmp_path):
+    code, text = run_spike(tmp_path, lambda cmd, **k: Done(returncode=0), seconds=600)
+    assert (code, text) == (0, "")

@@ -106,6 +106,8 @@ The desktop view has several ways to use a finger. They are chosen from the bar 
   GNOME to create an extra virtual monitor of that size, checks that it appears (size, position, which monitor stays primary), keeps it for a few
   seconds, removes it and checks it is gone, then prints `RESULT: YES/PARTIAL/NO` with the reasons. Needs `gjs` and `gst-launch-1.0` with the
   PipeWire plugin. The monitor exists only while the command runs; Ctrl+C removes it too.
+  With `--seconds 600` (anything over 60) it holds the monitor open and prints live, so you can see it in GNOME's display settings, drag a window onto it,
+  or test what other programs (Sunshine, a screen recorder) do with it; Ctrl+C removes it.
 - The pointer mark in the desktop view is now only a small faint dot (a bit stronger while the button is held).
 
 # Trying the desktop view

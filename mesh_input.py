@@ -1586,6 +1586,7 @@ try {
         : `PARTIAL: a virtual monitor appeared but at ${fresh[0].width}x${fresh[0].height}, not the ${WIDTH}x${HEIGHT} asked for`;
       const primary = after.find(m => m.primary);
       print(`primary monitor during the test: ${primary ? primary.connector : '(none reported)'}`);
+      print(SECONDS > 60 ? 'holding the virtual monitor open: press Ctrl+C here to remove it' : `holding it for ${SECONDS} s`);
       waitUntil(SECONDS * 1000, () => closed);
       if (closed) print('note: GNOME closed the session by itself during the hold');
     }
@@ -1631,7 +1632,7 @@ def spike_virtual_monitor(size: str = "1600x720", seconds: int = 8, runner=subpr
         width, height = parse_size(size)
     except ValueError as exc:
         return 2, str(exc)
-    seconds = max(2, min(int(seconds), 60))
+    seconds = max(2, min(int(seconds), 3600))
     missing = [name for name in ("gjs", "gst-launch-1.0") if which(name) is None]
     if missing:
         hint = {"gjs": "sudo pacman -S gjs", "gst-launch-1.0": "sudo pacman -S gst-plugins-base gst-plugin-pipewire"}
@@ -1645,8 +1646,20 @@ def spike_virtual_monitor(size: str = "1600x720", seconds: int = 8, runner=subpr
                 handle.write(text)
             return handle.name
     path = make_temp(VIRTUAL_MONITOR_SPIKE_JS)
+    command = ["gjs", "-m", path, str(width), str(height), str(seconds)]
+    if seconds > 60:
+        # Held open for looking at it or trying other programs on it: show the output live; Ctrl+C removes the monitor.
+        try:
+            return runner(command, env=env).returncode, ""
+        except KeyboardInterrupt:
+            return 130, "stopped: the virtual monitor is removed again"
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
     try:
-        done = runner(["gjs", "-m", path, str(width), str(height), str(seconds)], capture_output=True, text=True, timeout=seconds + 60, env=env)
+        done = runner(command, capture_output=True, text=True, timeout=seconds + 60, env=env)
     except subprocess.TimeoutExpired:
         return 1, "the test did not finish in time (GNOME may be waiting for something); stop it with Ctrl+C and paste this line"
     finally:
@@ -1946,7 +1959,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.command == "spike-virtual-monitor":
         code, text = spike_virtual_monitor(args.size, args.seconds)
-        print(text)
+        if text:
+            print(text)
         return code
 
     if args.command == "encoder-bench":
