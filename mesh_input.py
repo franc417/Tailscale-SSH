@@ -1080,6 +1080,23 @@ def _redact_config(text: str) -> List[str]:
     return kept
 
 
+SCREENCAST_SOURCE_BITS = ((1, "monitor"), (2, "window"), (4, "virtual"))
+REMOTE_DESKTOP_DEVICE_BITS = ((1, "keyboard"), (2, "pointer"), (4, "touchscreen"))
+
+
+def dbus_number(text: str) -> Optional[int]:
+    """The number in a `gdbus call` reply such as `(<uint32 7>,)` or `(<4>,)`; None when there is none."""
+    match = re.search(r"<(?:uint32 |int32 |uint64 |byte )?(\d+)>", text or "")
+    return int(match.group(1)) if match else None
+
+
+def bit_names(value: Optional[int], bits) -> str:
+    if value is None:
+        return "(not understood)"
+    names = [name for bit, name in bits if value & bit]
+    return ", ".join(names) if names else "none"
+
+
 def display_info(runner=subprocess.run, which=shutil.which, environ=os.environ, read_file=None,
                  listdir=os.listdir, exists=os.path.exists, uid=os.getuid) -> str:
     """Describes this computer's desktop, monitors, Sunshine and hardware, for the person to paste when something is slow
@@ -1139,6 +1156,39 @@ def display_info(runner=subprocess.run, which=shutil.which, environ=os.environ, 
         out = run(cmd)
         if out is not None:
             section(cmd[0], out.splitlines())
+
+    # -- screen capture and input: what a phone-shaped virtual monitor and direct input would be built on
+    caps: List[str] = []
+    out = run(["gnome-shell", "--version"])
+    if out:
+        caps.append(out.splitlines()[0])
+    dbus_get = lambda dest, path, interface, prop: run(["gdbus", "call", "--session", "--dest", dest, "--object-path", path, "--method",
+                                                        "org.freedesktop.DBus.Properties.Get", interface, prop])
+    portal = ("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop")
+    out = dbus_get("org.gnome.Mutter.ScreenCast", "/org/gnome/Mutter/ScreenCast", "org.gnome.Mutter.ScreenCast", "Version")
+    if out is not None:
+        caps.append(f"Mutter ScreenCast API version: {dbus_number(out) if dbus_number(out) is not None else '(not understood) ' + out[:120]}")
+    for interface, bits_prop, bits in (("org.freedesktop.portal.ScreenCast", "AvailableSourceTypes", SCREENCAST_SOURCE_BITS),
+                                       ("org.freedesktop.portal.RemoteDesktop", "AvailableDeviceTypes", REMOTE_DESKTOP_DEVICE_BITS)):
+        version = dbus_get(*portal, interface, "version")
+        kinds = dbus_get(*portal, interface, bits_prop)
+        if version is not None or kinds is not None:
+            short = interface.rsplit(".", 1)[1]
+            caps.append(f"portal {short}: version {dbus_number(version) if version else '?'}, {'source' if short == 'ScreenCast' else 'device'} types: "
+                        f"{bit_names(dbus_number(kinds), bits) if kinds else '?'}")
+    if which("pipewire"):
+        out = run(["pipewire", "--version"])
+        if out:
+            caps.append("pipewire: " + " ".join(out.split())[:80])
+    if which("gst-inspect-1.0"):
+        out = run(["gst-inspect-1.0", "pipewiresrc"])
+        caps.append("gstreamer pipewiresrc: " + ("found" if out and "No such element" not in out else "missing (pacman -S gst-plugin-pipewire)"))
+    for package in ("mutter", "gnome-shell", "xdg-desktop-portal", "xdg-desktop-portal-gnome", "pipewire", "gst-plugin-pipewire", "gjs"):
+        out = run(["pacman", "-Q", package]) if which("pacman") else None
+        if out is not None:
+            caps.append(f"package {package}: " + (out if out and not out.startswith("error") else "not installed"))
+    if caps:
+        section("screen capture + input capabilities", caps, 30)
 
     # -- Sunshine
     out = run(["sunshine", "--version"])

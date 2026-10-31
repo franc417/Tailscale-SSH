@@ -196,3 +196,49 @@ def test_both_command_names_print_the_report_and_succeed(capsys):
     for name in ("diagnose", "display-info"):
         assert mi.main([name]) == 0
         assert "Mesh diagnostics" in capsys.readouterr().out
+
+
+# ------------------------------------------------------------------ screen capture + input capabilities
+
+def test_numbers_are_read_out_of_gdbus_replies():
+    assert mi.dbus_number("(<uint32 7>,)") == 7 and mi.dbus_number("(<4>,)") == 4 and mi.dbus_number("(<int32 12>,)") == 12
+    assert mi.dbus_number("Error: no such interface") is None and mi.dbus_number("") is None
+
+
+def test_bit_values_become_names():
+    assert mi.bit_names(7, mi.SCREENCAST_SOURCE_BITS) == "monitor, window, virtual"
+    assert mi.bit_names(3, mi.SCREENCAST_SOURCE_BITS) == "monitor, window"       # no virtual monitor offered
+    assert mi.bit_names(3, mi.REMOTE_DESKTOP_DEVICE_BITS) == "keyboard, pointer"
+    assert mi.bit_names(0, mi.SCREENCAST_SOURCE_BITS) == "none" and mi.bit_names(None, mi.SCREENCAST_SOURCE_BITS) == "(not understood)"
+
+
+def test_the_report_says_whether_gnome_offers_a_virtual_monitor_and_direct_input():
+    answers = {("org.gnome.Mutter.ScreenCast", "Version"): "(<4>,)",
+               ("org.freedesktop.portal.ScreenCast", "version"): "(<uint32 5>,)",
+               ("org.freedesktop.portal.ScreenCast", "AvailableSourceTypes"): "(<uint32 7>,)",
+               ("org.freedesktop.portal.RemoteDesktop", "version"): "(<uint32 2>,)",
+               ("org.freedesktop.portal.RemoteDesktop", "AvailableDeviceTypes"): "(<uint32 3>,)"}
+
+    def gdbus(cmd):
+        if "GetCurrentState" in " ".join(cmd):
+            return MUTTER
+        return answers[(cmd[-2], cmd[-1])]
+
+    def pacman(cmd):
+        return "error: package 'gjs' was not found" if cmd[-1] == "gjs" else f"{cmd[-1]} 48.2-1"
+
+    text = report({"gdbus": gdbus, "gnome-shell": "GNOME Shell 48.2", "pacman": pacman,
+                   "pipewire": "pipewire\nCompiled with libpipewire 1.4.7\nLinked with libpipewire 1.4.7",
+                   "gst-inspect-1.0": "No such element or plugin 'pipewiresrc'"})
+    assert "[screen capture + input capabilities]" in text and "GNOME Shell 48.2" in text
+    assert "Mutter ScreenCast API version: 4" in text
+    assert "portal ScreenCast: version 5, source types: monitor, window, virtual" in text
+    assert "portal RemoteDesktop: version 2, device types: keyboard, pointer" in text
+    assert "pipewire: pipewire Compiled with libpipewire 1.4.7" in text
+    assert "gstreamer pipewiresrc: missing (pacman -S gst-plugin-pipewire)" in text
+    assert "package mutter: mutter 48.2-1" in text and "package gjs: not installed" in text
+
+
+def test_a_desktop_without_these_pieces_still_gives_a_report():
+    text = report({"gdbus": MUTTER})            # no gnome-shell, pipewire, pacman: nothing breaks
+    assert "[GNOME monitors]" in text
