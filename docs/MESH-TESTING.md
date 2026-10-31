@@ -95,6 +95,12 @@ The desktop view has several ways to use a finger. They are chosen from the bar 
 - **On the computer** run `python3 mesh_input.py diagnose` in a terminal **inside the desktop** (it also works over SSH) right
   after a stream, and paste what it prints. It shows the desktop and monitors, Sunshine's settings and the lines of its log about
   capture and encoding (this is where "software encoding" or a slow capture shows up), and the processor and graphics hardware.
+- **Fixing a slow computer-side encode**: run `python3 mesh_input.py encoder-bench` on the computer (needs `ffmpeg`; it also works over
+  SSH). It times every video encoder this computer offers on a 1080p and a 720p test picture (about a minute), says which ones work
+  and why the others do not, and recommends the Sunshine setting. `python3 mesh_input.py encoder-bench --apply` writes the
+  recommended `encoder = ...` line into `~/.config/sunshine/sunshine.conf` (the old file is kept as `sunshine.conf.bak`); then run
+  `systemctl --user restart sunshine`, stream again and compare the "computer encode" number in the report. It ranks encoders
+  with a synthetic picture, so it does not replace the stream report.
 - The pointer mark in the desktop view is now only a small faint dot (a bit stronger while the button is held).
 
 # Trying the desktop view

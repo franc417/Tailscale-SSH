@@ -1183,6 +1183,214 @@ def display_info(runner=subprocess.run, which=shutil.which, environ=os.environ, 
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# `encoder-bench`: which video encoder on THIS computer is fast enough, and which Sunshine setting picks it.
+#
+# The first stream report showed the computer taking ~37 ms to encode a 1080p60 frame (a hardware encoder needs 2-6 ms).
+# This measures every encoder FFmpeg offers here on a synthetic 1080p60 and 720p60 picture and says which one to force.
+# It measures encoding only (including the upload of each frame to the graphics chip); Sunshine's capture comes on top.
+# ---------------------------------------------------------------------------------------------------------------------
+
+BENCH_FRAMES_SHORT = 60
+BENCH_FRAMES_LONG = 300
+BENCH_SIZES = ((1920, 1080), (1280, 720))
+FRAME_BUDGET_60FPS_MS = 1000.0 / 60.0
+
+# (ffmpeg encoder, value for Sunshine's `encoder =` setting, is it hardware, ffmpeg options placed before the input,
+#  video filter, encoder options). Sunshine's accepted values are listed in its docs/configuration.md (`encoder`).
+_BENCH_RATE = ["-b:v", "20M", "-bf", "0", "-g", "60"]
+BENCH_CANDIDATES = (
+    ("h264_nvenc", "nvenc", True, [], "format=nv12", ["-preset", "p1", "-tune", "ll"] + _BENCH_RATE),
+    ("h264_vaapi", "vaapi", True, ["-vaapi_device", "{render_node}"], "format=nv12,hwupload", _BENCH_RATE),
+    ("h264_qsv", "quicksync", True, ["-init_hw_device", "qsv=hw", "-filter_hw_device", "hw"],
+     "format=nv12,hwupload=extra_hw_frames=64,format=qsv", _BENCH_RATE),
+    ("h264_vulkan", "vulkan", True, ["-init_hw_device", "vulkan=vk", "-filter_hw_device", "vk"], "format=nv12,hwupload", _BENCH_RATE),
+    ("libx264", "software", False, [], "format=yuv420p", ["-preset", "ultrafast", "-tune", "zerolatency", "-b:v", "20M", "-g", "60"]),
+)
+
+
+def parse_ffmpeg_encoders(text: str) -> set:
+    """The encoder names in the output of `ffmpeg -encoders`."""
+    names = set()
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and re.fullmatch(r"[VASFXBD.]{6}", parts[0]):
+            names.add(parts[1])
+    return names
+
+
+def bench_command(encoder: Optional[str], pre: List[str], vf: str, opts: List[str], size: Tuple[int, int], frames: int) -> List[str]:
+    """The ffmpeg command line for one timing run. [encoder] None times only the picture source (the thing to subtract)."""
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats", "-y"] + pre
+    cmd += ["-f", "lavfi", "-i", f"testsrc2=size={size[0]}x{size[1]}:rate=60", "-frames:v", str(frames)]
+    if encoder is None:
+        return cmd + ["-vf", "format=nv12", "-f", "null", "-"]
+    return cmd + ["-vf", vf, "-c:v", encoder] + opts + ["-f", "null", "-"]
+
+
+def set_config_option(text: str, key: str, value: str) -> str:
+    """Sunshine-style `key = value` text with [key] set to [value]: the existing line is replaced, or one is added."""
+    line = f"{key} = {value}"
+    out, done = [], False
+    for old in text.splitlines():
+        if re.match(rf"\s*{re.escape(key)}\s*=", old):
+            if not done:
+                out.append(line)
+                done = True
+            continue  # drop any repeated copy of the same key
+        out.append(old)
+    if not done:
+        out.append(line)
+    return "\n".join(out) + "\n"
+
+
+def current_config_value(text: str, key: str) -> Optional[str]:
+    for old in text.splitlines():
+        match = re.match(rf"\s*{re.escape(key)}\s*=\s*(.*?)\s*$", old)
+        if match:
+            return match.group(1)
+    return None
+
+
+def pick_encoder(results: List[dict]) -> Optional[dict]:
+    """The best row to recommend: the fastest hardware encoder that worked at 1080p, else the fastest software one."""
+    worked = [r for r in results if r["size"] == BENCH_SIZES[0] and r["ms"] is not None]
+    for want_hardware in (True, False):
+        pool = [r for r in worked if r["hardware"] == want_hardware]
+        if pool:
+            return min(pool, key=lambda r: r["ms"])
+    return None
+
+
+def encoder_bench(runner=subprocess.run, which=shutil.which, clock=time.monotonic, environ=os.environ, read_file=None,
+                  glob=None, progress: Callable[[str], None] = lambda s: None) -> Tuple[str, Optional[dict]]:
+    """Times every available encoder. Returns (the report to paste, the recommended row or None)."""
+    import glob as globmod
+    if read_file is None:
+        def read_file(path: str) -> str:
+            with open(path, errors="replace") as f:
+                return f.read()
+    if glob is None:
+        glob = globmod.glob
+
+    lines = ["Mesh encoder benchmark (paste all of this):", ""]
+    if which("ffmpeg") is None:
+        lines += ["ffmpeg is not installed, so encoders cannot be timed.", "On Arch: sudo pacman -S ffmpeg   (then run this again)"]
+        return "\n".join(lines), None
+
+    def run(cmd: List[str], timeout: float = 90.0) -> Tuple[Optional[float], str]:
+        started = clock()
+        try:
+            done = runner(cmd, capture_output=True, text=True, timeout=timeout, env=dict(environ))
+        except subprocess.TimeoutExpired:
+            return None, "took longer than 90 s"
+        except OSError as exc:
+            return None, str(exc)
+        elapsed = clock() - started
+        if done.returncode != 0:
+            # The first message is the cause ("Cannot load libcuda.so.1"); the last is usually ffmpeg's generic fallout.
+            said = [l.strip() for l in (done.stderr or done.stdout or "").splitlines() if l.strip()]
+            return None, (said[0] if said else f"exit code {done.returncode}")[:160]
+        return elapsed, ""
+
+    def per_frame_ms(encoder, pre, vf, opts, size) -> Tuple[Optional[float], str]:
+        """Time per frame from two runs of different length, so ffmpeg's start-up cost cancels out."""
+        short, why = run(bench_command(encoder, pre, vf, opts, size, BENCH_FRAMES_SHORT))
+        if short is None:
+            return None, why
+        long, why = run(bench_command(encoder, pre, vf, opts, size, BENCH_FRAMES_LONG))
+        if long is None:
+            return None, why
+        return max(0.0, (long - short) / (BENCH_FRAMES_LONG - BENCH_FRAMES_SHORT) * 1000.0), ""
+
+    listing = runner(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True, timeout=20)
+    offered = parse_ffmpeg_encoders(listing.stdout or "")
+
+    config_dir = os.path.join(environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "sunshine")
+    try:
+        config = read_file(os.path.join(config_dir, "sunshine.conf"))
+    except OSError:
+        config = ""
+    adapter = current_config_value(config, "adapter_name") or ""
+    nodes = sorted(glob("/dev/dri/renderD*"))
+    render_node = adapter if adapter.startswith("/dev/dri/") else (nodes[0] if nodes else "/dev/dri/renderD128")
+    lines.append(f"render node used for VAAPI: {render_node}" + (" (from sunshine.conf adapter_name)" if adapter.startswith("/dev/dri/") else ""))
+    lines.append(f"Sunshine's current setting: encoder = {current_config_value(config, 'encoder') or '(not set: it uses the first one that works)'}")
+
+    sources: Dict[Tuple[int, int], float] = {}
+    for size in BENCH_SIZES:
+        progress(f"timing the picture source at {size[0]}x{size[1]} ...")
+        ms, why = per_frame_ms(None, [], "", [], size)
+        sources[size] = ms if ms is not None else 0.0
+        if ms is None:
+            lines.append(f"(could not time the picture source at {size[0]}x{size[1]}: {why})")
+
+    results: List[dict] = []
+    for encoder, sunshine_value, hardware, pre, vf, opts in BENCH_CANDIDATES:
+        for size in BENCH_SIZES:
+            row = {"encoder": encoder, "sunshine": sunshine_value, "hardware": hardware, "size": size, "ms": None, "why": ""}
+            results.append(row)
+            if encoder not in offered:
+                row["why"] = "this ffmpeg was built without it"
+                continue
+            progress(f"timing {encoder} at {size[0]}x{size[1]} ...")
+            ms, why = per_frame_ms(encoder, [p.replace("{render_node}", render_node) for p in pre], vf, opts, size)
+            if ms is None:
+                row["why"] = why
+            else:
+                row["ms"] = max(0.05, ms - sources[size])
+
+    lines += ["", "ms per frame, encoding only (a 60 fps stream has 16.7 ms per frame; lower is better):"]
+    for size in BENCH_SIZES:
+        lines.append(f"  {size[0]}x{size[1]}")
+        for row in (r for r in results if r["size"] == size):
+            if row["ms"] is None:
+                lines.append(f"    {row['encoder']:<12} not usable: {row['why']}")
+            else:
+                verdict = "keeps up at 60 fps" if row["ms"] <= FRAME_BUDGET_60FPS_MS * 0.6 else (
+                    "borderline at 60 fps" if row["ms"] <= FRAME_BUDGET_60FPS_MS else "TOO SLOW for 60 fps")
+                kind = "hardware" if row["hardware"] else "processor"
+                lines.append(f"    {row['encoder']:<12} {row['ms']:6.1f} ms   {kind:<9} {verdict}")
+
+    best = pick_encoder(results)
+    lines.append("")
+    if best is None:
+        lines.append("No encoder worked at 1080p, so there is nothing to recommend. The lines above say why each failed.")
+    else:
+        lines.append(f"Recommendation: encoder = {best['sunshine']}   ({best['encoder']}, {best['ms']:.1f} ms per 1080p frame)")
+        if not best["hardware"]:
+            lines.append("Only the processor can encode here. Fix the graphics driver (for VAAPI on Intel/AMD: the media/mesa VA driver, check `vainfo`),"
+                         " or lower the stream's size and frame rate; `encoder = software` is the fallback.")
+        lines.append("Apply it with: python3 mesh_input.py encoder-bench --apply   (edits sunshine.conf, keeps a .bak, then restart Sunshine)")
+    lines.append("")
+    lines.append("This times FFmpeg encoding a moving test picture, including the upload to the graphics chip. A mostly still desktop is cheaper, and Sunshine's own"
+                 " capture and packaging come on top, so treat it as a ranking of encoders, not an exact stream delay.")
+    return "\n".join(lines), best
+
+
+def apply_encoder_setting(best: dict, config_dir: str, read_file=None, write_file=None) -> str:
+    """Writes `encoder = <value>` into Sunshine's config (keeping a .bak of the old file). Returns what to tell the person."""
+    path = os.path.join(config_dir, "sunshine.conf")
+    if read_file is None:
+        def read_file(p: str) -> str:
+            with open(p, errors="replace") as f:
+                return f.read()
+    if write_file is None:
+        def write_file(p: str, text: str) -> None:
+            with open(p, "w") as f:
+                f.write(text)
+    try:
+        old = read_file(path)
+    except FileNotFoundError:
+        old = ""
+    os.makedirs(config_dir, exist_ok=True)
+    if old:
+        write_file(path + ".bak", old)
+    write_file(path, set_config_option(old, "encoder", best["sunshine"]))
+    return f"set encoder = {best['sunshine']} in {path}" + (f" (the old file is kept as {path}.bak)" if old else "") + \
+        "\nrestart Sunshine to use it:  systemctl --user restart sunshine"
+
+
 def sunshine_login(directory: str, url: Optional[str] = None, username: Optional[str] = None,
                    password: Optional[str] = None, ask: Callable[[str], str] = input,
                    ask_secret: Callable[[str], str] = getpass.getpass, out: Callable[[str], None] = print) -> int:
@@ -1452,18 +1660,30 @@ def uninstall_service(target_dir: Optional[str] = None, runner=subprocess.run) -
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Mesh input channel (host side)")
-    ap.add_argument("command", choices=["init", "pair-info", "run", "reset-token", "install-service", "uninstall-service", "sunshine-login", "display-info", "diagnose"])
+    ap.add_argument("command", choices=["init", "pair-info", "run", "reset-token", "install-service", "uninstall-service", "sunshine-login", "display-info", "diagnose", "encoder-bench"])
     ap.add_argument("--dir", default=default_dir())
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--dry-run", action="store_true", help="record events instead of injecting them")
     ap.add_argument("--no-start", action="store_true", help="install-service: write the unit but do not start it")
     ap.add_argument("--sunshine-url", default=None, help="sunshine-login: Sunshine's web address (default https://127.0.0.1:47990)")
     ap.add_argument("--sunshine-user", default=None, help="sunshine-login: the username, instead of being asked")
+    ap.add_argument("--apply", action="store_true", help="encoder-bench: write the recommended encoder into Sunshine's sunshine.conf")
     ap.add_argument("--password-stdin", action="store_true", help="sunshine-login: read the password from standard input")
     args = ap.parse_args(argv)
 
     if args.command in ("display-info", "diagnose"):
         print(display_info())
+        return 0
+
+    if args.command == "encoder-bench":
+        report, best = encoder_bench(progress=lambda text: print(text, file=sys.stderr, flush=True))
+        print(report)
+        if args.apply:
+            if best is None:
+                print("nothing to apply", file=sys.stderr)
+                return 1
+            config_dir = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "sunshine")
+            print(apply_encoder_setting(best, config_dir))
         return 0
 
     if args.command == "sunshine-login":
