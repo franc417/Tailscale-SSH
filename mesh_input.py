@@ -1198,12 +1198,12 @@ FRAME_BUDGET_60FPS_MS = 1000.0 / 60.0
 
 # (ffmpeg encoder, value for Sunshine's `encoder =` setting, is it hardware, ffmpeg options placed before the input,
 #  video filter, encoder options). Sunshine's accepted values are listed in its docs/configuration.md (`encoder`).
+# Only the encoders Sunshine itself can use on Linux are here: its Linux list (src/video.cpp) is nvenc, vulkan, vaapi, software
+# (QuickSync and AMF are Windows-only there; Intel graphics on Linux go through VAAPI).
 _BENCH_RATE = ["-b:v", "20M", "-bf", "0", "-g", "60"]
 BENCH_CANDIDATES = (
     ("h264_nvenc", "nvenc", True, [], "format=nv12", ["-preset", "p1", "-tune", "ll"] + _BENCH_RATE),
     ("h264_vaapi", "vaapi", True, ["-vaapi_device", "{render_node}"], "format=nv12,hwupload", _BENCH_RATE),
-    ("h264_qsv", "quicksync", True, ["-init_hw_device", "qsv=hw", "-filter_hw_device", "hw"],
-     "format=nv12,hwupload=extra_hw_frames=64,format=qsv", _BENCH_RATE),
     ("h264_vulkan", "vulkan", True, ["-init_hw_device", "vulkan=vk", "-filter_hw_device", "vk"], "format=nv12,hwupload", _BENCH_RATE),
     ("libx264", "software", False, [], "format=yuv420p", ["-preset", "ultrafast", "-tune", "zerolatency", "-b:v", "20M", "-g", "60"]),
 )
@@ -1359,8 +1359,14 @@ def encoder_bench(runner=subprocess.run, which=shutil.which, clock=time.monotoni
     else:
         lines.append(f"Recommendation: encoder = {best['sunshine']}   ({best['encoder']}, {best['ms']:.1f} ms per 1080p frame)")
         if not best["hardware"]:
-            lines.append("Only the processor can encode here. Fix the graphics driver (for VAAPI on Intel/AMD: the media/mesa VA driver, check `vainfo`),"
-                         " or lower the stream's size and frame rate; `encoder = software` is the fallback.")
+            lines.append("Only the processor can encode here, so Sunshine is already doing the same (its order is nvenc, vulkan, vaapi, then software).")
+            vaapi = next((r for r in results if r["encoder"] == "h264_vaapi" and r["size"] == BENCH_SIZES[0]), None)
+            if vaapi and vaapi["ms"] is None and re.search(r"(?i)libva|vaapi connection|va driver|no such file|permission", vaapi["why"]):
+                lines.append("VAAPI (the graphics chip's video encoder) could not start, which usually means its driver is not installed."
+                             " Intel (Broadwell and newer): sudo pacman -S intel-media-driver libva-utils;  older Intel: libva-intel-driver;"
+                             "  AMD: libva-mesa-driver.  Then run `vainfo`: it must list an H264 line ending in EncSlice (or EncSliceLP). Run this benchmark again.")
+            else:
+                lines.append("Fix the graphics driver (check `vainfo`), or lower the stream's size and frame rate.")
         lines.append("Apply it with: python3 mesh_input.py encoder-bench --apply   (edits sunshine.conf, keeps a .bak, then restart Sunshine)")
     lines.append("")
     lines.append("This times FFmpeg encoding a moving test picture, including the upload to the graphics chip. A mostly still desktop is cheaper, and Sunshine's own"

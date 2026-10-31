@@ -111,8 +111,28 @@ def test_a_slow_encoder_is_called_too_slow_for_60_fps():
 def test_an_encoder_this_ffmpeg_does_not_have_is_said_so_and_not_run():
     machine = Machine({None: 0.0, "libx264": 5.0, "h264_nvenc": 3.0, "h264_vaapi": 4.0})
     report, _ = run_bench(machine)
-    assert "h264_qsv" in report and "this ffmpeg was built without it" in report
-    assert not any("h264_qsv" in " ".join(c) and "-frames:v" in c for c in machine.commands)
+    assert "h264_vulkan" in report and "this ffmpeg was built without it" in report
+    assert not any("h264_vulkan" in " ".join(c) and "-frames:v" in c for c in machine.commands)
+
+
+def test_only_encoders_sunshine_can_use_on_linux_are_timed():
+    machine = Machine({None: 0.0, "libx264": 5.0, "h264_nvenc": 3.0, "h264_vaapi": 4.0})
+    report, _ = run_bench(machine)
+    assert "h264_qsv" not in report and "quicksync" not in report  # Windows-only in Sunshine
+
+
+def test_a_missing_va_driver_is_named_with_the_package_to_install():
+    machine = Machine({None: 0.0, "libx264": 3.0}, failing={
+        "h264_vaapi": "[VAAPI @ 0x1] Failed to initialise VAAPI connection: -1 (unknown libva error).", "h264_nvenc": "Cannot load libcuda.so.1"})
+    report, best = run_bench(machine)
+    assert best["encoder"] == "libx264"
+    assert "sudo pacman -S intel-media-driver libva-utils" in report and "Sunshine is already doing the same" in report
+
+
+def test_a_different_vaapi_failure_does_not_blame_the_driver_package():
+    machine = Machine({None: 0.0, "libx264": 3.0}, failing={"h264_vaapi": "Impossible to convert between the formats", "h264_nvenc": "x"})
+    report, _ = run_bench(machine)
+    assert "intel-media-driver" not in report and "check `vainfo`" in report
 
 
 def test_nothing_working_at_all_gives_no_recommendation():
