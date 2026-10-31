@@ -1059,7 +1059,7 @@ def summarize_mutter_state(text: str) -> List[str]:
 _SUNSHINE_LOG_INTEREST = re.compile(
     r"(?i)encoder|capture|kms|pipewire|portal|wayland|x11|vaapi|nvenc|nvidia|software|x264|resolution|fps|frame|"
     r"warn|error|fatal|cuda|monitor|display|session|bitrate|latency|client|launch|rtsp|found|detected|using|configuring|"
-    r"adapter|gpu|drm|cursor|idr|fec|packet")
+    r"adapter|gpu|drm|cursor|idr|fec|packet|ssl|certificate|pair")
 
 
 def filter_sunshine_log(text: str, keep: int = 50) -> List[str]:
@@ -1095,6 +1095,40 @@ def bit_names(value: Optional[int], bits) -> str:
         return "(not understood)"
     names = [name for bit, name in bits if value & bit]
     return ", ".join(names) if names else "none"
+
+
+def paired_devices_summary(state_text: str) -> List[str]:
+    """What Sunshine's saved state says about paired phones (no certificates shown), and why one of them could be refused.
+
+    Sunshine only accepts a phone whose certificate matches EXACTLY ONE enabled record. The same certificate stored twice, or a
+    disabled record, makes it answer "Client certificate identity is not enabled" and the app falls back to asking for a PIN.
+    """
+    try:
+        data = json.loads(state_text)
+    except ValueError as exc:
+        return [f"(sunshine_state.json is not valid JSON: {exc})"]
+    root = data.get("root") if isinstance(data, dict) else None
+    devices = (root or {}).get("named_devices") or []
+    if not isinstance(devices, list):
+        return ["(unexpected named_devices format)"]
+    lines = [f"{len(devices)} paired device record(s)"]
+    prints: Dict[str, List[int]] = {}
+    for index, device in enumerate(devices, 1):
+        cert = "".join(str(device.get("cert", "")).split())
+        fingerprint = hashlib.sha256(cert.encode()).hexdigest()[:12] if cert else "(no certificate)"
+        enabled = str(device.get("enabled", "true")).strip().lower() != "false"      # Sunshine's writer stores booleans as text
+        prints.setdefault(fingerprint, []).append(index)
+        lines.append(f"  #{index} name={device.get('name') or '(unnamed)'!r} enabled={'yes' if enabled else 'NO'} "
+                     f"uuid={str(device.get('uuid', ''))[:8]} cert={fingerprint}")
+        if not enabled:
+            lines.append(f"  -> #{index} is DISABLED, so that phone is refused")
+    for fingerprint, where in prints.items():
+        if len(where) > 1 and fingerprint != "(no certificate)":
+            lines.append(f"  -> records {', '.join('#' + str(i) for i in where)} hold the SAME certificate: Sunshine refuses it "
+                         "(\"identity is not enabled\"). Delete all but one in Sunshine's web page, Devices tab.")
+    if not devices:
+        lines.append("  (nothing is paired)")
+    return lines
 
 
 def display_info(runner=subprocess.run, which=shutil.which, environ=os.environ, read_file=None,
@@ -1208,6 +1242,11 @@ def display_info(runner=subprocess.run, which=shutil.which, environ=os.environ, 
             section("sunshine.conf (secrets hidden)", _redact_config(read_file(path)) or ["(empty: all defaults)"])
         except OSError:
             lines.append(f"[sunshine.conf] not readable at {path}")
+    state_path = os.path.join(environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "sunshine", "sunshine_state.json")
+    try:
+        section("sunshine paired devices", paired_devices_summary(read_file(state_path)), 30)
+    except OSError:
+        lines.append(f"[sunshine paired devices] no state file at {state_path} (nothing has paired yet)")
     log = run(["journalctl", "--user", "-u", "sunshine", "-n", "800", "--no-pager", "-o", "cat"], timeout=15)
     if not log:
         try:

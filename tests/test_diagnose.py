@@ -112,7 +112,7 @@ FILES = {
 }
 
 
-def fake_world(tools, conf="encoder = vaapi\ncapture = kms\n", log="[info] Encoder: vaapi\n[warning] slow\n"):
+def fake_world(tools, conf="encoder = vaapi\ncapture = kms\n", log="[info] Encoder: vaapi\n[warning] slow\n", state=None):
     def runner(cmd, **kwargs):
         assert "env" in kwargs                                    # tools are run against the found desktop
         out = tools[cmd[0]]
@@ -127,6 +127,10 @@ def fake_world(tools, conf="encoder = vaapi\ncapture = kms\n", log="[info] Encod
             return conf
         if path.endswith("sunshine.log"):
             return log
+        if path.endswith("sunshine_state.json"):
+            if state is None:
+                raise FileNotFoundError(path)
+            return state
         if path in FILES:
             return FILES[path]
         raise FileNotFoundError(path)
@@ -242,3 +246,50 @@ def test_the_report_says_whether_gnome_offers_a_virtual_monitor_and_direct_input
 def test_a_desktop_without_these_pieces_still_gives_a_report():
     text = report({"gdbus": MUTTER})            # no gnome-shell, pipewire, pacman: nothing breaks
     assert "[GNOME monitors]" in text
+
+
+# ------------------------------------------------------------------ paired devices
+
+def _state(*devices):
+    import json as _json
+    return _json.dumps({"root": {"uniqueid": "ABC", "named_devices": list(devices)}})
+
+
+def test_one_enabled_phone_is_listed_without_showing_its_certificate():
+    lines = mi.paired_devices_summary(_state({"name": "Mesh", "cert": "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+                                              "uuid": "12345678-aaaa", "enabled": "true"}))
+    text = "\n".join(lines)
+    assert lines[0] == "1 paired device record(s)" and "name='Mesh' enabled=yes uuid=12345678" in text
+    assert "AAAA" not in text and "BEGIN" not in text and "SAME certificate" not in text
+
+
+def test_the_same_certificate_stored_twice_is_named_as_the_reason_for_a_refusal():
+    cert = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"
+    other = "-----BEGIN CERTIFICATE-----\nBBBB\n-----END CERTIFICATE-----\n"
+    text = "\n".join(mi.paired_devices_summary(_state(
+        {"name": "Mesh", "cert": cert, "uuid": "1" * 8}, {"name": "Other", "cert": other, "uuid": "2" * 8},
+        {"name": "Mesh (2)", "cert": cert.replace("\n", "\r\n"), "uuid": "3" * 8})))
+    assert "records #1, #3 hold the SAME certificate" in text and "#2" not in text.split("SAME certificate")[0].split("records")[-1]
+    assert "identity is not enabled" in text
+
+
+def test_a_disabled_phone_is_called_out():
+    text = "\n".join(mi.paired_devices_summary(_state({"name": "Mesh", "cert": "X", "uuid": "u", "enabled": "false"})))
+    assert "enabled=NO" in text and "DISABLED" in text
+
+
+def test_nothing_paired_and_broken_files_are_reported_plainly():
+    assert "  (nothing is paired)" in mi.paired_devices_summary(_state())
+    assert "not valid JSON" in mi.paired_devices_summary("{oops")[0]
+    assert mi.paired_devices_summary("[]")[0] == "0 paired device record(s)"
+
+
+def test_the_report_includes_the_paired_devices_section_and_refusal_lines():
+    text = report({"gdbus": MUTTER}, state=_state({"name": "Mesh", "cert": "X", "uuid": "abcdefgh"}),
+                  log="[x]: Warning: SSL Verification error :: Client certificate identity is not enabled\n")
+    assert "[sunshine paired devices]" in text and "name='Mesh'" in text
+    assert "Client certificate identity is not enabled" in text
+
+
+def test_a_missing_state_file_says_nothing_has_paired():
+    assert "no state file" in report({"gdbus": MUTTER})
