@@ -92,7 +92,20 @@ class StreamActivity : Activity() {
     private var inputStatus = ""
     private val handler = Handler(Looper.getMainLooper())
 
-    private val settings: StreamSettings get() = StreamSettings.presets[presetIndex].second
+    /** The fixed presets plus one the shape of this phone's screen (so a phone-shaped virtual screen on the computer fills it exactly). */
+    private val presetList: List<Pair<String, StreamSettings>> by lazy {
+        val (w, h) = realScreenSize()
+        StreamSettings.presets + listOfNotNull(StreamSettings.phoneShaped(w, h))
+    }
+
+    private fun realScreenSize(): Pair<Int, Int> =
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            windowManager.maximumWindowMetrics.bounds.let { it.width() to it.height() }
+        } else {
+            resources.displayMetrics.let { it.widthPixels to it.heightPixels }
+        }
+
+    private val settings: StreamSettings get() = presetList[presetIndex].second
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -214,7 +227,7 @@ class StreamActivity : Activity() {
         viewChip = chip("View: " + viewLabel(viewMode)) { showViewPicker() }
         bar.addView(viewChip)
         bar.addView(gap())
-        qualityChip = chip(StreamSettings.presets[presetIndex].first.substringBefore(" ")) { showQualityPicker() }
+        qualityChip = chip(presetList[presetIndex].first.substringBefore(" ")) { showQualityPicker() }
         bar.addView(qualityChip)
         bar.addView(gap())
         bar.addView(chip("Keyboard") { setKeyboardVisible(keyboardBox.visibility != View.VISIBLE) })
@@ -698,7 +711,7 @@ class StreamActivity : Activity() {
     private fun loadViewPrefs() {
         pointerMode = runCatching { PointerMode.valueOf(viewPrefs.getString("pointer", null) ?: "") }.getOrDefault(PointerMode.TRACKPAD)
         viewMode = ViewMode.parse(viewPrefs.getString("view", null))
-        presetIndex = viewPrefs.getInt("quality", 0).coerceIn(0, StreamSettings.presets.size - 1)
+        presetIndex = viewPrefs.getInt("quality", 0).coerceIn(0, presetList.size - 1)
     }
 
     private fun pointerLabel(mode: PointerMode) = when (mode) {
@@ -796,7 +809,7 @@ class StreamActivity : Activity() {
     }
 
     private fun showQualityPicker() {
-        val names = StreamSettings.presets.map { it.first }.toTypedArray()
+        val names = presetList.map { it.first }.toTypedArray()
         AlertDialog.Builder(this)
             .setTitle("Stream quality")
             .setSingleChoiceItems(names, presetIndex) { dialog, which ->
@@ -811,10 +824,14 @@ class StreamActivity : Activity() {
         if (index == presetIndex) return
         presetIndex = index
         viewPrefs.edit().putInt("quality", presetIndex).apply()
-        qualityChip.text = StreamSettings.presets[presetIndex].first.substringBefore(" ")
+        qualityChip.text = presetList[presetIndex].first.substringBefore(" ")
+        if (presetList[presetIndex].first.startsWith("Phone screen")) {
+            val chosen = presetList[presetIndex].second
+            Toast.makeText(this, "On the computer run: python3 mesh_input.py screen-phone --size ${chosen.width}x${chosen.height}", Toast.LENGTH_LONG).show()
+        }
         // A running stream is restarted so the new size is really used; before that the choice just applies to the start.
         if (session != null || messagePanel.visibility == View.VISIBLE) {
-            showMessage("Switching to ${StreamSettings.presets[presetIndex].first}", "")
+            showMessage("Switching to ${presetList[presetIndex].first}", "")
             restart()
         }
     }

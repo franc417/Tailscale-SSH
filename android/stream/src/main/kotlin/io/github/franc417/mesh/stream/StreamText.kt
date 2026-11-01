@@ -24,6 +24,20 @@ data class StreamSettings(
             // Small and quick: if the delay goes away here the computer's encoder or the network was the limit, not the phone.
             "Quick · 540p 60 fps" to StreamSettings(960, 540, 60, 6_000),
         )
+
+        /**
+         * A stream with the same shape as the phone's own screen (whichever way the phone is held), [longSide] pixels on the long side,
+         * both sides even. With a virtual screen of exactly this size on the computer, the picture fills the phone with no bars and
+         * nothing is scaled. Null when the screen size is not known.
+         */
+        fun phoneShaped(screenWidth: Int, screenHeight: Int, longSide: Int = 1920, fps: Int = 60, bitrateKbps: Int = 15_000): Pair<String, StreamSettings>? {
+            if (screenWidth <= 0 || screenHeight <= 0 || longSide < 2) return null
+            val long = maxOf(screenWidth, screenHeight)
+            val short = minOf(screenWidth, screenHeight)
+            val evenLong = longSide - longSide % 2
+            val evenShort = maxOf(2, Math.round(evenLong.toDouble() * short / long / 2.0).toInt() * 2)
+            return "Phone screen · ${evenLong}x$evenShort $fps fps" to StreamSettings(evenLong, evenShort, fps, bitrateKbps)
+        }
     }
 }
 
