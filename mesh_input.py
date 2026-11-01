@@ -1354,6 +1354,12 @@ def set_config_option(text: str, key: str, value: str) -> str:
     return "\n".join(out) + "\n"
 
 
+def remove_config_option(text: str, key: str) -> str:
+    """Sunshine-style `key = value` text without any line that sets [key]."""
+    kept = [line for line in text.splitlines() if not re.match(rf"\s*{re.escape(key)}\s*=", line)]
+    return "\n".join(kept) + ("\n" if kept else "")
+
+
 def current_config_value(text: str, key: str) -> Optional[str]:
     for old in text.splitlines():
         match = re.match(rf"\s*{re.escape(key)}\s*=\s*(.*?)\s*$", old)
@@ -1805,7 +1811,18 @@ class ProcessTools:
             return "Sunshine had to be force-stopped"
         return "stopped the running Sunshine"
 
+    def busy_port_owner(self) -> str:
+        """Who is already listening on Sunshine's video-control port (empty when it is free). A second Sunshine cannot start while it is held."""
+        if self.which("ss") is None:
+            return ""
+        out = self._ok(["ss", "-H", "-ltnp", "sport", "=", ":48010"])
+        return " ".join(out.split())[:200] if out and out.strip() else ""
+
     def start_sunshine(self, config_dir: str) -> str:
+        owner = self.busy_port_owner()
+        if owner:
+            raise RuntimeError("port 48010 is still held by another program, so Sunshine cannot start: " + owner +
+                               "  (find it with: ss -ltnp | grep 48010 ; stop it with: kill -9 <pid>)")
         if self.sunshine_is_service():
             self._ok(["systemctl", "--user", "start", "sunshine"])
             return "started the Sunshine service"
@@ -1978,11 +1995,30 @@ def screen_normal(tools: Optional[ProcessTools] = None, progress: Callable[[str]
                 os.unlink(token)
             steps.append("restored Sunshine's normal settings")
         else:
-            steps.append("Sunshine's settings were already the normal ones")
+            # No backup, so screen-phone did not set this up. A phone screen set up BY HAND (the two lines below added to
+            # sunshine.conf, the real screen's approval saved as portal_token.old) is still undone here: it makes Sunshine fail
+            # at start whenever the virtual monitor is not running.
+            try:
+                text_conf = open(conf, errors="replace").read()
+            except OSError:
+                text_conf = ""
+            if re.search(r"(?m)^\s*capture\s*=\s*portal\s*$", text_conf) and re.search(rf"(?m)^\s*output_name\s*=\s*{PHONE_OUTPUT_NAME}\s*$", text_conf):
+                with open(conf, "w") as f:
+                    f.write(remove_config_option(remove_config_option(text_conf, "capture"), "output_name"))
+                if os.path.exists(token):
+                    shutil.copy2(token, phone_token)
+                if os.path.exists(token + ".old"):
+                    os.replace(token + ".old", token)
+                elif os.path.exists(token):
+                    os.unlink(token)
+                steps.append("removed leftover phone-screen settings (capture = portal, output_name = Meta-0) from sunshine.conf")
+            else:
+                steps.append("Sunshine's settings were already the normal ones")
         steps.append(tools.start_sunshine(config_dir))
         ready, line = tools.wait_for_sunshine(config_dir, 25.0, progress)
         steps.append(("Sunshine is ready" if ready else "Sunshine did NOT start") + f": {line}")
         if not ready:
+            steps.append("If this keeps failing, run: python3 mesh_input.py diagnose   and paste it (it shows Sunshine's log and settings).")
             return 1, "\n".join(steps)
     except (RuntimeError, OSError) as exc:
         return 1, "\n".join(steps + [f"stopped: {exc}"])

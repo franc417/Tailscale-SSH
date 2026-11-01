@@ -30,11 +30,12 @@ class Computer:
 
     def __init__(self, config_dir, sunshine_running=True, service=False, holder_log="new monitor(s): Meta-0 1600x720@60.00 at (1920,0)\n",
                  holder_exits=False, sunshine_log="[x]: Info: Configuration UI available at [https://localhost:47990]\n",
-                 sunshine_refuses_to_die=False):
+                 sunshine_refuses_to_die=False, port_owner=""):
         self.config_dir, self.sunshine_running, self.service = config_dir, sunshine_running, service
         self.holder_log, self.holder_exits, self.sunshine_log, self.refuses = holder_log, holder_exits, sunshine_log, sunshine_refuses_to_die
         self.events, self.now, self.kills = [], 0.0, []
         self.sunshine_writes_token = True
+        self.port_owner = port_owner
 
     # time
     def clock(self):
@@ -50,6 +51,8 @@ class Computer:
         if cmd[:2] == ["systemctl", "--user"]:
             self.events.append("systemctl " + cmd[2])
             return Done()
+        if cmd[0] == "ss":
+            return Done(self.port_owner, 0)
         if cmd == ["pgrep", "-x", "sunshine"]:
             return Done("4242\n", 0) if self.sunshine_running else Done("", 1)
         if cmd[0] == "pkill":
@@ -235,3 +238,44 @@ def test_screen_normal_with_no_real_screen_approval_leaves_no_virtual_one_behind
     mi.screen_phone("1600x720", pc.tools())
     mi.screen_normal(pc.tools())
     assert not (world / "portal_token").exists()                         # nothing of the virtual screen is left where normal mode looks
+
+
+# ------------------------------------------------------------------ undoing a hand-made phone screen
+
+def test_config_lines_can_be_removed_without_touching_the_others():
+    text = "encoder = vaapi\ncapture = portal\n  output_name = Meta-0\ncapture_extra = 1\n"
+    assert mi.remove_config_option(mi.remove_config_option(text, "capture"), "output_name") == "encoder = vaapi\ncapture_extra = 1\n"
+    assert mi.remove_config_option("", "capture") == ""
+
+
+def test_screen_normal_undoes_a_phone_screen_that_was_set_up_by_hand(world):
+    (world / "sunshine.conf").write_text("encoder = vaapi\ncapture = portal\noutput_name = Meta-0\n")
+    (world / "portal_token").write_text("meta-0-approval")
+    (world / "portal_token.old").write_text("real-screen-approval")
+    pc = Computer(str(world))
+    code, text = mi.screen_normal(pc.tools())
+    assert code == 0 and "removed leftover phone-screen settings" in text
+    assert read(world / "sunshine.conf") == "encoder = vaapi\n"
+    assert read(world / "portal_token") == "real-screen-approval" and not (world / "portal_token.old").exists()
+    assert read(world / "portal_token.mesh-phone") == "meta-0-approval"
+    assert pc.events[-1] == "start sunshine"
+
+
+def test_screen_normal_does_not_touch_a_portal_setup_that_is_not_the_phone_screen(world):
+    (world / "sunshine.conf").write_text("capture = portal\noutput_name = HDMI-1\n")
+    pc = Computer(str(world))
+    mi.screen_normal(pc.tools())
+    assert read(world / "sunshine.conf") == "capture = portal\noutput_name = HDMI-1\n"
+
+
+def test_a_failed_normal_start_points_to_diagnose(world):
+    pc = Computer(str(world), sunshine_log="[x]: Fatal: Unable to find display or encoder during startup.\n")
+    code, text = mi.screen_normal(pc.tools())
+    assert code == 1 and "python3 mesh_input.py diagnose" in text
+
+
+def test_a_port_still_held_by_another_program_stops_the_start_and_names_the_holder(world):
+    pc = Computer(str(world), port_owner='LISTEN 0 4096 0.0.0.0:48010 0.0.0.0:* users:(("sunshine",pid=999,fd=40))')
+    code, text = mi.screen_normal(pc.tools())
+    assert code == 1 and "port 48010 is still held" in text and "pid=999" in text and "kill -9" in text
+    assert "start sunshine" not in pc.events
