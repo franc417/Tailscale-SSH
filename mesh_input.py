@@ -1856,6 +1856,19 @@ class ProcessTools:
             self.sleep(0.5)
         return False, f"Sunshine did not report ready within {int(seconds)} s (see {log_path})"
 
+    def log_excerpt(self, config_dir: str, limit: int = 12) -> List[str]:
+        """The lines of the latest Sunshine start that explain a failure (screen share, tokens, errors), so nobody has to dig in the log."""
+        try:
+            with open(os.path.join(config_dir, SUNSHINE_LOG_NAME), errors="replace") as f:
+                text = f.read()
+        except OSError:
+            return []
+        marker = "--- started by mesh_input.py"
+        text = text[text.rfind(marker):] if marker in text else text
+        wanted = re.compile(r"(?i)portal|pipewire|token|fatal|error")
+        lines = [l.strip() for l in text.splitlines() if wanted.search(l) and not _SUNSHINE_LOG_NOISE.search(l) and "--- started" not in l]
+        return lines[-limit:]
+
     # -- the virtual-monitor holder: gjs running the spike script for a day, so the monitor exists until told to stop
     def holder_files(self) -> Tuple[str, str, str]:
         directory = phone_screen_dir()
@@ -1959,12 +1972,27 @@ def screen_phone(size: str, tools: Optional[ProcessTools] = None, progress: Call
         steps.append("pointed Sunshine at the virtual monitor (capture = portal, output_name = Meta-0; the old settings are saved)")
         if asks:
             progress("A GNOME window will ask which screen to share: choose the MetaVendor one (the virtual screen) and press Share ...")
-        steps.append(tools.start_sunshine(config_dir))
-        ready, line = tools.wait_for_sunshine(config_dir, 60.0 if asks else 25.0, progress)
+        while True:
+            steps.append(tools.start_sunshine(config_dir))
+            ready, line = tools.wait_for_sunshine(config_dir, 60.0 if asks else 25.0, progress)
+            if ready or asks:
+                break
+            # The saved approval for the virtual screen did not work (GNOME may not restore a virtual monitor): drop it and let GNOME ask.
+            steps.append("the saved approval for the virtual screen did not work, so it is dropped and GNOME will ask again")
+            steps.append(tools.stop_sunshine())
+            for stale in (token, phone_token):
+                if os.path.exists(stale):
+                    os.unlink(stale)
+            asks = True
+            progress("A GNOME window will ask which screen to share: choose the MetaVendor one (the virtual screen) and press Share ...")
         steps.append(("Sunshine is ready" if ready else "Sunshine did NOT start") + f": {line}")
-        if ready and os.path.exists(token) and not os.path.exists(phone_token):
+        if ready and os.path.exists(token):
             shutil.copy2(token, phone_token)
         if not ready:
+            excerpt = tools.log_excerpt(config_dir)
+            if excerpt:
+                steps.append("What Sunshine's log says about it:")
+                steps.extend("  " + l for l in excerpt)
             return 1, "\n".join(steps) + "\nUndo with: python3 mesh_input.py screen-normal"
     except (RuntimeError, OSError) as exc:
         return 1, "\n".join(steps + [f"stopped: {exc}", "Undo with: python3 mesh_input.py screen-normal"])

@@ -30,12 +30,13 @@ class Computer:
 
     def __init__(self, config_dir, sunshine_running=True, service=False, holder_log="new monitor(s): Meta-0 1600x720@60.00 at (1920,0)\n",
                  holder_exits=False, sunshine_log="[x]: Info: Configuration UI available at [https://localhost:47990]\n",
-                 sunshine_refuses_to_die=False, port_owner=""):
+                 sunshine_refuses_to_die=False, port_owner="", fail_with_token=None):
         self.config_dir, self.sunshine_running, self.service = config_dir, sunshine_running, service
         self.holder_log, self.holder_exits, self.sunshine_log, self.refuses = holder_log, holder_exits, sunshine_log, sunshine_refuses_to_die
         self.events, self.now, self.kills = [], 0.0, []
         self.sunshine_writes_token = True
         self.port_owner = port_owner
+        self.fail_with_token = fail_with_token
 
     # time
     def clock(self):
@@ -66,10 +67,14 @@ class Computer:
         if cmd[0] == "sunshine":
             self.events.append("start sunshine")
             self.sunshine_running = True
-            stdout.write(self.sunshine_log.encode())
+            token_path = os.path.join(self.config_dir, "portal_token")
+            stale = bool(self.fail_with_token) and os.path.exists(token_path) and open(token_path).read() == self.fail_with_token
+            log_text = ("[x]: Error: [portalgrab] RemoteDesktop Start: no streams in response\n"
+                        "[x]: Fatal: Unable to find display or encoder during startup.\n") if stale else self.sunshine_log
+            stdout.write(log_text.encode())
             stdout.flush()
             in_portal_mode = "capture = portal" in open(os.path.join(self.config_dir, "sunshine.conf")).read()
-            if self.sunshine_writes_token and in_portal_mode and "Fatal" not in self.sunshine_log:       # only portal capture saves a token
+            if self.sunshine_writes_token and in_portal_mode and "Fatal" not in log_text:       # only portal capture saves a token
                 with open(os.path.join(self.config_dir, "portal_token"), "w") as f:
                     f.write("token-from-this-run")
             return Process(4242)
@@ -279,3 +284,34 @@ def test_a_port_still_held_by_another_program_stops_the_start_and_names_the_hold
     code, text = mi.screen_normal(pc.tools())
     assert code == 1 and "port 48010 is still held" in text and "pid=999" in text and "kill -9" in text
     assert "start sunshine" not in pc.events
+
+
+# ------------------------------------------------------------------ a saved approval that no longer works
+
+def test_screen_phone_drops_a_saved_approval_that_does_not_work_and_lets_gnome_ask_again(world):
+    (world / "portal_token.mesh-phone").write_text("stale")
+    pc = Computer(str(world), fail_with_token="stale")
+    shown = []
+    code, text = mi.screen_phone("1920x864", pc.tools(), progress=shown.append)
+    assert code == 0, text
+    assert pc.events.count("start sunshine") == 2 and "the saved approval for the virtual screen did not work" in text
+    assert read(world / "portal_token.mesh-phone") == "token-from-this-run"             # the fresh approval replaces the stale one
+    assert any("choose the MetaVendor" in line for line in shown)
+
+
+def test_screen_phone_failure_shows_what_sunshine_s_log_says_about_the_screen_share(world):
+    pc = Computer(str(world), sunshine_log="[x]: Error: [portalgrab] RemoteDesktop Start: no streams in response\n"
+                                           "[x]: Info: [wayland] Found interface: wl_output(3) version 4\n"
+                                           "[x]: Error: [pipewire] something about a stream\n"
+                                           "[x]: Fatal: Unable to find display or encoder during startup.\n")
+    code, text = mi.screen_phone("1920x864", pc.tools())
+    assert code == 1 and "What Sunshine's log says about it:" in text
+    assert "RemoteDesktop Start: no streams in response" in text and "something about a stream" in text
+    assert "Found interface" not in text and "screen-normal" in text
+
+
+def test_a_working_saved_approval_is_used_once_and_not_dropped(world):
+    (world / "portal_token.mesh-phone").write_text("good")
+    pc = Computer(str(world), fail_with_token="stale")
+    code, _ = mi.screen_phone("1920x864", pc.tools())
+    assert code == 0 and pc.events.count("start sunshine") == 1

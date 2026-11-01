@@ -112,7 +112,7 @@ class ControlActivity : Activity() {
     override fun onStop() {
         attempt++
         // Closing tells the computer to let go of any key still held down.
-        client?.close()
+        client?.closeInBackground()
         client = null
         bridge = null
         super.onStop()
@@ -125,7 +125,7 @@ class ControlActivity : Activity() {
 
     private fun connect() {
         val c = computer ?: return
-        client?.close()
+        client?.closeInBackground()
         client = null
         bridge = null
         retry.visibility = View.GONE

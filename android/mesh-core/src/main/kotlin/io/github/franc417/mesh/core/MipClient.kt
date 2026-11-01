@@ -285,7 +285,16 @@ class MipClient(private val config: Config, private val listener: Listener) : In
 
     // ------------------------------------------------------------------ ending
 
-    /** Ends the session politely; the host releases anything still held. */
+    /**
+     * Ends the session from any thread without blocking it. [close] writes to the network and closes the socket, which Android
+     * forbids on the main thread (it crashed the app with NetworkOnMainThreadException when "Try again" was tapped), so every caller
+     * that may be on the main thread uses this one.
+     */
+    fun closeInBackground() {
+        Thread({ close() }, "mesh-mip-close").apply { isDaemon = true }.start()
+    }
+
+    /** Ends the session politely; the host releases anything still held. Does network I/O: never call it on the main thread. */
     fun close() {
         if (finished.get()) return
         try {

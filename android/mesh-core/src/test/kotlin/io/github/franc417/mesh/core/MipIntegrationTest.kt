@@ -329,6 +329,21 @@ class MipIntegrationTest {
     }
 
     @Test
+    fun `closing in the background ends the session once and never blocks the caller`() = withAgent { agent ->
+        val rec = Recorder()
+        val client = MipClient(config(agent), rec)
+        client.connect()
+        assertTrue(client.isConnected)
+        val started = System.nanoTime()
+        client.closeInBackground()
+        client.closeInBackground()   // twice is fine
+        assertTrue("the call must return at once", (System.nanoTime() - started) / 1_000_000 < 500)
+        assertTrue(waitUntil(8000) { rec.disconnects.isNotEmpty() })
+        assertFalse(client.isConnected)
+        assertEquals(1, rec.disconnects.size)   // reported exactly once
+    }
+
+    @Test
     fun `sending after the session ended is harmless`() = withAgent { agent ->
         val client = MipClient(config(agent), Recorder())
         client.connect()

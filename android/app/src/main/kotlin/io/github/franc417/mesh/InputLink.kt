@@ -70,7 +70,7 @@ class InputLink(
     fun close() {
         connecting = false
         bridge = null
-        client?.close()
+        client?.closeInBackground()   // this runs on the main thread, where network writes are forbidden
         client = null
     }
 }
