@@ -30,13 +30,14 @@ class Computer:
 
     def __init__(self, config_dir, sunshine_running=True, service=False, holder_log="new monitor(s): Meta-0 1600x720@60.00 at (1920,0)\n",
                  holder_exits=False, sunshine_log="[x]: Info: Configuration UI available at [https://localhost:47990]\n",
-                 sunshine_refuses_to_die=False, port_owner="", fail_with_token=None):
+                 sunshine_refuses_to_die=False, port_owner="", fail_with_token=None, agent_running=True):
         self.config_dir, self.sunshine_running, self.service = config_dir, sunshine_running, service
         self.holder_log, self.holder_exits, self.sunshine_log, self.refuses = holder_log, holder_exits, sunshine_log, sunshine_refuses_to_die
         self.events, self.now, self.kills = [], 0.0, []
         self.sunshine_writes_token = True
         self.port_owner = port_owner
         self.fail_with_token = fail_with_token
+        self.agent_running = agent_running
 
     # time
     def clock(self):
@@ -52,6 +53,8 @@ class Computer:
         if cmd[:2] == ["systemctl", "--user"]:
             self.events.append("systemctl " + cmd[2])
             return Done()
+        if cmd[:2] == ["pgrep", "-f"]:
+            return Done("999\n", 0) if self.agent_running else Done("", 1)
         if cmd[0] == "ss":
             return Done(self.port_owner, 0)
         if cmd == ["pgrep", "-x", "sunshine"]:
@@ -315,3 +318,22 @@ def test_a_working_saved_approval_is_used_once_and_not_dropped(world):
     pc = Computer(str(world), fail_with_token="stale")
     code, _ = mi.screen_phone("1920x864", pc.tools())
     assert code == 0 and pc.events.count("start sunshine") == 1
+
+
+def test_screen_phone_warns_when_the_agent_that_pairs_the_phone_is_not_running(world):
+    pc = Computer(str(world), agent_running=False)
+    code, text = mi.screen_phone("1920x864", pc.tools())
+    assert code == 0 and "WARNING: the Mesh agent is not running" in text and "python3 mesh_input.py run" in text
+
+
+def test_no_warning_when_the_agent_is_running(world):
+    pc = Computer(str(world))
+    code, text = mi.screen_phone("1920x864", pc.tools())
+    assert code == 0 and "WARNING" not in text
+
+
+def test_unpair_all_also_warns_about_a_missing_agent(world):
+    (world / "sunshine_state.json").write_text(json.dumps({"root": {"named_devices": [{"name": "Mesh"}]}}))
+    pc = Computer(str(world), agent_running=False)
+    code, text = mi.sunshine_unpair_all(pc.tools())
+    assert code == 0 and "WARNING: the Mesh agent is not running" in text

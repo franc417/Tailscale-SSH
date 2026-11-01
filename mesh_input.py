@@ -1811,6 +1811,11 @@ class ProcessTools:
             return "Sunshine had to be force-stopped"
         return "stopped the running Sunshine"
 
+    def agent_running(self) -> bool:
+        """Whether the Mesh agent (`mesh_input.py run`, by hand or as the service) is running: automatic pairing needs it."""
+        out = self._ok(["pgrep", "-f", "mesh_input.py run"])
+        return bool(out and out.strip())
+
     def busy_port_owner(self) -> str:
         """Who is already listening on Sunshine's video-control port (empty when it is free). A second Sunshine cannot start while it is held."""
         if self.which("ss") is None:
@@ -1996,6 +2001,8 @@ def screen_phone(size: str, tools: Optional[ProcessTools] = None, progress: Call
             return 1, "\n".join(steps) + "\nUndo with: python3 mesh_input.py screen-normal"
     except (RuntimeError, OSError) as exc:
         return 1, "\n".join(steps + [f"stopped: {exc}", "Undo with: python3 mesh_input.py screen-normal"])
+    if not tools.agent_running():
+        steps.append("WARNING: the Mesh agent is not running, and the phone pairs through it. Start it first: python3 mesh_input.py run   (or install-service)")
     steps.append("Now open the desktop on the phone. Put windows on the virtual screen with Super+Shift+Right, or push the pointer past the right edge.")
     steps.append("Go back to the normal screen with: python3 mesh_input.py screen-normal")
     return 0, "\n".join(steps)
@@ -2082,6 +2089,8 @@ def sunshine_unpair_all(tools: Optional[ProcessTools] = None, progress: Callable
     except (RuntimeError, OSError) as exc:
         return 1, "\n".join(steps + [f"stopped: {exc}"])
     if code == 0:
+        if not tools.agent_running():
+            steps.append("WARNING: the Mesh agent is not running, and the phone pairs through it. Start it first: python3 mesh_input.py run   (or install-service)")
         steps.append("Now open the desktop on the phone once: it pairs again by itself (the Mesh agent must be running and `sunshine-login` done).")
     return code, "\n".join(steps)
 
