@@ -110,6 +110,28 @@ The desktop view has several ways to use a finger. They are chosen from the bar 
   or test what other programs (Sunshine, a screen recorder) do with it; Ctrl+C removes it.
 - The pointer mark in the desktop view is now only a small faint dot (a bit stronger while the button is held).
 
+# The whole sequence, from pairing to the phone-shaped screen
+
+Run these on the computer, in a terminal inside the desktop, from the Tailscale-SSH folder. Each command prints what it did.
+
+1. `git pull`
+2. `python3 mesh_input.py sunshine-unpair-all` : stops Sunshine, forgets every paired phone (the old list is kept as
+   `sunshine_state.json.mesh-backup`) and starts Sunshine again in the background (log: `~/.config/sunshine/mesh-sunshine.log`).
+   Needed when the phone shows a PIN and Sunshine's log says `Client certificate identity is not enabled`: Sunshine only accepts a
+   phone whose certificate is stored exactly once, and every re-pairing used to add one more copy.
+3. Once: open `https://localhost:47990`, create Sunshine's username and password if it asks, then run
+   `python3 mesh_input.py sunshine-login`.
+4. `python3 mesh_input.py run` in a second terminal (or `install-service` once). The agent must be running for automatic pairing.
+5. On the phone install the newest **mesh-debug** APK and tap **Open desktop**. It pairs by itself. If the app crashes, open it again:
+   it shows "Mesh crashed last time"; tap **Copy and close** and paste the text into the chat.
+6. The phone-shaped screen: `python3 mesh_input.py screen-phone` (optionally `--size 2400x1080`). It starts a virtual monitor in the
+   background, points Sunshine at it (`capture = portal`, `output_name = Meta-0`) and restarts Sunshine. The first time GNOME asks which
+   screen to share: choose **MetaVendor** and press Share. Then **Open desktop** on the phone. Move windows there with `Super+Shift+Right`.
+7. Back to normal: `python3 mesh_input.py screen-normal` (removes the virtual monitor, restores Sunshine's old settings, restarts it).
+
+Backups: `sunshine.conf.mesh-normal` and `portal_token.mesh-normal` hold the normal setup while the phone screen is on;
+`portal_token.mesh-phone` remembers the GNOME approval for the virtual screen so it asks only once.
+
 # Trying the desktop view
 
 Mesh shows the computer's screen by talking to **Sunshine** (the same program Moonlight uses), using Moonlight's

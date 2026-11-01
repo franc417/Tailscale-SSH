@@ -26,6 +26,11 @@ Commands:
   python3 mesh_input.py sunshine-login       save Sunshine's web login once, so the phone pairs its desktop view with no PIN
   python3 mesh_input.py diagnose             print the desktop, monitors, Sunshine settings/log and hardware, to find out why it is slow
                                               (display-info is the same command)
+  python3 mesh_input.py encoder-bench       time the video encoders here and recommend Sunshine's (--apply writes it)
+  python3 mesh_input.py sunshine-unpair-all  forget every paired phone in Sunshine (cures "Client certificate identity is not enabled")
+  python3 mesh_input.py screen-phone         phone-shaped virtual screen on, Sunshine pointed at it (--size 1600x720)
+  python3 mesh_input.py screen-normal        the real screen and Sunshine's own settings back
+  python3 mesh_input.py spike-virtual-monitor  try creating a virtual monitor and report what GNOME did (--seconds N holds it open)
   python3 mesh_input.py run [--port N]       serve (needs /dev/uinput access)
   python3 mesh_input.py install-service      start at every login and restart on failure (systemd user service)
   python3 mesh_input.py uninstall-service    stop and remove that service
@@ -1062,9 +1067,13 @@ _SUNSHINE_LOG_INTEREST = re.compile(
     r"adapter|gpu|drm|cursor|idr|fec|packet|ssl|certificate|pair")
 
 
+_SUNSHINE_LOG_NOISE = re.compile(r"\[wayland\] (Found interface|Found display|Resolution|Offset|Logical size|Name|Found monitor)|CAP_SYS_ADMIN|drop_elevated")
+
+
 def filter_sunshine_log(text: str, keep: int = 50) -> List[str]:
     """The lines of Sunshine's log that say how it captures and encodes and what went wrong, the newest [keep] of them."""
-    hits = [line.rstrip() for line in text.splitlines() if _SUNSHINE_LOG_INTEREST.search(line)]
+    hits = [line.rstrip() for line in text.splitlines()
+            if _SUNSHINE_LOG_INTEREST.search(line) and not _SUNSHINE_LOG_NOISE.search(line)]
     return hits[-keep:]
 
 
@@ -1249,10 +1258,13 @@ def display_info(runner=subprocess.run, which=shutil.which, environ=os.environ, 
         lines.append(f"[sunshine paired devices] no state file at {state_path} (nothing has paired yet)")
     log = run(["journalctl", "--user", "-u", "sunshine", "-n", "800", "--no-pager", "-o", "cat"], timeout=15)
     if not log:
-        try:
-            log = read_file(os.path.join(environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "sunshine", "sunshine.log"))
-        except OSError:
-            log = ""
+        for name in (SUNSHINE_LOG_NAME, "sunshine.log"):
+            try:
+                log = read_file(os.path.join(environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "sunshine", name))
+            except OSError:
+                log = ""
+            if log:
+                break
     section("sunshine log (capture, encoder, warnings; newest last)", filter_sunshine_log(log or "") or ["(no log found)"], 50)
 
     # -- the computer
@@ -1710,6 +1722,306 @@ def spike_virtual_monitor(size: str = "1600x720", seconds: int = 8, runner=subpr
     return done.returncode, "Mesh virtual-monitor spike (paste all of this):\n\n" + (text or "(no output)")
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# The phone-shaped screen, as three commands that do the whole dance:
+#   screen-phone         starts a virtual monitor (kept alive in the background), points Sunshine at it, restarts Sunshine
+#   screen-normal        puts everything back (real screen, Sunshine's old settings) and restarts Sunshine
+#   sunshine-unpair-all  forgets every paired phone in Sunshine (cures "Client certificate identity is not enabled"), restarts Sunshine
+# Sunshine can only capture the virtual monitor through GNOME's screen-share portal, and only while the monitor exists, so the
+# monitor must be started first and Sunshine restarted after it. These commands keep that order and keep backups of what they change.
+# ---------------------------------------------------------------------------------------------------------------------
+
+PHONE_OUTPUT_NAME = "Meta-0"
+SUNSHINE_LOG_NAME = "mesh-sunshine.log"          # Sunshine started by these commands writes here (its own sunshine.log is left alone)
+
+
+def sunshine_config_dir(environ=os.environ) -> str:
+    return os.path.join(environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "sunshine")
+
+
+def phone_screen_dir() -> str:
+    return os.path.join(default_dir(), "phone-screen")
+
+
+def clear_paired_devices(state_text: str) -> Tuple[str, int]:
+    """Sunshine's saved state with every paired phone removed, and how many records that was."""
+    data = json.loads(state_text)
+    root = data.get("root") if isinstance(data, dict) else None
+    if not isinstance(root, dict):
+        return state_text, 0
+    removed = 0
+    for key in ("named_devices", "devices"):
+        value = root.pop(key, None)
+        if isinstance(value, list):
+            removed += len(value)
+    return json.dumps(data, indent=2) + "\n", removed
+
+
+class ProcessTools:
+    """The few ways these commands touch running programs, in one place so tests can replace them."""
+
+    def __init__(self, runner=subprocess.run, popen=subprocess.Popen, which=shutil.which, sleep=time.sleep, clock=time.monotonic,
+                 environ=os.environ, kill=os.kill, read_cmdline=None):
+        self.runner, self.popen, self.which, self.sleep, self.clock, self.environ, self.kill = runner, popen, which, sleep, clock, environ, kill
+        self.read_cmdline = read_cmdline or self._proc_cmdline
+
+    @staticmethod
+    def _proc_cmdline(pid: int) -> str:
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                return f.read().replace(b"\0", b" ").decode(errors="replace")
+        except OSError:
+            return ""
+
+    def _ok(self, cmd: List[str]) -> Optional[str]:
+        try:
+            done = self.runner(cmd, capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return (done.stdout or "") if done.returncode == 0 else None
+
+    def sunshine_is_service(self) -> bool:
+        return self.which("systemctl") is not None and self._ok(["systemctl", "--user", "cat", "sunshine.service"]) is not None
+
+    def sunshine_running(self) -> bool:
+        out = self._ok(["pgrep", "-x", "sunshine"])
+        return bool(out and out.strip())
+
+    def stop_sunshine(self) -> str:
+        """Stops every Sunshine. It holds the network ports, so a second copy cannot start while one is still running."""
+        if self.sunshine_is_service():
+            self._ok(["systemctl", "--user", "stop", "sunshine"])
+        if not self.sunshine_running():
+            return "Sunshine was not running"
+        self._ok(["pkill", "-x", "sunshine"])
+        deadline = self.clock() + 8
+        while self.sunshine_running() and self.clock() < deadline:
+            self.sleep(0.3)
+        if self.sunshine_running():
+            self._ok(["pkill", "-9", "-x", "sunshine"])
+            self.sleep(0.5)
+            if self.sunshine_running():
+                raise RuntimeError("Sunshine would not stop (try: pkill -9 sunshine)")
+            return "Sunshine had to be force-stopped"
+        return "stopped the running Sunshine"
+
+    def start_sunshine(self, config_dir: str) -> str:
+        if self.sunshine_is_service():
+            self._ok(["systemctl", "--user", "start", "sunshine"])
+            return "started the Sunshine service"
+        if self.which("sunshine") is None:
+            raise RuntimeError("Sunshine is not installed (Arch: sudo pacman -S sunshine)")
+        os.makedirs(config_dir, exist_ok=True)
+        log_path = os.path.join(config_dir, SUNSHINE_LOG_NAME)
+        env = {**self.environ, **graphical_environment(self.environ)}
+        with open(log_path, "ab") as log:
+            log.write(f"\n--- started by mesh_input.py at {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n".encode())
+            self.popen(["sunshine"], stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True, env=env)
+        return f"started Sunshine in the background (its log: {log_path})"
+
+    def wait_for_sunshine(self, config_dir: str, seconds: float, progress: Callable[[str], None] = lambda s: None) -> Tuple[bool, str]:
+        """Waits until Sunshine says it is ready, or says it failed. Returns (ready, the line that decided it)."""
+        log_path = os.path.join(config_dir, SUNSHINE_LOG_NAME)
+        deadline = self.clock() + seconds
+        marker = "--- started by mesh_input.py"
+        while self.clock() < deadline:
+            try:
+                with open(log_path, errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                text = ""
+            text = text[text.rfind(marker):] if marker in text else text
+            for line in text.splitlines():
+                if "Fatal:" in line:
+                    return False, line.strip()
+                if "Configuration UI available" in line:
+                    return True, line.strip()
+            self.sleep(0.5)
+        return False, f"Sunshine did not report ready within {int(seconds)} s (see {log_path})"
+
+    # -- the virtual-monitor holder: gjs running the spike script for a day, so the monitor exists until told to stop
+    def holder_files(self) -> Tuple[str, str, str]:
+        directory = phone_screen_dir()
+        return os.path.join(directory, "holder.mjs"), os.path.join(directory, "holder.log"), os.path.join(directory, "holder.pid")
+
+    def stop_holder(self) -> str:
+        script, _log, pid_file = self.holder_files()
+        try:
+            pid = int(open(pid_file).read().strip())
+        except (OSError, ValueError):
+            return "no virtual monitor was being held"
+        cmdline = self.read_cmdline(pid)
+        stopped = "no virtual monitor was being held"
+        if "holder.mjs" in cmdline:
+            try:
+                self.kill(pid, 15)
+                stopped = "removed the virtual monitor"
+                self.sleep(1.0)
+            except OSError:
+                pass
+        try:
+            os.unlink(pid_file)
+        except OSError:
+            pass
+        return stopped
+
+    def start_holder(self, width: int, height: int, seconds: float = 25.0) -> Tuple[bool, str]:
+        """Starts the virtual monitor and waits until GNOME shows it. Returns (ok, what to tell the person)."""
+        script, log_path, pid_file = self.holder_files()
+        os.makedirs(os.path.dirname(script), exist_ok=True)
+        with open(script, "w") as f:
+            f.write(VIRTUAL_MONITOR_SPIKE_JS)
+        env = {**self.environ, **graphical_environment(self.environ)}
+        with open(log_path, "wb") as log:
+            process = self.popen(["gjs", "-m", script, str(width), str(height), "86400"], stdout=log, stderr=subprocess.STDOUT,
+                                 stdin=subprocess.DEVNULL, start_new_session=True, env=env)
+        with open(pid_file, "w") as f:
+            f.write(str(process.pid))
+        deadline = self.clock() + seconds
+        while self.clock() < deadline:
+            try:
+                with open(log_path, errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                text = ""
+            match = re.search(r"new monitor\(s\): (\S+) (\d+)x(\d+)", text)
+            if match:
+                return True, f"virtual monitor {match.group(1)} is up at {match.group(2)}x{match.group(3)}"
+            if process.poll() is not None:
+                tail = [l for l in text.splitlines() if l.strip()][-4:]
+                return False, "the virtual monitor could not start: " + " | ".join(tail)
+            self.sleep(0.5)
+        return False, "the virtual monitor did not appear within " + str(int(seconds)) + " s"
+
+
+def screen_phone(size: str, tools: Optional[ProcessTools] = None, progress: Callable[[str], None] = lambda s: None) -> Tuple[int, str]:
+    """`screen-phone`: virtual monitor first, then Sunshine pointed at it."""
+    tools = tools or ProcessTools()
+    try:
+        width, height = parse_size(size)
+    except ValueError as exc:
+        return 2, str(exc)
+    missing = [name for name in ("gjs", "gst-launch-1.0", "sunshine") if tools.which(name) is None]
+    if missing:
+        return 1, "cannot start the phone screen, missing: " + ", ".join(missing) + " (Arch: sudo pacman -S gjs gst-plugins-base gst-plugin-pipewire sunshine)"
+    config_dir = sunshine_config_dir(tools.environ)
+    conf, token = os.path.join(config_dir, "sunshine.conf"), os.path.join(config_dir, "portal_token")
+    normal_conf, normal_token, phone_token = conf + ".mesh-normal", token + ".mesh-normal", token + ".mesh-phone"
+    steps: List[str] = []
+    try:
+        progress("stopping Sunshine and any earlier virtual monitor ...")
+        steps.append(tools.stop_sunshine())
+        tools.stop_holder()
+        progress(f"starting a {width}x{height} virtual monitor ...")
+        ok, text = tools.start_holder(width, height)
+        steps.append(text)
+        if not ok:
+            tools.stop_holder()
+            return 1, "\n".join(steps)
+        # Remember the normal setup once, so screen-normal can put it back exactly.
+        os.makedirs(config_dir, exist_ok=True)
+        if not os.path.exists(normal_conf):
+            if os.path.exists(conf):
+                shutil.copy2(conf, normal_conf)
+            else:
+                open(normal_conf, "w").close()
+        if os.path.exists(token) and not os.path.exists(normal_token):
+            os.replace(token, normal_token)
+        elif os.path.exists(token):
+            os.unlink(token)
+        asks = not os.path.exists(phone_token)
+        if not asks:
+            shutil.copy2(phone_token, token)
+        try:
+            text_conf = open(conf, errors="replace").read()
+        except OSError:
+            text_conf = ""
+        text_conf = set_config_option(set_config_option(text_conf, "capture", "portal"), "output_name", PHONE_OUTPUT_NAME)
+        with open(conf, "w") as f:
+            f.write(text_conf)
+        steps.append("pointed Sunshine at the virtual monitor (capture = portal, output_name = Meta-0; the old settings are saved)")
+        if asks:
+            progress("A GNOME window will ask which screen to share: choose the MetaVendor one (the virtual screen) and press Share ...")
+        steps.append(tools.start_sunshine(config_dir))
+        ready, line = tools.wait_for_sunshine(config_dir, 60.0 if asks else 25.0, progress)
+        steps.append(("Sunshine is ready" if ready else "Sunshine did NOT start") + f": {line}")
+        if ready and os.path.exists(token) and not os.path.exists(phone_token):
+            shutil.copy2(token, phone_token)
+        if not ready:
+            return 1, "\n".join(steps) + "\nUndo with: python3 mesh_input.py screen-normal"
+    except (RuntimeError, OSError) as exc:
+        return 1, "\n".join(steps + [f"stopped: {exc}", "Undo with: python3 mesh_input.py screen-normal"])
+    steps.append("Now open the desktop on the phone. Put windows on the virtual screen with Super+Shift+Right, or push the pointer past the right edge.")
+    steps.append("Go back to the normal screen with: python3 mesh_input.py screen-normal")
+    return 0, "\n".join(steps)
+
+
+def screen_normal(tools: Optional[ProcessTools] = None, progress: Callable[[str], None] = lambda s: None) -> Tuple[int, str]:
+    """`screen-normal`: the real screen again, Sunshine's own settings back."""
+    tools = tools or ProcessTools()
+    config_dir = sunshine_config_dir(tools.environ)
+    conf, token = os.path.join(config_dir, "sunshine.conf"), os.path.join(config_dir, "portal_token")
+    normal_conf, normal_token, phone_token = conf + ".mesh-normal", token + ".mesh-normal", token + ".mesh-phone"
+    steps: List[str] = []
+    try:
+        progress("stopping Sunshine and the virtual monitor ...")
+        steps.append(tools.stop_sunshine())
+        steps.append(tools.stop_holder())
+        if os.path.exists(normal_conf):
+            if os.path.exists(token):
+                shutil.copy2(token, phone_token)          # keep the approval for the virtual screen for next time
+            shutil.copy2(normal_conf, conf)
+            os.unlink(normal_conf)
+            if os.path.exists(normal_token):
+                os.replace(normal_token, token)
+            elif os.path.exists(token):
+                os.unlink(token)
+            steps.append("restored Sunshine's normal settings")
+        else:
+            steps.append("Sunshine's settings were already the normal ones")
+        steps.append(tools.start_sunshine(config_dir))
+        ready, line = tools.wait_for_sunshine(config_dir, 25.0, progress)
+        steps.append(("Sunshine is ready" if ready else "Sunshine did NOT start") + f": {line}")
+        if not ready:
+            return 1, "\n".join(steps)
+    except (RuntimeError, OSError) as exc:
+        return 1, "\n".join(steps + [f"stopped: {exc}"])
+    return 0, "\n".join(steps)
+
+
+def sunshine_unpair_all(tools: Optional[ProcessTools] = None, progress: Callable[[str], None] = lambda s: None) -> Tuple[int, str]:
+    """`sunshine-unpair-all`: forget every paired phone, so the next pairing is the only record (the cure for a phone Sunshine refuses)."""
+    tools = tools or ProcessTools()
+    config_dir = sunshine_config_dir(tools.environ)
+    state = os.path.join(config_dir, "sunshine_state.json")
+    steps: List[str] = []
+    code = 0
+    try:
+        progress("stopping Sunshine (it would write its old list back) ...")
+        steps.append(tools.stop_sunshine())
+        try:
+            cleaned, removed = clear_paired_devices(open(state, errors="replace").read())
+            shutil.copy2(state, state + ".mesh-backup")
+            with open(state, "w") as f:
+                f.write(cleaned)
+            steps.append(f"removed {removed} paired device record(s) (the old file is kept as {state}.mesh-backup)")
+        except FileNotFoundError:
+            steps.append("Sunshine has no state file yet, so nothing is paired")
+        except ValueError as exc:
+            steps.append(f"sunshine_state.json is not valid JSON ({exc}); nothing was changed")
+            code = 1
+        steps.append(tools.start_sunshine(config_dir))             # never leave Sunshine stopped
+        ready, line = tools.wait_for_sunshine(config_dir, 25.0, progress)
+        steps.append(("Sunshine is ready" if ready else "Sunshine did NOT start") + f": {line}")
+        if not ready:
+            code = 1
+    except (RuntimeError, OSError) as exc:
+        return 1, "\n".join(steps + [f"stopped: {exc}"])
+    if code == 0:
+        steps.append("Now open the desktop on the phone once: it pairs again by itself (the Mesh agent must be running and `sunshine-login` done).")
+    return code, "\n".join(steps)
+
+
 def sunshine_login(directory: str, url: Optional[str] = None, username: Optional[str] = None,
                    password: Optional[str] = None, ask: Callable[[str], str] = input,
                    ask_secret: Callable[[str], str] = getpass.getpass, out: Callable[[str], None] = print) -> int:
@@ -1979,7 +2291,7 @@ def uninstall_service(target_dir: Optional[str] = None, runner=subprocess.run) -
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Mesh input channel (host side)")
-    ap.add_argument("command", choices=["init", "pair-info", "run", "reset-token", "install-service", "uninstall-service", "sunshine-login", "display-info", "diagnose", "encoder-bench", "spike-virtual-monitor"])
+    ap.add_argument("command", choices=["init", "pair-info", "run", "reset-token", "install-service", "uninstall-service", "sunshine-login", "display-info", "diagnose", "encoder-bench", "spike-virtual-monitor", "screen-phone", "screen-normal", "sunshine-unpair-all"])
     ap.add_argument("--dir", default=default_dir())
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--dry-run", action="store_true", help="record events instead of injecting them")
@@ -1995,6 +2307,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command in ("display-info", "diagnose"):
         print(display_info())
         return 0
+
+    if args.command in ("screen-phone", "screen-normal", "sunshine-unpair-all"):
+        say = lambda text: print(text, file=sys.stderr, flush=True)
+        if args.command == "screen-phone":
+            code, text = screen_phone(args.size, progress=say)
+        elif args.command == "screen-normal":
+            code, text = screen_normal(progress=say)
+        else:
+            code, text = sunshine_unpair_all(progress=say)
+        print(text)
+        return code
 
     if args.command == "spike-virtual-monitor":
         code, text = spike_virtual_monitor(args.size, args.seconds)
