@@ -58,7 +58,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 VERSION = 1
 DEFAULT_PORT = 47600
@@ -964,14 +964,56 @@ class SunshineLink:
 
     # -- pairing
 
-    def pair(self, pin: str, name: str, peer: str = "", wait: float = SUNSHINE_PIN_WAIT) -> None:
+    @staticmethod
+    def clean_name(name: str) -> str:
+        """The name Sunshine will store for the phone (what pair() sends)."""
+        return (name or "").strip().encode()[:128].decode("utf-8", "ignore") or "Mesh phone"
+
+    # -- keeping one record per phone
+    #
+    # Sunshine adds a NEW record every time a phone completes a pairing, even with the very same certificate, and it only accepts a
+    # phone whose certificate is stored exactly once. So one pairing that the phone believes failed (a timeout) and is then repeated
+    # leaves two copies, and from then on Sunshine refuses the phone ("identity is not enabled"), which makes the app pair again, and
+    # so on. After every approved pairing the agent therefore removes the records this phone name had BEFORE it.
+
+    def clients(self) -> List[Tuple[str, str]]:
+        """(name, uuid) of every paired record in Sunshine's own order; empty when Sunshine cannot be asked."""
+        try:
+            status, data = self._call("GET", "/api/clients/list")
+        except SunshineError:
+            return []
+        if status != 200 or not isinstance(data, dict):
+            return []
+        return [(str(c.get("name", "")), str(c["uuid"])) for c in data.get("named_certs", []) if isinstance(c, dict) and c.get("uuid")]
+
+    def unpair(self, uuid: str) -> bool:
+        try:
+            status, data = self._call("POST", "/api/clients/unpair", body={"uuid": uuid})
+        except SunshineError:
+            return False
+        return status == 200 and isinstance(data, dict) and data.get("status") is True
+
+    def drop_older_records(self, name: str, before: Set[str], wait: float = 20.0) -> int:
+        """Waits for the phone's NEW record to appear, then removes the records it had before. Returns how many were removed."""
+        deadline = self._clock() + wait
+        while True:
+            now = self.clients()
+            if any(n == name and u not in before for n, u in now):
+                break
+            if self._clock() >= deadline:
+                return 0                       # the new record never appeared: leave the old ones, they may be all there is
+            self._sleep(0.5)
+        return sum(1 for n, u in now if n == name and u in before and self.unpair(u))
+
+    def pair(self, pin: str, name: str, peer: str = "", wait: float = SUNSHINE_PIN_WAIT) -> Set[str]:
         """Approves the phone's pending pairing request with [pin]. Blocks; raises SunshineError with a reason a person can act on.
+        Returns the ids of the records Sunshine already held for this phone name just before it was approved (see drop_older_records).
 
         [peer] is the phone's address as this agent sees it: a pending request from any other address is ignored, so a
         stranger's request that happens to arrive at the same moment is never approved."""
         if not re.fullmatch(r"[0-9]{4}", pin or ""):
             raise SunshineError(S_BAD_REQUEST, "the PIN must be exactly 4 digits")
-        name = (name or "").strip().encode()[:128].decode("utf-8", "ignore") or "Mesh phone"
+        name = self.clean_name(name)
         peer = _normalize_address(peer)
         deadline = self._clock() + wait
         pairing_id = None
@@ -989,10 +1031,11 @@ class SunshineLink:
                     raise SunshineError(S_FAILED, "Sunshine only has a pairing request from another device, which was left alone")
                 raise SunshineError(S_FAILED, "the phone's pairing request never reached Sunshine (is the phone able to reach Sunshine's port 47989?)")
             self._sleep(0.25)
+        before = {u for n, u in self.clients() if n == name}
         status, data = self._call("POST", "/api/pin", timeout=35.0,
                                   body={"pairing_id": pairing_id, "pin": pin, "name": name})
         if status == 200 and isinstance(data, dict) and data.get("status") is True:
-            return
+            return before
         if status in (401, 403):
             raise SunshineError(S_LOGIN_REFUSED, "Sunshine did not accept Mesh's saved login. On the computer run: python3 mesh_input.py sunshine-login")
         raise SunshineError(S_FAILED, "Sunshine did not complete the pairing (wrong PIN or it timed out)")
@@ -2255,8 +2298,11 @@ class Server:
             await self._send(writer, msg_sunshine_result(S_NOT_CONFIGURED, "this agent was started without the Sunshine link"))
             return
         link = self.sunshine
+        loop = asyncio.get_running_loop()
+        stored_name = SunshineLink.clean_name(name)
+        before: Set[str] = set()
         try:
-            await asyncio.get_running_loop().run_in_executor(None, lambda: link.pair(pin, name, peer))
+            before = await loop.run_in_executor(None, lambda: link.pair(pin, name, peer)) or set()
             code, text = S_OK, "paired"
         except SunshineError as exc:
             code, text = exc.code, exc.text
@@ -2264,6 +2310,16 @@ class Server:
             code, text = S_FAILED, f"unexpected error: {exc}"
         self.log(f"sunshine pairing for {self._active_name or peer}: {text}")
         await self._send(writer, msg_sunshine_result(code, text))
+        if code == S_OK and before:
+            asyncio.ensure_future(loop.run_in_executor(None, lambda: self._tidy_records(link, stored_name, before)))
+
+    def _tidy_records(self, link, stored_name: str, before: Set[str]) -> None:
+        try:
+            removed = link.drop_older_records(stored_name, before)
+            if removed:
+                self.log(f"removed {removed} older pairing record(s) of {stored_name!r} from Sunshine, so the phone is stored exactly once")
+        except Exception as exc:   # tidying is a courtesy and must never matter
+            self.log(f"could not tidy Sunshine's pairing records: {exc}")
 
     @staticmethod
     async def _send(writer, frame: bytes) -> None:

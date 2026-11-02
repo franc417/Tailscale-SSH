@@ -33,6 +33,9 @@ class FakeSunshine:
         self.apps = [{"name": "Steam Big Picture"}]
         self.requests = []                      # (method, path, body)
         self.created_login = None
+        self.clients = []                       # [{"name", "uuid", "enabled"}] in Sunshine's order
+        self.add_client_on_pin = False          # a completed pairing adds a record, as Sunshine does a moment after the PIN
+        self.unpaired = []
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -72,6 +75,8 @@ class FakeSunshine:
                     self._send(200, {"pairings": list(fake.pending)})
                 elif self.path == "/api/apps":
                     self._send(200, {"env": {}, "apps": list(fake.apps)})
+                elif self.path == "/api/clients/list":
+                    self._send(200, {"named_certs": list(fake.clients)})
                 else:
                     self._send(404, {"error": "not found"})
 
@@ -88,7 +93,14 @@ class FakeSunshine:
                 if not self._authorized():
                     return
                 if self.path == "/api/pin":
+                    if fake.pin_result and fake.add_client_on_pin:
+                        fake.clients.append({"name": body["name"], "uuid": f"NEW{len(fake.clients)}", "enabled": True})
                     self._send(200, {"status": fake.pin_result})
+                elif self.path == "/api/clients/unpair":
+                    before = len(fake.clients)
+                    fake.clients = [c for c in fake.clients if c["uuid"] != body["uuid"]]
+                    fake.unpaired.append(body["uuid"])
+                    self._send(200, {"status": len(fake.clients) < before})
                 elif self.path == "/api/apps":
                     fake.apps.append({"name": body["name"]})
                     self._send(200, {"status": True})
@@ -503,3 +515,68 @@ def test_an_unauthenticated_connection_cannot_start_a_pairing(tmp_path, sunshine
             await settle()
             assert posts_to(sunshine, "/api/pin") == []
     asyncio.run(go())
+
+
+# ------------------------------------------------------------------ one record per phone
+
+def test_the_name_sunshine_stores_is_cleaned_the_same_way_everywhere():
+    assert mi.SunshineLink.clean_name("  Pixel 8 ") == "Pixel 8"
+    assert mi.SunshineLink.clean_name("") == "Mesh phone"
+    assert len(mi.SunshineLink.clean_name("x" * 500).encode()) <= 128
+
+
+def test_the_records_sunshine_holds_are_listed_with_their_names(tmp_path, sunshine):
+    sunshine.clients = [{"name": "A", "uuid": "1", "enabled": True}, {"name": "B", "uuid": "2", "enabled": True}]
+    assert link_for(tmp_path, sunshine).clients() == [("A", "1"), ("B", "2")]
+
+
+def test_an_unreachable_or_unconfigured_sunshine_lists_nothing_instead_of_failing(tmp_path, sunshine):
+    assert link_for(tmp_path, sunshine, with_login=False).clients() == []
+
+
+def test_after_a_new_pairing_the_older_records_of_that_phone_are_removed_and_other_phones_are_kept(tmp_path, sunshine):
+    sunshine.clients = [{"name": "25128RN17A", "uuid": "old1", "enabled": True}, {"name": "25128RN17A", "uuid": "old2", "enabled": True},
+                        {"name": "tablet", "uuid": "t", "enabled": True}]
+    link = link_for(tmp_path, sunshine)
+    sunshine.add_client_on_pin = True
+    sunshine.add_pending()
+    before = link.pair("1234", "25128RN17A", peer="127.0.0.1")
+    assert before == {"old1", "old2"}
+    assert link.drop_older_records("25128RN17A", before, wait=5) == 2
+    assert [(c["name"], c["uuid"]) for c in sunshine.clients] == [("tablet", "t"), ("25128RN17A", "NEW3")]
+    assert sorted(sunshine.unpaired) == ["old1", "old2"]
+
+
+def test_nothing_is_removed_when_the_new_record_never_appears(tmp_path, sunshine):
+    sunshine.clients = [{"name": "phone", "uuid": "old", "enabled": True}]
+    link = link_for(tmp_path, sunshine)
+    assert link.drop_older_records("phone", {"old"}, wait=0.2) == 0
+    assert sunshine.unpaired == [] and len(sunshine.clients) == 1
+
+
+def test_the_new_record_is_waited_for_when_it_appears_a_moment_later(tmp_path, sunshine):
+    sunshine.clients = [{"name": "phone", "uuid": "old", "enabled": True}]
+    link = link_for(tmp_path, sunshine)
+    threading.Timer(0.3, lambda: sunshine.clients.append({"name": "phone", "uuid": "fresh", "enabled": True})).start()
+    assert link.drop_older_records("phone", {"old"}, wait=5) == 1
+    assert [c["uuid"] for c in sunshine.clients] == ["fresh"]
+
+
+@needs_openssl
+def test_pairing_over_the_channel_removes_the_phone_s_older_duplicates_afterwards(tmp_path, sunshine):
+    sunshine.clients = [{"name": "phone", "uuid": "dup1", "enabled": True}, {"name": "phone", "uuid": "dup2", "enabled": True}]
+    sunshine.add_client_on_pin = True
+    sunshine.add_pending()
+
+    async def go():
+        async with running(tmp_path, sunshine=link_for(tmp_path, sunshine)) as (port, _inj, token, _fp):
+            c = await paired(port, token)
+            await c.send(mi.msg_sunshine_pair("1234", "phone"))
+            status, _text = await sunshine_result(c)
+            assert status == mi.S_OK
+            for _ in range(100):                      # the tidy-up runs just after the answer
+                if len(sunshine.clients) == 1:
+                    break
+                await asyncio.sleep(0.05)
+    asyncio.run(go())
+    assert [c["uuid"] for c in sunshine.clients] == ["NEW2"] and sorted(sunshine.unpaired) == ["dup1", "dup2"]
