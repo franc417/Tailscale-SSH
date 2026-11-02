@@ -64,6 +64,8 @@ class StreamActivity : Activity() {
     private lateinit var pinView: TextView
     private lateinit var openPinPage: TextView
     private lateinit var retryButton: TextView
+    private lateinit var copyDetailsButton: TextView
+    private var errorDetail: String = ""
     private lateinit var statusChip: TextView
     private lateinit var qualityChip: TextView
     private lateinit var controlBar: View
@@ -408,6 +410,11 @@ class StreamActivity : Activity() {
             host?.let { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://$it:47990/pin"))) }
         }
         retryButton = Ui.button(this, "Try again") { restart() }
+        copyDetailsButton = Ui.button(this, "Copy details") {
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+            clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Mesh error details", errorDetail))
+            Toast.makeText(this, "Copied. Paste it into the chat.", Toast.LENGTH_SHORT).show()
+        }
         messagePanel.addView(messageTitle)
         messagePanel.addView(Ui.gap(this, 8))
         messagePanel.addView(messageBody)
@@ -416,11 +423,15 @@ class StreamActivity : Activity() {
         messagePanel.addView(openPinPage)
         messagePanel.addView(Ui.gap(this, 8))
         messagePanel.addView(retryButton)
+        messagePanel.addView(Ui.gap(this, 8))
+        messagePanel.addView(copyDetailsButton)
         messagePanel.visibility = View.GONE
         return messagePanel
     }
 
-    private fun showMessage(title: String, body: String, pin: String? = null, retry: Boolean = false) {
+    private fun showMessage(title: String, body: String, pin: String? = null, retry: Boolean = false, detail: String = "") {
+        errorDetail = detail
+        copyDetailsButton.visibility = if (detail.isEmpty()) View.GONE else View.VISIBLE
         messageTitle.text = title
         messageBody.text = body
         messageBody.visibility = if (body.isEmpty()) View.GONE else View.VISIBLE
@@ -432,7 +443,7 @@ class StreamActivity : Activity() {
         setControlsExpanded(true)
     }
 
-    private fun showError(text: String) = showMessage("Could not show the desktop", text, retry = true)
+    private fun showError(text: String, detail: String = "") = showMessage("Could not show the desktop", text, retry = true, detail = detail)
 
     private fun hideMessage() {
         messagePanel.visibility = View.GONE
@@ -608,7 +619,7 @@ class StreamActivity : Activity() {
                     }
                     StreamClient.PairResult.WrongPin -> showError("The PIN was wrong. Try again and type the number shown.")
                     StreamClient.PairResult.AlreadyInProgress -> showError("Another device is pairing with ${computer.name} right now. Wait a minute and try again.")
-                    is StreamClient.PairResult.Failed -> showError("Pairing failed: ${result.reason}")
+                    is StreamClient.PairResult.Failed -> showError("Pairing failed: ${result.reason}", result.detail)
                 }
             }
         }, "mesh-pair").start()

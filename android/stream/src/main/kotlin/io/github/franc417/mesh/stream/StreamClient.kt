@@ -58,10 +58,16 @@ class StreamClient(context: Context) {
         data class Paired(val info: HostInfo) : PairResult()
         object WrongPin : PairResult()
         object AlreadyInProgress : PairResult()
-        data class Failed(val reason: String) : PairResult()
+        /** [detail] is the full stack trace plus what the app saw just before, for pasting back when "read timed out" is not enough to go on. */
+        data class Failed(val reason: String, val detail: String = "") : PairResult()
     }
 
     private fun tuple(host: String) = ComputerDetails.AddressTuple(host, NvHTTP.DEFAULT_HTTP_PORT)
+
+    /** Why the last check said "not paired" (the saved-certificate probe failed), kept for the pairing failure details. */
+    @Volatile
+    var lastProbeNote: String = ""
+        private set
 
     /** Asks the computer who it is and whether this phone is already paired with it. Throws when unreachable. */
     fun probe(host: String): HostInfo {
@@ -78,6 +84,7 @@ class StreamClient(context: Context) {
             HostInfo(d.name, d.uuid, d.pairState == PairingManager.PairState.PAIRED, d.httpsPort, d.runningGameId != 0)
         } catch (e: Exception) {
             LimeLog.info("StreamClient: pinned probe failed ($e), treating as not paired")
+            lastProbeNote = "The check with the saved certificate failed first: ${e.javaClass.simpleName}: ${e.message}"
             HostInfo(first.name, first.uuid, false, first.httpsPort, first.runningGameId != 0)
         }
     }
@@ -103,7 +110,11 @@ class StreamClient(context: Context) {
                 else -> PairResult.Failed("The computer refused to pair.")
             }
         } catch (e: Exception) {
-            PairResult.Failed(e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName)
+            val trace = java.io.StringWriter().also { e.printStackTrace(java.io.PrintWriter(it)) }.toString()
+            PairResult.Failed(
+                e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName,
+                listOf(lastProbeNote, trace).filter { it.isNotBlank() }.joinToString("\n\n"),
+            )
         }
     }
 

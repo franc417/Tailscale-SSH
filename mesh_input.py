@@ -2309,6 +2309,9 @@ class Server:
         except Exception as exc:   # a bug here must never take the input channel down
             code, text = S_FAILED, f"unexpected error: {exc}"
         self.log(f"sunshine pairing for {self._active_name or peer}: {text}")
+        if code == S_OK:
+            self.log(f"sunshine already stored {len(before)} record(s) for {stored_name!r} before this pairing"
+                     + (" (the phone was re-pairing although it was already stored, so its saved-certificate check failed)" if before else ""))
         await self._send(writer, msg_sunshine_result(code, text))
         if code == S_OK and before:
             asyncio.ensure_future(loop.run_in_executor(None, lambda: self._tidy_records(link, stored_name, before)))
@@ -2318,6 +2321,9 @@ class Server:
             removed = link.drop_older_records(stored_name, before)
             if removed:
                 self.log(f"removed {removed} older pairing record(s) of {stored_name!r} from Sunshine, so the phone is stored exactly once")
+            else:
+                self.log(f"no new pairing record of {stored_name!r} appeared in Sunshine within 20 s, so the phone did not finish pairing; "
+                         f"the {len(before)} older record(s) were left alone")
         except Exception as exc:   # tidying is a courtesy and must never matter
             self.log(f"could not tidy Sunshine's pairing records: {exc}")
 
