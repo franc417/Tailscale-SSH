@@ -30,6 +30,7 @@ Commands:
   python3 mesh_input.py sunshine-unpair-all  forget every paired phone in Sunshine (cures "Client certificate identity is not enabled")
   python3 mesh_input.py screen-phone         phone-shaped virtual screen on, Sunshine pointed at it (--size 1600x720)
   python3 mesh_input.py screen-normal        the real screen and Sunshine's own settings back
+  python3 mesh_input.py screen-status        one paste with everything about the phone-screen setup (monitor, Sunshine, pairing, log)
   python3 mesh_input.py spike-virtual-monitor  try creating a virtual monitor and report what GNOME did (--seconds N holds it open)
   python3 mesh_input.py run [--port N]       serve (needs /dev/uinput access)
   python3 mesh_input.py install-service      start at every login and restart on failure (systemd user service)
@@ -2103,6 +2104,73 @@ def screen_normal(tools: Optional[ProcessTools] = None, progress: Callable[[str]
     return 0, "\n".join(steps)
 
 
+def screen_status(tools: Optional[ProcessTools] = None, monitors_text: Optional[str] = None, read_file=None) -> str:
+    """`screen-status`: everything about the phone-screen setup in one paste: is the virtual monitor alive, how Sunshine is set up,
+    the saved approvals, who is paired and what Sunshine's latest start/launch said."""
+    tools = tools or ProcessTools()
+    if read_file is None:
+        def read_file(path: str) -> str:
+            with open(path, errors="replace") as f:
+                return f.read()
+    config_dir = sunshine_config_dir(tools.environ)
+    lines = ["Mesh phone-screen status (paste all of this):", ""]
+
+    _script, holder_log, pid_file = tools.holder_files()
+    try:
+        pid = int(read_file(pid_file).strip())
+        alive = "holder.mjs" in tools.read_cmdline(pid)
+        lines.append(f"virtual monitor holder: {'running (pid ' + str(pid) + ')' if alive else 'NOT running (it was started, but is gone)'}")
+    except (OSError, ValueError):
+        lines.append("virtual monitor holder: never started (screen-phone has not been run, or screen-normal removed it)")
+    try:
+        held = [l for l in read_file(holder_log).splitlines() if l.strip()][-4:]
+        lines += ["  holder log: " + l for l in held]
+    except OSError:
+        pass
+
+    if monitors_text is None:
+        monitors_text = display_info()
+    section: List[str] = []
+    capturing = False
+    for line in monitors_text.splitlines():
+        if line.startswith("[GNOME monitors]"):
+            capturing = True
+            continue
+        if capturing and (not line.strip() or line.startswith("[")):
+            break
+        if capturing:
+            section.append(line)
+    lines += ["", "monitors GNOME has right now:"] + (["  " + l for l in section[:6]] if section else ["  (could not read them)"])
+
+    try:
+        conf = read_file(os.path.join(config_dir, "sunshine.conf"))
+    except OSError:
+        conf = ""
+    lines += ["", f"sunshine running: {'yes' if tools.sunshine_running() else 'NO'}",
+              f"sunshine settings: capture = {current_config_value(conf, 'capture') or '(automatic)'}, "
+              f"output_name = {current_config_value(conf, 'output_name') or '(automatic)'}, encoder = {current_config_value(conf, 'encoder') or '(automatic)'}"]
+    present = [name for name in ("portal_token", "portal_token.mesh-phone", "portal_token.mesh-normal", "portal_token.old", "sunshine.conf.mesh-normal")
+               if os.path.exists(os.path.join(config_dir, name))]
+    lines.append("saved files: " + (", ".join(present) if present else "none"))
+    lines.append(f"mesh agent running: {'yes' if tools.agent_running() else 'NO (the phone cannot pair without it)'}")
+
+    try:
+        lines += [""] + paired_devices_summary(read_file(os.path.join(config_dir, "sunshine_state.json")))
+    except OSError:
+        lines += ["", "no sunshine_state.json (nothing is paired)"]
+
+    wanted = re.compile(r"(?i)portal|pipewire|token|fatal|error|warn|session|client|launch|encoder|capture|monitor|display|ssl")
+    try:
+        text = read_file(os.path.join(config_dir, SUNSHINE_LOG_NAME))
+        marker = "--- started by mesh_input.py"
+        text = text[text.rfind(marker):] if marker in text else text
+        recent = [l.strip() for l in text.splitlines() if wanted.search(l) and not _SUNSHINE_LOG_NOISE.search(l) and "--- started" not in l][-25:]
+    except OSError:
+        recent = []
+    lines += ["", "what Sunshine's log says since it was last started by these commands:"] + (["  " + l for l in recent] or ["  (nothing: it was started some other way)"])
+    return "\n".join(lines)
+
+
 def sunshine_unpair_all(tools: Optional[ProcessTools] = None, progress: Callable[[str], None] = lambda s: None) -> Tuple[int, str]:
     """`sunshine-unpair-all`: forget every paired phone, so the next pairing is the only record (the cure for a phone Sunshine refuses)."""
     tools = tools or ProcessTools()
@@ -2426,7 +2494,7 @@ def uninstall_service(target_dir: Optional[str] = None, runner=subprocess.run) -
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Mesh input channel (host side)")
-    ap.add_argument("command", choices=["init", "pair-info", "run", "reset-token", "install-service", "uninstall-service", "sunshine-login", "display-info", "diagnose", "encoder-bench", "spike-virtual-monitor", "screen-phone", "screen-normal", "sunshine-unpair-all"])
+    ap.add_argument("command", choices=["init", "pair-info", "run", "reset-token", "install-service", "uninstall-service", "sunshine-login", "display-info", "diagnose", "encoder-bench", "spike-virtual-monitor", "screen-phone", "screen-normal", "sunshine-unpair-all", "screen-status"])
     ap.add_argument("--dir", default=default_dir())
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--dry-run", action="store_true", help="record events instead of injecting them")
@@ -2441,6 +2509,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.command in ("display-info", "diagnose"):
         print(display_info())
+        return 0
+
+    if args.command == "screen-status":
+        print(screen_status())
         return 0
 
     if args.command in ("screen-phone", "screen-normal", "sunshine-unpair-all"):

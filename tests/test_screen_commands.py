@@ -337,3 +337,59 @@ def test_unpair_all_also_warns_about_a_missing_agent(world):
     pc = Computer(str(world), agent_running=False)
     code, text = mi.sunshine_unpair_all(pc.tools())
     assert code == 0 and "WARNING: the Mesh agent is not running" in text
+
+
+# ------------------------------------------------------------------ screen-status
+
+MONITORS_TEXT = """Mesh diagnostics:
+
+[GNOME monitors]
+monitor eDP-1 (IVO): now 1920x1080 at 60.01 Hz
+monitor Meta-0 (MetaVendor): now 1920x864 at 60.00 Hz
+logical monitor at (0, 0) scale 1.0, primary
+
+[sunshine version]
+x
+"""
+
+
+def test_the_status_says_the_monitor_holder_is_gone_when_its_process_is_gone(world, tmp_path):
+    pc = Computer(str(world))
+    pc.sunshine_running = False
+    holder_dir = tmp_path / "agent" / "phone-screen"
+    holder_dir.mkdir(parents=True)
+    (holder_dir / "holder.pid").write_text("777")
+    (holder_dir / "holder.log").write_text("GNOME accepted\nnew monitor(s): Meta-0 1920x864@60.00 at (1920,0)\n")
+    tools = pc.tools()
+    tools.read_cmdline = lambda pid: ""                       # the process no longer exists
+    text = mi.screen_status(tools, monitors_text=MONITORS_TEXT)
+    assert "virtual monitor holder: NOT running" in text and "holder log: new monitor(s): Meta-0" in text
+    assert "sunshine running: NO" in text
+
+
+def test_the_status_lists_monitors_settings_saved_files_pairing_and_the_log(world, tmp_path):
+    (world / "sunshine.conf").write_text("encoder = vaapi\ncapture = portal\noutput_name = Meta-0\n")
+    (world / "portal_token").write_text("t")
+    (world / "portal_token.mesh-normal").write_text("n")
+    (world / "sunshine_state.json").write_text(json.dumps({"root": {"named_devices": [{"name": "25128RN17A", "cert": "X", "uuid": "abcdefgh"}]}}))
+    (world / mi.SUNSHINE_LOG_NAME).write_text("--- started by mesh_input.py at x ---\n[x]: Info: [wayland] Found interface: wl_output\n"
+                                              "[x]: Error: [portalgrab] RemoteDesktop Start: no streams in response\n[x]: Info: CLIENT CONNECTED\n")
+    holder_dir = tmp_path / "agent" / "phone-screen"
+    holder_dir.mkdir(parents=True)
+    (holder_dir / "holder.pid").write_text("777")
+    pc = Computer(str(world))
+    text = mi.screen_status(pc.tools(), monitors_text=MONITORS_TEXT)
+    assert "virtual monitor holder: running (pid 777)" in text
+    assert "monitor Meta-0 (MetaVendor): now 1920x864" in text and "logical monitor" in text
+    assert "capture = portal, output_name = Meta-0, encoder = vaapi" in text
+    assert "saved files: portal_token, portal_token.mesh-normal" in text
+    assert "mesh agent running: yes" in text and "1 paired device record(s)" in text and "name='25128RN17A'" in text
+    assert "RemoteDesktop Start: no streams in response" in text and "CLIENT CONNECTED" in text and "Found interface" not in text
+
+
+def test_the_status_works_on_a_machine_where_nothing_was_ever_set_up(world):
+    pc = Computer(str(world))
+    pc.sunshine_running = False
+    pc.agent_running = False
+    text = mi.screen_status(pc.tools(), monitors_text="[GNOME monitors]\nmonitor eDP-1 (IVO): now 1920x1080 at 60.01 Hz\n")
+    assert "never started" in text and "mesh agent running: NO" in text and "no sunshine_state.json" in text and "monitor eDP-1" in text
