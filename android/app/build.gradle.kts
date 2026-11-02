@@ -15,6 +15,20 @@ android {
         versionName = "0.1.0"
     }
 
+    signingConfigs {
+        getByName("debug") {
+            // One fixed key for every debug build. The CI machine is new for every run, so without this each build was signed with a
+            // different random key; Android then refuses to install it over the previous one, the old app has to be uninstalled first,
+            // and uninstalling erases the app's data: the phone's pairing identity (its certificate) and the saved computers. With a
+            // fixed key a new build installs over the old one and keeps both. This is a debug key with the standard debug passwords:
+            // it is not a secret and must never be used for a release build.
+            storeFile = file("mesh-debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
