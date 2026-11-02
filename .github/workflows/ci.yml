@@ -132,7 +132,7 @@ jobs:
           fi
           apk=$(ls android/app/build/outputs/apk/debug/*.apk | head -1)
           got=$("$apksigner" verify --print-certs "$apk" | grep -m1 "certificate SHA-256 digest" | sed 's/.*: *//' | tr -d ':' | tr 'A-Z' 'a-z')
-          want=$(keytool -list -keystore android/app/mesh-debug.keystore -storepass android | grep -m1 "SHA-256" | sed 's/.*: *//' | tr -d ':' | tr 'A-Z' 'a-z')
+          want=$(keytool -list -keystore android/app/mesh-debug.keystore -storepass android | grep -m1 "SHA-256" | awk '{print $NF}' | tr -d ':' | tr 'A-Z' 'a-z')
           echo "::notice title=apk signing::APK signed with ${got}; fixed debug key is ${want}"
           [ -n "$got" ] && [ "$got" = "$want" ] || { echo "::error title=apk signing::the APK is not signed with the fixed debug key (${got} vs ${want})"; exit 1; }
 
