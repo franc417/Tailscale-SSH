@@ -122,6 +122,20 @@ jobs:
             fi
           done
           echo "::notice title=native core::libmoonlight-core.so is present for arm64-v8a and armeabi-v7a"
+      - name: Check the APK is signed with the fixed debug key
+        if: success()
+        run: |
+          apksigner=$(ls "${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"/build-tools/*/apksigner 2>/dev/null | tail -1)
+          if [ -z "$apksigner" ]; then
+            echo "::notice title=apk signing::apksigner not found on this runner, signing key not compared"
+            exit 0
+          fi
+          apk=$(ls android/app/build/outputs/apk/debug/*.apk | head -1)
+          got=$("$apksigner" verify --print-certs "$apk" | grep -m1 "certificate SHA-256 digest" | sed 's/.*: *//' | tr -d ':' | tr 'A-Z' 'a-z')
+          want=$(keytool -list -keystore android/app/mesh-debug.keystore -storepass android | grep -m1 "SHA-256" | sed 's/.*: *//' | tr -d ':' | tr 'A-Z' 'a-z')
+          echo "::notice title=apk signing::APK signed with ${got}; fixed debug key is ${want}"
+          [ -n "$got" ] && [ "$got" = "$want" ] || { echo "::error title=apk signing::the APK is not signed with the fixed debug key (${got} vs ${want})"; exit 1; }
+
       - name: Upload the APK
         if: success()
         uses: actions/upload-artifact@v4
