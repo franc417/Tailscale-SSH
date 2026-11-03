@@ -30,7 +30,7 @@ class Computer:
 
     def __init__(self, config_dir, sunshine_running=True, service=False, holder_log="new monitor(s): Meta-0 1600x720@60.00 at (1920,0)\n",
                  holder_exits=False, sunshine_log="[x]: Info: Configuration UI available at [https://localhost:47990]\n",
-                 sunshine_refuses_to_die=False, port_owner="", fail_with_token=None, agent_running=True):
+                 sunshine_refuses_to_die=False, port_owner="", fail_with_token=None, agent_running=True, https_ok=True):
         self.config_dir, self.sunshine_running, self.service = config_dir, sunshine_running, service
         self.holder_log, self.holder_exits, self.sunshine_log, self.refuses = holder_log, holder_exits, sunshine_log, sunshine_refuses_to_die
         self.events, self.now, self.kills = [], 0.0, []
@@ -38,6 +38,7 @@ class Computer:
         self.port_owner = port_owner
         self.fail_with_token = fail_with_token
         self.agent_running = agent_running
+        self.https_ok = https_ok
 
     # time
     def clock(self):
@@ -95,7 +96,8 @@ class Computer:
     def tools(self):
         return mi.ProcessTools(runner=self.runner, popen=self.popen, which=lambda n: "/usr/bin/" + n, sleep=self.sleep, clock=self.clock,
                                environ={"XDG_CONFIG_HOME": os.path.dirname(self.config_dir), "XDG_RUNTIME_DIR": "/nonexistent"}, kill=self.kill,
-                               read_cmdline=lambda pid: "gjs -m /x/phone-screen/holder.mjs 1600 720 86400")
+                               read_cmdline=lambda pid: "gjs -m /x/phone-screen/holder.mjs 1600 720 86400",
+                               https_probe=lambda: (self.https_ok, "the secure port 47984 answers" if self.https_ok else "the secure port 47984 accepts connections but never answers"))
 
 
 @pytest.fixture
@@ -393,3 +395,53 @@ def test_the_status_works_on_a_machine_where_nothing_was_ever_set_up(world):
     pc.agent_running = False
     text = mi.screen_status(pc.tools(), monitors_text="[GNOME monitors]\nmonitor eDP-1 (IVO): now 1920x1080 at 60.01 Hz\n")
     assert "never started" in text and "mesh agent running: NO" in text and "no sunshine_state.json" in text and "monitor eDP-1" in text
+
+
+# ------------------------------------------------------------------ the secure port must answer
+
+def test_screen_phone_reports_a_sunshine_whose_secure_port_never_answers_as_stuck(world):
+    pc = Computer(str(world), https_ok=False)
+    shown = []
+    code, text = mi.screen_phone("1920x864", pc.tools(), progress=shown.append)
+    assert code == 1 and "PROBLEM: the secure port 47984 accepts connections but never answers" in text
+    assert "waiting for GNOME's screen-share window" in text and "screen-normal" in text
+    assert any("which screen to share" in line for line in shown)
+
+
+def test_screen_phone_waits_for_the_share_button_and_then_succeeds(world):
+    pc = Computer(str(world))
+    answers = iter([(False, "no"), (False, "no"), (True, "the secure port 47984 answers")])
+    tools = pc.tools()
+    tools.https_probe = lambda: next(answers)
+    code, text = mi.screen_phone("1920x864", tools)
+    assert code == 0 and "Secure port: the secure port 47984 answers" in text
+
+
+def test_screen_normal_flags_a_secure_port_that_does_not_answer(world):
+    pc = Computer(str(world), https_ok=False)
+    code, text = mi.screen_normal(pc.tools())
+    assert code == 1 and "PROBLEM:" in text and "python3 mesh_input.py diagnose" in text
+
+
+def test_the_status_shows_whether_the_secure_port_answers(world):
+    pc = Computer(str(world), https_ok=False)
+    assert "sunshine secure port (the phone's pairing check and launch use it): NOT ANSWERING" in mi.screen_status(pc.tools(), monitors_text="")
+    pc2 = Computer(str(world))
+    assert ": OK:" in mi.screen_status(pc2.tools(), monitors_text="")
+
+
+def test_the_real_probe_calls_a_port_that_accepts_but_never_answers_stuck_and_a_closed_port_unreachable():
+    import socket
+    import threading
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(5)
+    port = server.getsockname()[1]
+    held = []
+    threading.Thread(target=lambda: held.append(server.accept()[0]), daemon=True).start()
+    tools = mi.ProcessTools()
+    ok, text = tools.sunshine_https_answers("127.0.0.1", port, timeout=0.6)
+    assert not ok and "never answers" in text
+    server.close()
+    ok, text = tools.sunshine_https_answers("127.0.0.1", port, timeout=0.6)
+    assert not ok and "not reachable" in text

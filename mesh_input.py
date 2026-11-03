@@ -1811,9 +1811,10 @@ class ProcessTools:
     """The few ways these commands touch running programs, in one place so tests can replace them."""
 
     def __init__(self, runner=subprocess.run, popen=subprocess.Popen, which=shutil.which, sleep=time.sleep, clock=time.monotonic,
-                 environ=os.environ, kill=os.kill, read_cmdline=None):
+                 environ=os.environ, kill=os.kill, read_cmdline=None, https_probe=None):
         self.runner, self.popen, self.which, self.sleep, self.clock, self.environ, self.kill = runner, popen, which, sleep, clock, environ, kill
         self.read_cmdline = read_cmdline or self._proc_cmdline
+        self.https_probe = https_probe
 
     @staticmethod
     def _proc_cmdline(pid: int) -> str:
@@ -1854,6 +1855,46 @@ class ProcessTools:
                 raise RuntimeError("Sunshine would not stop (try: pkill -9 sunshine)")
             return "Sunshine had to be force-stopped"
         return "stopped the running Sunshine"
+
+    def sunshine_https_answers(self, host: str = "127.0.0.1", port: int = 47984, timeout: float = 4.0) -> Tuple[bool, str]:
+        """Whether Sunshine's secure web port (the one the phone uses for the last pairing step, the check "am I paired" and the launch)
+        completes a TLS handshake. When Sunshine is stuck inside a handler (for example waiting for GNOME's screen-share window) it
+        still accepts connections but never answers them: the phone then reports "read timed out". Sunshine insisting on a client
+        certificate also counts as an answer."""
+        if self.https_probe is not None:
+            return self.https_probe()
+        import socket
+        import ssl
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        try:
+            with socket.create_connection((host, port), timeout=timeout) as raw:
+                with context.wrap_socket(raw, server_hostname="localhost"):
+                    return True, f"the secure port {port} answers"
+        except ssl.SSLError as exc:
+            if "timed out" in str(exc).lower():
+                return False, f"the secure port {port} accepts connections but never answers"
+            return True, f"the secure port {port} answers (it wants a client certificate)"
+        except socket.timeout:
+            return False, f"the secure port {port} accepts connections but never answers"
+        except OSError as exc:
+            return False, f"the secure port {port} is not reachable ({exc})"
+
+    def wait_for_https(self, seconds: float, progress: Callable[[str], None] = lambda s: None) -> Tuple[bool, str]:
+        """Waits for the secure port to answer (a person may still have to press Share in a GNOME window)."""
+        deadline = self.clock() + seconds
+        first = True
+        while True:
+            ok, text = self.sunshine_https_answers()
+            if ok:
+                return True, text
+            if first:
+                progress("Sunshine is waiting for something. Look for a GNOME window on the laptop screen asking which screen to share, and press Share ...")
+                first = False
+            if self.clock() >= deadline:
+                return False, text
+            self.sleep(2.0)
 
     def agent_running(self) -> bool:
         """Whether the Mesh agent (`mesh_input.py run`, by hand or as the service) is running: automatic pairing needs it."""
@@ -2035,6 +2076,14 @@ def screen_phone(size: str, tools: Optional[ProcessTools] = None, progress: Call
             asks = True
             progress("A GNOME window will ask which screen to share: choose the MetaVendor one (the virtual screen) and press Share ...")
         steps.append(("Sunshine is ready" if ready else "Sunshine did NOT start") + f": {line}")
+        if ready:
+            answers, why = tools.wait_for_https(45.0, progress)
+            steps.append(("Secure port: " if answers else "PROBLEM: ") + why)
+            if not answers:
+                ready = False
+                line = ("Sunshine started but is stuck: it is almost certainly waiting for GNOME's screen-share window. Press Share in it, "
+                        "or run screen-normal to give up on the phone screen.")
+                steps.append(line)
         if ready and os.path.exists(token):
             shutil.copy2(token, phone_token)
         if not ready:
@@ -2096,6 +2145,11 @@ def screen_normal(tools: Optional[ProcessTools] = None, progress: Callable[[str]
         steps.append(tools.start_sunshine(config_dir))
         ready, line = tools.wait_for_sunshine(config_dir, 25.0, progress)
         steps.append(("Sunshine is ready" if ready else "Sunshine did NOT start") + f": {line}")
+        if ready:
+            answers, why = tools.wait_for_https(15.0, progress)
+            steps.append(("Secure port: " if answers else "PROBLEM: ") + why)
+            if not answers:
+                ready = False
         if not ready:
             steps.append("If this keeps failing, run: python3 mesh_input.py diagnose   and paste it (it shows Sunshine's log and settings).")
             return 1, "\n".join(steps)
@@ -2149,6 +2203,8 @@ def screen_status(tools: Optional[ProcessTools] = None, monitors_text: Optional[
     lines += ["", f"sunshine running: {'yes' if tools.sunshine_running() else 'NO'}",
               f"sunshine settings: capture = {current_config_value(conf, 'capture') or '(automatic)'}, "
               f"output_name = {current_config_value(conf, 'output_name') or '(automatic)'}, encoder = {current_config_value(conf, 'encoder') or '(automatic)'}"]
+    answers, why = tools.sunshine_https_answers() if tools.sunshine_running() else (False, "Sunshine is not running")
+    lines.append(f"sunshine secure port (the phone's pairing check and launch use it): {'OK' if answers else 'NOT ANSWERING'}: {why}")
     present = [name for name in ("portal_token", "portal_token.mesh-phone", "portal_token.mesh-normal", "portal_token.old", "sunshine.conf.mesh-normal")
                if os.path.exists(os.path.join(config_dir, name))]
     lines.append("saved files: " + (", ".join(present) if present else "none"))
