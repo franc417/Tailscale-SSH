@@ -696,7 +696,7 @@ class StreamActivity : Activity() {
         if (!paired || !surfaceReady || session != null) return
         fitSurface()
         showMessage("Starting the stream", "")
-        session = streamClient.start(h, settings, surfaceView.holder.surface, Events(generation))
+        session = streamClient.start(h, settings, surfaceView.holder.surface, Events(generation), AudioPrefs.onComputer(this))
     }
 
     private fun stopStream() {

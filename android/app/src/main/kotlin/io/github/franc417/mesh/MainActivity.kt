@@ -9,6 +9,8 @@ import android.view.ViewGroup
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.TextView
+import io.github.franc417.mesh.core.AudioChoice
 
 /**
  * Your computers. Each card opens the desktop view, the input-only screen, or the edit screen; "Add desktop" adds one.
@@ -56,6 +58,19 @@ class MainActivity : Activity() {
         column.addView(Ui.button(this, "+  Add desktop") {
             startActivity(Intent(this, ComputerFormActivity::class.java))
         })
+        column.addView(Ui.gap(this, 16))
+        // Where the sound comes out, chosen before opening a desktop (the computer by default).
+        val audioHelp = Ui.text(this, AudioChoice.explanation(AudioPrefs.onComputer(this)), 12f, Ui.MUTED)
+        lateinit var audioButton: TextView
+        audioButton = Ui.button(this, AudioChoice.buttonLabel(AudioPrefs.onComputer(this))) {
+            val now = !AudioPrefs.onComputer(this)
+            AudioPrefs.setOnComputer(this, now)
+            audioButton.text = AudioChoice.buttonLabel(now)
+            audioHelp.text = AudioChoice.explanation(now)
+        }
+        column.addView(audioButton)
+        column.addView(Ui.gap(this, 6))
+        column.addView(audioHelp)
         column.addView(Ui.gap(this, 16))
 
         listBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }

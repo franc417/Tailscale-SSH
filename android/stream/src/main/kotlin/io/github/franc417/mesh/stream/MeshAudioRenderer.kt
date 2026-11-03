@@ -17,8 +17,11 @@ import com.limelight.nvstream.jni.MoonBridge
  * (a 10 ms buffer in low-latency mode) this one starts with a steadier 40 ms buffer in normal mode and grows it by
  * 20 ms every time it ran dry (see [AudioBufferPolicy]): a dry buffer is the occasional scratch, and on a phone that is
  * also busy decoding video it happens. The thread that feeds it runs at audio priority.
+ *
+ * When [muted] (the sound is meant to come out of the computer) nothing is opened or played: the stream is still received
+ * and decoded by the streaming core, the samples are simply dropped, and the phone stays silent.
  */
-class MeshAudioRenderer : AudioRenderer {
+class MeshAudioRenderer(private val muted: Boolean = false) : AudioRenderer {
     private var track: AudioTrack? = null
     private var sampleRate = 48_000
     private var samplesPerPacket = 240
@@ -35,6 +38,10 @@ class MeshAudioRenderer : AudioRenderer {
     @Volatile var underruns = 0; private set
 
     override fun setup(audioConfiguration: MoonBridge.AudioConfiguration, sampleRate: Int, samplesPerFrame: Int): Int {
+        if (muted) {
+            LimeLog.info("MeshAudioRenderer: muted, the sound plays on the computer")
+            return 0
+        }
         if (audioConfiguration.channelCount != 2) {
             LimeLog.severe("MeshAudioRenderer: only stereo is supported, got ${audioConfiguration.channelCount} channels")
             return -1

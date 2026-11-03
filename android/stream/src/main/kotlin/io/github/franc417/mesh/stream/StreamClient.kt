@@ -118,9 +118,14 @@ class StreamClient(context: Context) {
         }
     }
 
-    /** Starts streaming the computer's desktop onto [surface]. Returns at once; progress arrives through [events]. */
-    fun start(host: String, settings: StreamSettings, surface: Surface, events: StreamEvents): StreamSession {
-        val session = StreamSession(appContext, this, host, settings, surface, events)
+    /**
+     * Starts streaming the computer's desktop onto [surface]. Returns at once; progress arrives through [events].
+     * [audioOnComputer]: the sound keeps playing on the computer (Sunshine does not switch its default output to the stream, so
+     * a song already playing is not moved or paused when the desktop is opened or closed) and the phone stays silent; when false
+     * the sound is taken off the computer and plays on the phone.
+     */
+    fun start(host: String, settings: StreamSettings, surface: Surface, events: StreamEvents, audioOnComputer: Boolean = true): StreamSession {
+        val session = StreamSession(appContext, this, host, settings, surface, events, audioOnComputer)
         session.begin()
         return session
     }
@@ -138,6 +143,7 @@ class StreamSession internal constructor(
     private val settings: StreamSettings,
     private val surface: Surface,
     private val events: StreamEvents,
+    private val audioOnComputer: Boolean = true,
 ) {
     @Volatile private var stopped = false
     private val startedAt = SystemClock.uptimeMillis()
@@ -159,7 +165,7 @@ class StreamSession internal constructor(
             }
         },
     )
-    private val audio = MeshAudioRenderer()
+    private val audio = MeshAudioRenderer(muted = audioOnComputer)
 
     private var lastDiagnosticsAt = SystemClock.uptimeMillis()
 
@@ -250,7 +256,7 @@ class StreamSession internal constructor(
                 .setClientRefreshRateX100(settings.fps * 100)
                 .setBitrate(settings.bitrateKbps)
                 .setEnableSops(false) // that is for games; the desktop should stream at exactly the size asked for
-                .enableLocalAudioPlayback(false)
+                .enableLocalAudioPlayback(audioOnComputer) // Moonlight's "play audio on the host PC": sent to Sunshine as localAudioPlayMode
                 .setMaxPacketSize(1392)
                 .setRemoteConfiguration(StreamConfiguration.STREAM_CFG_AUTO)
                 .setAudioConfiguration(MoonBridge.AUDIO_CONFIGURATION_STEREO)
