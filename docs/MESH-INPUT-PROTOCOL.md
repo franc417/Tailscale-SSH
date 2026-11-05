@@ -21,6 +21,15 @@ An input channel is full control of the computer, so it authenticates in two way
   stop at 1.2).
 - **Pairing token.** A random 32-byte token, sent inside the encrypted channel in `HELLO` and compared in
   constant time. A wrong token is answered after a one second pause and the connection is closed.
+- **Trust through Tailscale (no token needed).** A phone that connects from a Tailscale address AND is signed in to the same
+  Tailscale account as the computer is one of the owner's own devices, so `HELLO` may carry an empty token. The agent asks
+  Tailscale (`tailscale whois --json <address>`, read-only) who the address belongs to and compares the account with its own
+  (`tailscale status --json`). Not trusted: devices of other accounts (shared in), tagged devices (servers), anything arriving
+  over the local network, and any case where Tailscale is not running. The answer is cached for 30 seconds; revocation is checked
+  every time: put a device's name on its own line in `~/.config/mesh/agent/denied-devices`. Turn the whole thing off with
+  `python3 mesh_input.py run --no-tailnet-trust`. The token still works exactly as before, so older phones keep working, and a
+  phone with a stale token but the right account still gets in. TLS still protects the channel; the phone learns the agent's
+  certificate fingerprint on its first connection and pins it from then on (trust on first use, over the authenticated tailnet).
 - **One phone at a time.** A newly authenticated phone replaces the old one, which is told `E_REPLACED`.
 - **No stuck keys.** Everything the phone had pressed is released when it disconnects, is replaced, or goes
   quiet for 15 seconds.
@@ -64,7 +73,7 @@ older agent. Key names are listed in `KEY_CODES` in `mesh_input.py`; unknown nam
 
 | Type | Name | Payload |
 |---|---|---|
-| 0x81 | HELLO_OK | `u8 version` `u8 features` (1 text, 2 hi-res scroll, 4 Sunshine pairing, 8 absolute pointer) `u8 n` `host name[n]` |
+| 0x81 | HELLO_OK | `u8 version` `u8 features` (1 text, 2 hi-res scroll, 4 Sunshine pairing, 8 absolute pointer, 16 this phone was let in by Tailscale trust) `u8 n` `host name[n]` |
 | 0x82 | ERROR | `u8 code` `u8 n` `text[n]`, then the connection closes |
 | 0x87 | PONG | `u32 id` |
 | 0x8A | SUNSHINE_RESULT | `u8 status` `u8 n` `text[n]` (a sentence for a person) |

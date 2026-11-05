@@ -44,6 +44,7 @@ import fcntl
 import getpass
 import hashlib
 import hmac
+import ipaddress
 import json
 import math
 import os
@@ -98,6 +99,7 @@ FEATURE_TEXT = 0x01
 FEATURE_HIRES_SCROLL = 0x02
 FEATURE_SUNSHINE_PAIR = 0x04
 FEATURE_ABS_POINTER = 0x08   # this computer can place the pointer at an exact spot (T_MOVE_ABS)
+FEATURE_TAILNET_TRUST = 0x10  # THIS phone was let in because it is signed in to the same Tailscale account (no token was needed)
 
 # T_SUNSHINE_RESULT status codes
 S_OK = 0                # the phone is paired with Sunshine
@@ -2299,11 +2301,123 @@ def sunshine_login(directory: str, url: Optional[str] = None, username: Optional
 
 # ---------------------------------------------------------------- server
 
+# ---------------------------------------------------------------- trust through Tailscale
+#
+# A phone that connects from a Tailscale address AND is signed in to the same Tailscale account as this computer is one of the
+# owner's own devices, so it does not need the pairing token. Tailscale itself proves who the other end is: the connection can
+# only come from that device's WireGuard key, and `tailscale whois` names the account it belongs to. Devices that belong to other
+# accounts (shared in), tagged devices (servers), and anything arriving over the local network still need the token.
+
+_TAILNET_V4 = ipaddress.ip_network("100.64.0.0/10")
+_TAILNET_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+DENIED_DEVICES_FILE = "denied-devices"        # one device name per line, in the agent's directory
+
+
+def is_tailnet_address(address: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(_normalize_address(address))
+    except ValueError:
+        return False
+    return ip in (_TAILNET_V4 if ip.version == 4 else _TAILNET_V6)
+
+
+def short_device_name(full: str) -> str:
+    """`pixel-7.tail1234.ts.net.` -> `pixel-7`."""
+    return (full or "").strip().rstrip(".").split(".")[0]
+
+
+class TailnetTrust:
+    """Answers: is this address one of my owner's own Tailscale devices? Everything it runs is read-only and cached."""
+
+    def __init__(self, directory: str = "", runner=subprocess.run, which=shutil.which, clock=time.monotonic, ttl: float = 30.0,
+                 read_denied: Optional[Callable[[], set]] = None) -> None:
+        self.runner, self.which, self.clock, self.ttl = runner, which, clock, ttl
+        self._cache: Dict[str, Tuple[float, Tuple[bool, str, str]]] = {}
+        self._self_identity: Optional[Tuple[int, str]] = None
+        self._read_denied = read_denied or (lambda: self._denied_from_file(directory))
+
+    @staticmethod
+    def _denied_from_file(directory: str) -> set:
+        try:
+            with open(os.path.join(directory, DENIED_DEVICES_FILE)) as f:
+                return {line.strip().lower() for line in f if line.strip() and not line.lstrip().startswith("#")}
+        except OSError:
+            return set()
+
+    def _json(self, args: List[str]) -> Optional[dict]:
+        if self.which("tailscale") is None:
+            return None
+        try:
+            done = self.runner(["tailscale", *args], capture_output=True, text=True, timeout=6)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if done.returncode != 0:
+            return None
+        try:
+            data = json.loads(done.stdout)
+        except ValueError:
+            return None
+        return data if isinstance(data, dict) else None
+
+    def own_identity(self) -> Optional[Tuple[int, str]]:
+        """(Tailscale user id, login name) of the account this computer is signed in to, or None when Tailscale is not running."""
+        if self._self_identity is not None:
+            return self._self_identity
+        status = self._json(["status", "--json"])
+        if not status or status.get("BackendState") not in (None, "Running"):
+            return None
+        user_id = (status.get("Self") or {}).get("UserID")
+        if not isinstance(user_id, int) or user_id <= 0:
+            return None
+        login = ((status.get("User") or {}).get(str(user_id)) or {}).get("LoginName") or ""
+        self._self_identity = (user_id, str(login))
+        return self._self_identity
+
+    def check(self, address: str) -> Tuple[bool, str, str]:
+        """(trusted, device name, a sentence saying why or why not)."""
+        key = _normalize_address(address)
+        now = self.clock()
+        cached = self._cache.get(key)
+        if cached and now - cached[0] < self.ttl:
+            device, reason = cached[1][1], cached[1][2]
+            verdict = cached[1][0]
+        else:
+            verdict, device, reason = self._decide(key)
+            self._cache[key] = (now, (verdict, device, reason))
+        if verdict and device.lower() in self._read_denied():      # revocation is checked every time, never cached
+            return False, device, f"{device} was revoked (it is listed in {DENIED_DEVICES_FILE})"
+        return verdict, device, reason
+
+    def _decide(self, address: str) -> Tuple[bool, str, str]:
+        if not is_tailnet_address(address):
+            return False, "", "not a Tailscale address"
+        own = self.own_identity()
+        if own is None:
+            return False, "", "Tailscale is not running on this computer, so it cannot tell who is connecting"
+        who = self._json(["whois", "--json", address])
+        if not who:
+            return False, "", "Tailscale does not know that address"
+        node = who.get("Node") or {}
+        device = short_device_name(str(node.get("Name") or "")) or address
+        if node.get("Tags"):
+            return False, device, f"{device} is a tagged device (a server), not one of your own"
+        profile = who.get("UserProfile") or {}
+        owner = profile.get("ID") if isinstance(profile.get("ID"), int) else node.get("User")
+        if owner != own[0]:
+            who_login = profile.get("LoginName") or "another account"
+            own_label = own[1] or "this computer's account"
+            return False, device, f"{device} belongs to {who_login}, not to {own_label}"
+        return True, device, f"{device} is signed in to Tailscale as {own[1] or 'you'}"
+
+
 class Server:
     def __init__(self, injector: Injector, token: bytes, host_name: str = "",
                  hello_timeout: float = HELLO_TIMEOUT, idle_timeout: float = IDLE_TIMEOUT,
-                 log: Callable[[str], None] = lambda s: None, sunshine: Optional["SunshineLink"] = None) -> None:
+                 log: Callable[[str], None] = lambda s: None, sunshine: Optional["SunshineLink"] = None,
+                 tailnet: Optional["TailnetTrust"] = None) -> None:
         self.sunshine = sunshine
+        self.tailnet = tailnet            # when set, phones of the owner's own Tailscale account need no token
+        self._tailnet_peers: set = set()  # writers let in by Tailscale (their HELLO_OK says so)
         self._tasks: set = set()          # running Sunshine pairings, kept so they are not garbage collected
         self._active_peer = ""            # the authenticated phone's address, as this agent sees it
         self.injector = injector
@@ -2358,11 +2472,18 @@ class Server:
         if version != VERSION:
             await self._send(writer, msg_error(E_BAD_VERSION, f"protocol version {version} not supported"))
             return False
+        by_tailnet = False
         if not hmac.compare_digest(token, self.token):
-            self.log(f"{peer}: wrong token")
-            await asyncio.sleep(1.0)  # makes guessing impractical
-            await self._send(writer, msg_error(E_BAD_TOKEN, "wrong pairing token"))
-            return False
+            trusted, device, why = False, "", ""
+            if self.tailnet is not None and peer:
+                trusted, device, why = await asyncio.get_running_loop().run_in_executor(None, self.tailnet.check, str(peer[0]))
+            if not trusted:
+                self.log(f"{peer}: " + ("no token" if not token else "wrong token") + (f" ({why})" if why else ""))
+                await asyncio.sleep(1.0)  # makes guessing impractical
+                await self._send(writer, msg_error(E_BAD_TOKEN, "wrong pairing token" if token else "this phone is not signed in to your Tailscale account: pair it with the token"))
+                return False
+            by_tailnet = True
+            self.log(f"{why}: let in without a token")
         old = self._active
         if old is not None and old is not writer:
             await self._send(old, msg_error(E_REPLACED, "another phone connected"))
@@ -2374,8 +2495,8 @@ class Server:
         self._active = writer
         self._active_peer = _normalize_address(str(peer[0])) if peer else ""
         self._active_name = name or str(peer)
-        self.log(f"{self._active_name} connected")
-        await self._send(writer, msg_hello_ok(self.host_name, self._features()))
+        self.log(f"{self._active_name} connected" + (" (trusted by Tailscale)" if by_tailnet else ""))
+        await self._send(writer, msg_hello_ok(self.host_name, self._features() | (FEATURE_TAILNET_TRUST if by_tailnet else 0)))
         return True
 
     async def _serve(self, reader, writer) -> None:
@@ -2471,9 +2592,19 @@ def _log(message: str) -> None:
     print(message, flush=True)  # flushed so a service manager or a test harness sees it at once
 
 
-async def serve(directory: str, port: int, injector: Injector, log=_log, host: str = "0.0.0.0") -> None:
+async def serve(directory: str, port: int, injector: Injector, log=_log, host: str = "0.0.0.0", tailnet_trust: bool = True) -> None:
     cert, key, token = ensure_identity(directory)
-    server = Server(injector, token, log=log, sunshine=SunshineLink(directory))
+    tailnet = TailnetTrust(directory) if tailnet_trust else None
+    server = Server(injector, token, log=log, sunshine=SunshineLink(directory), tailnet=tailnet)
+    if tailnet is None:
+        log("Tailscale trust is OFF: every phone must pair with the token")
+    else:
+        own = tailnet.own_identity()
+        if own:
+            log(f"Tailscale trust is ON: phones signed in to Tailscale as {own[1] or 'your account'} need no pairing "
+                f"(revoke one by adding its name to {os.path.join(directory, DENIED_DEVICES_FILE)}; turn it off with --no-tailnet-trust)")
+        else:
+            log("Tailscale trust is on, but Tailscale is not running here: phones must pair with the token until it is")
     tls = await asyncio.start_server(server.handle, host, port, ssl=make_ssl_context(cert, key))
     log(f"mesh input channel listening on port {port}  (certificate {cert_fingerprint(cert)[:16]}...)")
     addresses = local_addresses()
@@ -2559,6 +2690,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--sunshine-user", default=None, help="sunshine-login: the username, instead of being asked")
     ap.add_argument("--size", default="1600x720", help="spike-virtual-monitor: size of the virtual monitor to ask for")
     ap.add_argument("--seconds", type=int, default=8, help="spike-virtual-monitor: how long to keep it")
+    ap.add_argument("--no-tailnet-trust", action="store_true", help="run: do not let phones of your own Tailscale account in without the pairing token")
     ap.add_argument("--apply", action="store_true", help="encoder-bench: write the recommended encoder into Sunshine's sunshine.conf")
     ap.add_argument("--password-stdin", action="store_true", help="sunshine-login: read the password from standard input")
     args = ap.parse_args(argv)
@@ -2640,7 +2772,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     try:
-        asyncio.run(serve(args.dir, args.port, injector))
+        asyncio.run(serve(args.dir, args.port, injector, tailnet_trust=not args.no_tailnet_trust))
     except KeyboardInterrupt:
         pass
     finally:
