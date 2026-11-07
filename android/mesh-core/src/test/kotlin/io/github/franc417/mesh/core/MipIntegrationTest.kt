@@ -329,6 +329,39 @@ class MipIntegrationTest {
     }
 
     @Test
+    fun `a blank pin learns the certificate only for Tailscale addresses`() = withAgent { agent ->
+        // 127.0.0.1 is not a Tailscale address, so the phone must refuse to trust whatever certificate it is shown.
+        val client = MipClient(config(agent, pin = ""), Recorder())
+        val error = try { client.connect(); null } catch (e: MipException) { e }
+        assertTrue(error?.message ?: "no error", error?.message?.contains("not on your Tailscale network") == true)
+    }
+
+    @Test
+    fun `trust on first use learns the agent's fingerprint after it let the phone in`() = withAgent { agent ->
+        val rec = Recorder()
+        val client = MipClient(MipClient.Config("127.0.0.1", agent.port, agent.token, "", "test phone", requireTailnetToLearn = false), rec)
+        client.connect()
+        assertEquals(agent.fingerprint, client.learnedFingerprint)
+        assertFalse(client.trustedByTailnet)   // it got in with the token here; Tailscale trust needs a real tailnet
+        client.close()
+    }
+
+    @Test
+    fun `a pinned connection learns nothing`() = withAgent { agent ->
+        val client = MipClient(config(agent), Recorder())
+        client.connect()
+        assertEquals(null, client.learnedFingerprint)
+        client.close()
+    }
+
+    @Test
+    fun `without a token and without Tailscale the agent's own explanation reaches the phone`() = withAgent { agent ->
+        val client = MipClient(config(agent, token = ByteArray(0)), Recorder())
+        val error = try { client.connect(); null } catch (e: MipException) { e }
+        assertTrue(error?.message ?: "no error", error?.message?.contains("Tailscale") == true)
+    }
+
+    @Test
     fun `closing in the background ends the session once and never blocks the caller`() = withAgent { agent ->
         val rec = Recorder()
         val client = MipClient(config(agent), rec)

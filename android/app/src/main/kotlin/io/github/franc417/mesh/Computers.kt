@@ -15,7 +15,16 @@ data class Computer(
     /** SHA-256 of the agent's certificate (hex): the only certificate this phone will accept for it. */
     val fingerprint: String,
     val tokenHex: String,
-)
+) {
+    /** A computer added by its Tailscale name or address only: no pairing token, the computer lets this phone in by its Tailscale account. */
+    val usesTailscale: Boolean get() = tokenHex.isEmpty()
+
+    /** Its certificate is not known yet: it is learned (and pinned) at the first connection, over Tailscale only. */
+    val needsLearning: Boolean get() = fingerprint.isEmpty()
+
+    /** The addresses to try: before the certificate is known only those on the Tailscale network (blocks on name lookup). */
+    fun connectHosts(): List<String> = if (needsLearning) io.github.franc417.mesh.core.Tailnet.onlyTailnet(hosts) else hosts
+}
 
 /**
  * Saved computers, in the app's private storage. Backups are switched off in the manifest so the

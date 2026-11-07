@@ -552,7 +552,7 @@ class StreamActivity : Activity() {
         }
         // Every saved address is tried at once; the first that answers is used for both input and video.
         Thread({
-            val reachable = Reach.firstReachable(computer.hosts, computer.port, 3000)
+            val reachable = Reach.firstReachable(computer.connectHosts(), computer.port, 3000)
             runOnUiThread {
                 if (g != generation) return@runOnUiThread
                 if (reachable == null) {
@@ -568,13 +568,16 @@ class StreamActivity : Activity() {
 
     private fun connectInput(host: String) {
         inputLink?.close()
-        val link = InputLink(computer) { text, ok ->
+        val link = InputLink(computer, { text, ok ->
             runOnUiThread {
                 inputStatus = text
                 if (!ok && streaming) statusChip.text = text
                 refreshAbsolute()
             }
-        }
+        }, { learned ->
+            computer = computer.copy(fingerprint = learned)
+            ComputerStore(applicationContext).update(computer)   // pinned from now on, also after the app is restarted
+        })
         inputLink = link
         link.connect(host)
     }

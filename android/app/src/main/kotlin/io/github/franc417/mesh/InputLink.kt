@@ -11,9 +11,13 @@ import io.github.franc417.mesh.core.hexToBytes
  * [report] is called from background threads with a short status and whether it is good news.
  */
 class InputLink(
-    private val computer: Computer,
+    computer: Computer,
     private val report: (text: String, ok: Boolean) -> Unit,
+    /** Called once, from a background thread, with the certificate fingerprint learned at the first connection to a Tailscale computer. */
+    private val onLearned: (fingerprint: String) -> Unit = {},
 ) {
+    @Volatile private var computer: Computer = computer
+
     @Volatile private var client: MipClient? = null
 
     /** Null until connected; view events go through it to the computer. */
@@ -47,6 +51,10 @@ class InputLink(
         Thread({
             try {
                 mip.connect()
+                mip.learnedFingerprint?.let { learned ->
+                    computer = computer.copy(fingerprint = learned)   // from now on this connection is pinned like any other
+                    onLearned(learned)
+                }
                 if (client === mip) {
                     bridge = bridgeForThis
                     report("Input connected", true)

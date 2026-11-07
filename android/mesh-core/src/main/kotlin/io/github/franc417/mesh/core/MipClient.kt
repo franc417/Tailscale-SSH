@@ -32,12 +32,17 @@ class MipClient(private val config: Config, private val listener: Listener) : In
         val host: String,
         val port: Int,
         val token: ByteArray,
-        /** SHA-256 of the computer's certificate, hex. */
+        /**
+         * SHA-256 of the computer's certificate, hex. Blank means "trust on first use": allowed only for Tailscale addresses (see
+         * [learnedFingerprint]); the agent then lets this phone in by its Tailscale account, so [token] may be empty too.
+         */
         val pinSha256: String,
         val deviceName: String,
         val connectTimeoutMs: Int = 4000,
         val pingIntervalMs: Long = 5000,
         val idleTimeoutMs: Int = 15000,
+        /** Tests switch this off to learn a certificate from a local test agent; the app never does. */
+        val requireTailnetToLearn: Boolean = true,
     )
 
     interface Listener {
@@ -73,13 +78,26 @@ class MipClient(private val config: Config, private val listener: Listener) : In
 
     val isConnected: Boolean get() = hello != null && !finished.get()
 
+    /** In trust-on-first-use mode: the fingerprint of the certificate the computer presented, once it has let this phone in. */
+    @Volatile var learnedFingerprint: String? = null
+        private set
+
+    /** True when the computer let this phone in because of its Tailscale account (no token was needed). */
+    val trustedByTailnet: Boolean get() = ((hello?.features ?: 0) and Mip.FEATURE_TAILNET_TRUST) != 0
+
     /** Opens the connection and authenticates. Blocks; throws MipException with a plain reason on failure. */
     fun connect(): HostMessage.HelloOk {
         val raw = Socket()
         try {
             raw.tcpNoDelay = true
             raw.connect(InetSocketAddress(config.host, config.port), config.connectTimeoutMs)
-            val tls = PinnedTls.context(config.pinSha256).socketFactory.createSocket(raw, config.host, config.port, true) as SSLSocket
+            val learning = config.pinSha256.isBlank()
+            if (learning && config.requireTailnetToLearn && !Tailnet.isTailnetHost(config.host)) {
+                throw MipException(0, "${config.host} is not on your Tailscale network, so this computer's identity cannot be trusted automatically. Use its pairing info (python3 mesh_input.py pair-info) instead.")
+            }
+            val seen = java.util.concurrent.atomic.AtomicReference<String?>(null)
+            val context = if (learning) PinnedTls.learningContext { seen.set(it) } else PinnedTls.context(config.pinSha256)
+            val tls = context.socketFactory.createSocket(raw, config.host, config.port, true) as SSLSocket
             tls.useClientMode = true
             val wanted = arrayOf("TLSv1.3", "TLSv1.2").filter { it in tls.supportedProtocols }
             tls.enabledProtocols = wanted.toTypedArray()
@@ -94,6 +112,7 @@ class MipClient(private val config: Config, private val listener: Listener) : In
             val (type, payload) = readFrame(inp)
             when (val reply = MipCodec.decodeHost(type, payload)) {
                 is HostMessage.HelloOk -> {
+                    if (learning) learnedFingerprint = seen.get()   // only after the computer accepted this phone
                     socket = tls
                     input = inp
                     output = out
@@ -123,7 +142,7 @@ class MipClient(private val config: Config, private val listener: Listener) : In
     }
 
     private fun describe(code: Int, text: String) = when (code) {
-        Mip.E_BAD_TOKEN -> "the computer rejected this phone's pairing token (pair again)"
+        Mip.E_BAD_TOKEN -> if (config.token.isEmpty()) text else "the computer rejected this phone's pairing token (pair again)"
         Mip.E_BAD_VERSION -> "the computer and this app use different protocol versions (update the Mesh agent or the app)"
         else -> text
     }

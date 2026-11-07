@@ -138,7 +138,7 @@ class ControlActivity : Activity() {
         // Every saved address is tried at once; the first that answers is used, so a home LAN address that is
         // unreachable while you are away never slows down the Tailscale one.
         Thread {
-            val host = Reach.firstReachable(c.hosts, c.port, 3000)
+            val host = Reach.firstReachable(c.connectHosts(), c.port, 3000)
             runOnUiThread {
                 if (mine != attempt) return@runOnUiThread
                 if (host == null) {
@@ -165,6 +165,7 @@ class ControlActivity : Activity() {
         Thread {
             try {
                 val hello: HostMessage.HelloOk = mip.connect()
+                mip.learnedFingerprint?.let { learned -> ComputerStore(applicationContext).update(c.copy(fingerprint = learned)) }
                 runOnUiThread {
                     if (client === mip) show("Connected to ${hello.hostName.ifEmpty { c.name }}", Ui.OK)
                 }

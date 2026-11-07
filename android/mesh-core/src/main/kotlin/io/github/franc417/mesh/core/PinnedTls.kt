@@ -48,4 +48,25 @@ object PinnedTls {
     fun context(pin: String): SSLContext = SSLContext.getInstance("TLS").apply {
         init(null, arrayOf(trustManager(pin)), SecureRandom())
     }
+
+    /**
+     * Trust on first use, for a computer reached over Tailscale that has no pairing info to pin: accepts the certificate that is
+     * presented and reports its fingerprint to [onLeaf] so it can be saved and pinned from then on. Only ever used for connections
+     * to Tailscale addresses, where WireGuard has already proved which machine is at the other end.
+     */
+    fun learningContext(onLeaf: (String) -> Unit): SSLContext = SSLContext.getInstance("TLS").apply {
+        val learner = object : X509TrustManager {
+            override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {
+                val leaf = chain?.firstOrNull() ?: throw CertificateException("the computer sent no certificate")
+                onLeaf(fingerprint(leaf))
+            }
+
+            override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {
+                throw CertificateException("this side does not accept client certificates")
+            }
+
+            override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+        }
+        init(null, arrayOf(learner), SecureRandom())
+    }
 }

@@ -14,6 +14,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Toast
 import io.github.franc417.mesh.core.ComputerForm
+import io.github.franc417.mesh.core.Mip
 import io.github.franc417.mesh.core.PairInfo
 import java.util.UUID
 
@@ -54,7 +55,8 @@ class ComputerFormActivity : Activity() {
         column.addView(Ui.text(this, if (editing == null) "Add desktop" else "Edit ${editing.name}", 24f, Ui.TEXT, bold = true))
         column.addView(Ui.gap(this, 6))
         column.addView(Ui.text(this, if (editing == null) {
-            "On the computer run:  python3 mesh_input.py pair-info  and paste what it prints below."
+            "Easiest, with Tailscale on this phone and on the computer (same account): type the computer's Tailscale name or address in Addresses below and press Add. Nothing to paste.\n\n" +
+                "Without Tailscale: on the computer run  python3 mesh_input.py pair-info  and paste what it prints in the box at the bottom."
         } else {
             "Change what this phone knows about the computer. Nothing changes on the computer itself."
         }, 13f, Ui.MUTED))
@@ -70,7 +72,7 @@ class ComputerFormActivity : Activity() {
         column.addView(Ui.text(this, "One per line. All are tried at once and the first that answers is used, so you can list the home Wi-Fi address and the Tailscale address together.", 12f, Ui.MUTED))
         column.addView(Ui.gap(this, 6))
         addressInput = field(
-            if (editing == null) "Optional: the pairing info already lists them" else "For example 192.168.1.20",
+            if (editing == null) "For example  mkz  or  100.67.163.21  (or leave empty when pasting pairing info)" else "For example 192.168.1.20",
             InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_VARIATION_URI,
         ).apply {
             minLines = 2
@@ -89,7 +91,7 @@ class ComputerFormActivity : Activity() {
             column.addView(Ui.gap(this, 14))
         }
 
-        column.addView(label(if (editing == null) "Pairing info" else "New pairing info (optional)"))
+        column.addView(label(if (editing == null) "Pairing info (only without Tailscale)" else "New pairing info (optional)"))
         if (editing != null) {
             column.addView(Ui.text(this, "Only needed if the agent on the computer was reinstalled or its pairing was reset. It replaces the saved pairing, and its port wins over the one above.", 12f, Ui.MUTED))
             column.addView(Ui.gap(this, 6))
@@ -109,6 +111,16 @@ class ComputerFormActivity : Activity() {
         buttons.addView(Ui.button(this, if (editing == null) "Add" else "Save") { save() }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 2f))
         column.addView(buttons)
 
+        if (editing != null && editing.usesTailscale && !editing.needsLearning) {
+            column.addView(Ui.gap(this, 22))
+            column.addView(Ui.text(this, "This computer's identity was saved at the first connection. If you reinstalled the agent on it, forget it so the next connection saves the new one.", 12f, Ui.MUTED))
+            column.addView(Ui.gap(this, 6))
+            column.addView(Ui.button(this, "Forget its saved identity") {
+                store.update(editing.copy(fingerprint = ""))
+                toast("Forgotten. The next connection over Tailscale saves it again.")
+                finish()
+            })
+        }
         if (editing != null) {
             column.addView(Ui.gap(this, 22))
             column.addView(Ui.button(this, "Remove this computer") { confirmRemove(editing) }.apply { setTextColor(Ui.ERROR) })
@@ -153,6 +165,10 @@ class ComputerFormActivity : Activity() {
     }
 
     private fun add() {
+        if (pairInput.text.isNullOrBlank()) {
+            addByTailscale()
+            return
+        }
         val info = PairInfo.parse(pairInput.text.toString())
         val typed = addressInput.text.toString()
         val typedHosts = if (typed.isBlank()) emptyList() else ComputerForm.parseAddresses(typed)
@@ -164,6 +180,20 @@ class ComputerFormActivity : Activity() {
         val name = ComputerForm.parseName(nameInput.text.toString(), info.hostName.ifEmpty { hosts.first() })
         store.add(Computer(UUID.randomUUID().toString(), name, hosts, info.port, info.fingerprint, info.tokenHex))
         toast("Added $name (${hosts.size} address${if (hosts.size == 1) "" else "es"})")
+        finish()
+    }
+
+    /** No pairing info: the computer is reached over Tailscale, lets this phone in by its account, and its certificate is learned at the first connection. */
+    private fun addByTailscale() {
+        val typed = addressInput.text.toString()
+        if (typed.isBlank()) {
+            toast("Type the computer's Tailscale name or address, or paste its pairing info")
+            return
+        }
+        val hosts = ComputerForm.parseAddresses(typed)
+        val name = ComputerForm.parseName(nameInput.text.toString(), hosts.first())
+        store.add(Computer(UUID.randomUUID().toString(), name, hosts, Mip.DEFAULT_PORT, "", ""))
+        toast("Added $name. It connects through Tailscale; the first connection saves its identity.")
         finish()
     }
 

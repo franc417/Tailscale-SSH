@@ -45,6 +45,8 @@ object Mip {
     const val FEATURE_HIRES_SCROLL = 0x02
     const val FEATURE_SUNSHINE_PAIR = 0x04
     const val FEATURE_ABS_POINTER = 0x08
+    /** This phone was let in because it is signed in to the same Tailscale account as the computer: no token was needed. */
+    const val FEATURE_TAILNET_TRUST = 0x10
 
     /** Absolute pointer positions are 0..65535 across the streamed screen on both axes. */
     const val ABS_MAX = 0xFFFF
