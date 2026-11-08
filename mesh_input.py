@@ -30,6 +30,8 @@ Commands:
   python3 mesh_input.py sunshine-unpair-all  forget every paired phone in Sunshine (cures "Client certificate identity is not enabled")
   python3 mesh_input.py screen-phone         phone-shaped virtual screen on, Sunshine pointed at it (--size 1600x720)
   python3 mesh_input.py screen-normal        the real screen and Sunshine's own settings back
+  python3 mesh_input.py doctor               checklist: what is fine and what to do (changes nothing)
+  python3 mesh_input.py setup [--yes]        the same checklist, then fixes what it can (asks first; --yes: no questions)
   python3 mesh_input.py screen-status        one paste with everything about the phone-screen setup (monitor, Sunshine, pairing, log)
   python3 mesh_input.py spike-virtual-monitor  try creating a virtual monitor and report what GNOME did (--seconds N holds it open)
   python3 mesh_input.py run [--port N]       serve (needs /dev/uinput access)
@@ -2264,6 +2266,254 @@ def sunshine_unpair_all(tools: Optional[ProcessTools] = None, progress: Callable
     return code, "\n".join(steps)
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# `doctor` and `setup`: one checklist for a computer that streams to the phone.
+#
+#   doctor   only looks, and says what is fine and what to do about the rest (safe to run any time, changes nothing)
+#   setup    the same checklist, then fixes what it can: asks before each fix (--yes: no questions), then checks again
+#
+# Every item is "check, and if wrong, how to repair": so the same code serves a brand new computer and a repair of an old one.
+# ---------------------------------------------------------------------------------------------------------------------
+
+SUNSHINE_SERVICE_NAME = "sunshine.service"
+
+
+class Check:
+    """One line of the checklist. [state] is ok / todo (setup can fix it) / problem (a person must) / info."""
+
+    def __init__(self, name: str, state: str, detail: str, fix: Optional[Callable[[], str]] = None, fix_title: str = "") -> None:
+        self.name, self.state, self.detail, self.fix, self.fix_title = name, state, detail, fix, fix_title
+
+
+def tailscale_summary(runner=subprocess.run, which=shutil.which) -> dict:
+    """What Tailscale says about this computer: {"state": missing|error|<BackendState>, "login", "name", "ip"}."""
+    if which("tailscale") is None:
+        return {"state": "missing"}
+    try:
+        done = runner(["tailscale", "status", "--json"], capture_output=True, text=True, timeout=8)
+        data = json.loads(done.stdout) if done.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        data = None
+    if not isinstance(data, dict):
+        return {"state": "error"}
+    me = data.get("Self") or {}
+    user_id = me.get("UserID")
+    login = ((data.get("User") or {}).get(str(user_id)) or {}).get("LoginName") or ""
+    ips = me.get("TailscaleIPs") or []
+    return {"state": data.get("BackendState") or "error", "login": str(login), "name": short_device_name(str(me.get("DNSName") or me.get("HostName") or "")),
+            "ip": next((i for i in ips if ":" not in str(i)), "")}
+
+
+def sunshine_unit(sunshine_path: str) -> str:
+    """The systemd user unit that keeps Sunshine running in your desktop session (restarts if it stops, starts at login)."""
+    return ("[Unit]\nDescription=Sunshine stream host (set up by Mesh)\nAfter=graphical-session.target\nPartOf=graphical-session.target\n\n"
+            f"[Service]\nExecStart={sunshine_path}\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=graphical-session.target\n")
+
+
+def gpu_vendor(lspci_text: str) -> str:
+    """intel / amd / nvidia / "" from `lspci` output (the first display controller wins; a laptop's discrete GPU is listed too)."""
+    vendors = []
+    for line in lspci_text.splitlines():
+        if re.search(r"(?i)VGA compatible|3D controller|Display controller", line):
+            low = line.lower()
+            vendors.append("nvidia" if "nvidia" in low else "amd" if ("amd" in low or "ati " in low or "radeon" in low) else "intel" if "intel" in low else "")
+    return next((v for v in vendors if v == "intel"), next((v for v in vendors if v), ""))
+
+
+DRIVER_HINT = {
+    "intel": "sudo pacman -S intel-media-driver libva-utils   (older Intel: libva-intel-driver)",
+    "amd": "sudo pacman -S libva-mesa-driver libva-utils",
+    "nvidia": "install your NVIDIA driver (nvidia-utils): Sunshine then uses NVENC",
+}
+
+
+class SetupEnv:
+    """Everything the checklist touches, in one place so tests can replace it."""
+
+    def __init__(self, directory: str, port: int = DEFAULT_PORT, tools: Optional[ProcessTools] = None, runner=subprocess.run,
+                 which=shutil.which, environ=os.environ, access=os.access, exists=os.path.exists, link: Optional[SunshineLink] = None,
+                 unit_directory: Optional[str] = None, make_identity=None, install_agent_service=None, bench=None) -> None:
+        self.directory, self.port, self.runner, self.which, self.environ = directory, port, runner, which, environ
+        self.tools = tools or ProcessTools(runner=runner, which=which, environ=environ)
+        self.access, self.exists = access, exists
+        self.link = link or SunshineLink(directory)
+        self.unit_directory = unit_directory or unit_dir()
+        self.make_identity = make_identity or (lambda: ensure_identity(directory))
+        self.install_agent_service = install_agent_service or (lambda: install_service(port, directory if directory != default_dir() else None))
+        self.bench = bench or (lambda: encoder_bench_and_apply(self))
+
+
+def encoder_bench_and_apply(env: SetupEnv) -> str:
+    report, best = encoder_bench(runner=env.runner, which=env.which, environ=env.environ)
+    if best is None:
+        return "no encoder worked, so none was set (run: python3 mesh_input.py encoder-bench)"
+    return apply_encoder_setting(best, sunshine_config_dir(env.environ), restart_advice=sunshine_restart_advice(env.runner, env.which))
+
+
+def _service_active(env: SetupEnv, name: str) -> bool:
+    if env.which("systemctl") is None:
+        return False
+    try:
+        return env.runner(["systemctl", "--user", "is-active", name], capture_output=True, text=True, timeout=8).stdout.strip() == "active"
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def gather_checks(env: SetupEnv) -> List[Check]:
+    checks: List[Check] = []
+    add = checks.append
+
+    # 1. Tailscale: the way phones find this computer and get let in without pairing
+    ts = tailscale_summary(env.runner, env.which)
+    if ts["state"] == "missing":
+        add(Check("Tailscale", "problem", "not installed. Install it on this computer and on the phone, sign in with the same account: "
+                  "Arch: sudo pacman -S tailscale && sudo systemctl enable --now tailscaled && sudo tailscale up   (other systems: tailscale.com/download)"))
+    elif ts["state"] != "Running":
+        add(Check("Tailscale", "problem", f"installed but {ts['state'] or 'not running'}. Start it: sudo tailscale up"))
+    else:
+        where = ts["name"] or ts["ip"] or "this computer"
+        add(Check("Tailscale", "ok", f"signed in as {ts['login'] or 'your account'}; this computer is {where}" + (f" ({ts['ip']})" if ts["ip"] and ts["name"] else "")
+                  + ". Phones signed in to the same account connect with no pairing"))
+
+    # 2. Input from the phone needs /dev/uinput
+    if env.access("/dev/uinput", os.W_OK):
+        add(Check("Keyboard and mouse input (/dev/uinput)", "ok", "this user may use it"))
+    else:
+        add(Check("Keyboard and mouse input (/dev/uinput)", "problem", "this user may not write to it, so the phone cannot type or move the pointer. The Sunshine package normally "
+                  "sets this up (a udev rule with TAG+=\"uaccess\"): install Sunshine, then log out and in. Check that the module is loaded: lsmod | grep uinput"))
+
+    # 3. The agent's own certificate and token
+    cert_path, key_path, token_path = _paths(env.directory)
+    identity_present = env.exists(cert_path) and env.exists(key_path) and env.exists(token_path)
+    if identity_present:
+        add(Check("Mesh agent identity", "ok", "certificate and token exist"))
+    else:
+        add(Check("Mesh agent identity", "todo", "no certificate and token yet", fix=lambda: (env.make_identity(), "created the certificate and token")[1], fix_title="create them"))
+
+    # 4. The agent running all the time
+    if _service_active(env, SERVICE_NAME):
+        add(Check("Mesh agent running", "ok", f"as the {SERVICE_NAME} service"))
+    elif env.tools.agent_running():
+        add(Check("Mesh agent running", "ok", "started by hand (it stops when that terminal closes; setup can install it as a service)",
+                  fix=lambda: env.install_agent_service(), fix_title="install it as a service that starts at login"))
+    else:
+        add(Check("Mesh agent running", "todo", "not running", fix=lambda: env.install_agent_service(), fix_title="install it as a service that starts at login"))
+
+    # 5. Sunshine itself
+    sunshine = env.which("sunshine")
+    if sunshine is None:
+        add(Check("Sunshine", "problem", "not installed. See https://docs.lizardbyte.dev/projects/sunshine/latest/md_docs_2getting__started.html (Arch: the LizardByte repository or the AUR)"))
+    else:
+        add(Check("Sunshine", "ok", f"installed ({sunshine})"))
+
+        # 6. ...kept running by systemd, not by a terminal
+        if env.tools.sunshine_is_service():
+            add(Check("Sunshine service", "ok", "runs as a systemd user service"))
+        else:
+            running = "running now, started by hand" if env.tools.sunshine_running() else "not running"
+            def install_sunshine() -> str:
+                env.tools.stop_sunshine()
+                os.makedirs(env.unit_directory, exist_ok=True)
+                with open(os.path.join(env.unit_directory, SUNSHINE_SERVICE_NAME), "w") as f:
+                    f.write(sunshine_unit(sunshine))
+                for args in (["daemon-reload"], ["enable", "--now", SUNSHINE_SERVICE_NAME]):
+                    done = env.runner(["systemctl", "--user", *args], capture_output=True, text=True)
+                    if done.returncode != 0:
+                        raise RuntimeError(f"`systemctl --user {' '.join(args)}` failed: {(done.stderr or done.stdout).strip()}")
+                return f"Sunshine now runs as {SUNSHINE_SERVICE_NAME} and starts with your desktop session"
+            add(Check("Sunshine service", "todo", f"{running}; there is no {SUNSHINE_SERVICE_NAME}, so it stops with the terminal and nothing restarts it",
+                      fix=install_sunshine, fix_title="install the service"))
+
+        # 7. The agent needs Sunshine's web login to approve the phone's pairing by itself
+        answers, why = env.tools.sunshine_https_answers()
+        if not env.tools.sunshine_running() and not answers:
+            add(Check("Sunshine web login for the agent", "info", "Sunshine is not running, so this cannot be checked yet"))
+        elif env.link.has_login():
+            try:
+                env.link.check_login()
+                add(Check("Sunshine web login for the agent", "ok", "saved, and Sunshine accepts it"))
+            except SunshineError as exc:
+                add(Check("Sunshine web login for the agent", "problem", f"saved, but {exc.text}. Run: python3 mesh_input.py sunshine-login"))
+        else:
+            try:
+                first = env.link.needs_first_login()
+            except SunshineError:
+                first = False
+            if first:
+                def make_login() -> str:
+                    password = env.link.create_login()
+                    return "gave Sunshine a login (user mesh) and saved it for the agent" + ("" if not password else "; you never need to type it")
+                add(Check("Sunshine web login for the agent", "todo", "Sunshine has no login yet", fix=make_login, fix_title="create one and save it"))
+            else:
+                add(Check("Sunshine web login for the agent", "problem", "Sunshine already has a login the agent does not know: run python3 mesh_input.py sunshine-login"))
+
+        # 8. The video encoder
+        conf = ""
+        try:
+            with open(os.path.join(sunshine_config_dir(env.environ), "sunshine.conf"), errors="replace") as f:
+                conf = f.read()
+        except OSError:
+            pass
+        encoder = current_config_value(conf, "encoder")
+        if encoder:
+            add(Check("Video encoder", "ok", f"set to {encoder}"))
+        else:
+            add(Check("Video encoder", "todo", "not chosen: Sunshine guesses, which can end up on the slow processor encoder", fix=lambda: env.bench(),
+                      fix_title="time the encoders (about a minute) and pick the fastest"))
+
+        # 9. Hardware encoding needs the graphics driver's video part
+        if env.which("vainfo") is None and env.which("nvidia-smi") is None:
+            try:
+                vendor = gpu_vendor(env.runner(["lspci"], capture_output=True, text=True, timeout=8).stdout or "")
+            except (OSError, subprocess.SubprocessError):
+                vendor = ""
+            add(Check("Hardware video encoding", "problem" if vendor in DRIVER_HINT else "info",
+                      "cannot tell whether the graphics chip can encode video (vainfo is missing)" + (f". Install: {DRIVER_HINT[vendor]}" if vendor in DRIVER_HINT else "")))
+        else:
+            add(Check("Hardware video encoding", "ok", "the video driver tools are installed (encoder-bench shows which encoder works)"))
+
+        # 10. Is Sunshine answering where the phone connects?
+        if env.tools.sunshine_running():
+            add(Check("Sunshine's secure port", "ok" if answers else "problem", why))
+    return checks
+
+
+def run_doctor(env: SetupEnv, fix: bool = False, yes: bool = False, ask: Callable[[str], str] = input, out: Callable[[str], None] = print) -> int:
+    """The checklist (and, with [fix], the repairs). Returns 0 when everything is fine at the end."""
+    marks = {"ok": "[ ok ]", "todo": "[todo]", "problem": "[FIX ]", "info": "[ .. ]"}
+
+    def show(checks: List[Check]) -> None:
+        for c in checks:
+            out(f"{marks[c.state]} {c.name}: {c.detail}")
+
+    checks = gather_checks(env)
+    show(checks)
+    if fix:
+        fixable = [c for c in checks if c.state in ("todo", "ok") and c.fix is not None and c.state == "todo"]
+        for c in fixable:
+            if not yes:
+                if ask(f"\n{c.name}: {c.fix_title}? [Y/n] ").strip().lower() in ("n", "no"):
+                    continue
+            try:
+                out(f"-> {c.fix()}")
+            except (RuntimeError, OSError, SunshineError) as exc:
+                out(f"-> could not do it: {getattr(exc, 'text', None) or exc}")
+        if fixable:
+            out("\nChecking again:")
+            checks = gather_checks(env)
+            show(checks)
+    problems = [c for c in checks if c.state in ("problem", "todo")]
+    out("")
+    ts = tailscale_summary(env.runner, env.which)
+    if not problems:
+        out("Everything is in place.")
+        if ts["state"] == "Running":
+            out(f"On the phone: Mesh -> Add desktop -> Addresses: {ts['name'] or ts['ip']}  (leave the pairing box empty) -> Add.")
+    else:
+        out(f"{len(problems)} thing(s) left: " + "; ".join(c.name for c in problems) + (". Run setup to fix what it can." if not fix else "."))
+    return 0 if not problems else 1
+
+
 def sunshine_login(directory: str, url: Optional[str] = None, username: Optional[str] = None,
                    password: Optional[str] = None, ask: Callable[[str], str] = input,
                    ask_secret: Callable[[str], str] = getpass.getpass, out: Callable[[str], None] = print) -> int:
@@ -2681,7 +2931,7 @@ def uninstall_service(target_dir: Optional[str] = None, runner=subprocess.run) -
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Mesh input channel (host side)")
-    ap.add_argument("command", choices=["init", "pair-info", "run", "reset-token", "install-service", "uninstall-service", "sunshine-login", "display-info", "diagnose", "encoder-bench", "spike-virtual-monitor", "screen-phone", "screen-normal", "sunshine-unpair-all", "screen-status"])
+    ap.add_argument("command", choices=["init", "pair-info", "run", "reset-token", "install-service", "uninstall-service", "sunshine-login", "display-info", "diagnose", "encoder-bench", "spike-virtual-monitor", "screen-phone", "screen-normal", "sunshine-unpair-all", "screen-status", "doctor", "setup"])
     ap.add_argument("--dir", default=default_dir())
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--dry-run", action="store_true", help="record events instead of injecting them")
@@ -2691,6 +2941,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--size", default="1600x720", help="spike-virtual-monitor: size of the virtual monitor to ask for")
     ap.add_argument("--seconds", type=int, default=8, help="spike-virtual-monitor: how long to keep it")
     ap.add_argument("--no-tailnet-trust", action="store_true", help="run: do not let phones of your own Tailscale account in without the pairing token")
+    ap.add_argument("--yes", action="store_true", help="setup: fix everything without asking")
     ap.add_argument("--apply", action="store_true", help="encoder-bench: write the recommended encoder into Sunshine's sunshine.conf")
     ap.add_argument("--password-stdin", action="store_true", help="sunshine-login: read the password from standard input")
     args = ap.parse_args(argv)
@@ -2698,6 +2949,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command in ("display-info", "diagnose"):
         print(display_info())
         return 0
+
+    if args.command in ("doctor", "setup"):
+        return run_doctor(SetupEnv(args.dir, args.port), fix=args.command == "setup", yes=args.yes)
 
     if args.command == "screen-status":
         print(screen_status())

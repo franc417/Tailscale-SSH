@@ -3,6 +3,15 @@
 Run them in a terminal inside the desktop, from the Tailscale-SSH folder (`cd ~/Downloads/Tailscale-SSH`).
 Update first: `git pull https://github.com/franc417/Tailscale-SSH.git main`
 
+## First time on a computer (or to repair one)
+
+| Command | What it does |
+|---|---|
+| `python3 mesh_input.py doctor` | A checklist, changes nothing: Tailscale, input permission, the agent's identity and service, Sunshine and its service, Sunshine's login for the agent, the video encoder and driver, Sunshine's secure port. Each line says what is fine and what to do. |
+| `python3 mesh_input.py setup` | The same checklist, then fixes what it can (asks before each fix; `--yes` asks nothing): creates the agent's identity, installs the agent as a service, installs Sunshine as a service (instead of a terminal), gives Sunshine its login and saves it for the agent, picks the fastest encoder. Ends by telling you what to type on the phone. |
+
+Then on the phone: install Tailscale and sign in with the same account, open Mesh, **Add desktop**, type the computer's Tailscale name (or its 100.x address), leave the pairing box empty, press **Add**. Nothing to paste: the computer lets in phones signed in to the same Tailscale account.
+
 ## Every day
 
 | Command | What it does |
@@ -34,6 +43,7 @@ Update first: `git pull https://github.com/franc417/Tailscale-SSH.git main`
 | What you see | Do this |
 |---|---|
 | App says error code 503, or is stuck on the "Desktop" panel | `python3 mesh_input.py screen-status`, paste it. To stream now: `python3 mesh_input.py screen-normal`. |
+| Anything seems off after an update or a reinstall | `python3 mesh_input.py doctor`, then `python3 mesh_input.py setup` to fix what it lists. |
 | App says "Pairing failed" / asks for a PIN again | Make sure `run` is running, then `python3 mesh_input.py sunshine-unpair-all`, then Open desktop once. In the app tap **Copy details** and paste it. |
 | Sunshine "did NOT start" | `python3 mesh_input.py screen-normal`; if it still fails, `python3 mesh_input.py diagnose`. |
 | "Address already in use" | `pkill -9 -x sunshine`, then `python3 mesh_input.py screen-normal`. |
