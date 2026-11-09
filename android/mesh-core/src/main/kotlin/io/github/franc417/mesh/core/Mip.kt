@@ -25,6 +25,8 @@ object Mip {
     const val T_TEXT = 0x06
     const val T_PING = 0x07
     const val T_RELEASE_ALL = 0x08
+    /** "I am leaving the desktop on purpose": the computer keeps the music playing through the end of the stream. */
+    const val T_LEAVE = 0x0C
     const val T_BYE = 0x09
     const val T_SUNSHINE_PAIR = 0x0A
     const val T_MOVE_ABS = 0x0B
@@ -143,6 +145,8 @@ object MipCodec {
     fun ping(id: Int): ByteArray = frame(Mip.T_PING, ByteBuffer.allocate(4).putInt(id).array())
 
     fun releaseAll(): ByteArray = frame(Mip.T_RELEASE_ALL)
+
+    fun leave(): ByteArray = frame(Mip.T_LEAVE)
 
     fun bye(): ByteArray = frame(Mip.T_BYE)
 

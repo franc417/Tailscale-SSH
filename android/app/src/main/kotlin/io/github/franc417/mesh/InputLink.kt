@@ -75,6 +75,11 @@ class InputLink(
         private set
 
     /** Closing tells the computer to release any key still held down. */
+    /** "I am leaving on purpose": the computer then keeps its music playing while the stream ends. Call just before close(). */
+    fun leave() {
+        client?.leave()
+    }
+
     fun close() {
         connecting = false
         bridge = null

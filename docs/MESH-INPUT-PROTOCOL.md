@@ -62,6 +62,7 @@ u16 length | u8 type | payload          (big-endian; length counts type + payloa
 | 0x07 | PING | `u32 id` |
 | 0x08 | RELEASE_ALL | none |
 | 0x09 | BYE | none |
+| 0x0C | LEAVE | no payload. "I am leaving the desktop on purpose": the agent notes which MPRIS media players are playing and, for 5 seconds, presses Play on those that turn Paused while the stream ends (BYE follows). |
 | 0x0B | MOVE_ABS | `u16 x` `u16 y` (0..65535 across the streamed screen, from the top left; only if feature bit 8 was advertised) |
 | 0x0A | SUNSHINE_PAIR | `u8 n` `pin[n]` (4 ASCII digits) `u8 m` `name[m]` (UTF-8; what Sunshine should call the phone) |
 

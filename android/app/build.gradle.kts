@@ -13,6 +13,9 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "0.1.0"
+        // Which commit this build is made from (the CI machine knows it), shown on the main page and in crash reports, so there is never
+        // doubt about which build is installed on the phone.
+        resValue("string", "mesh_build", System.getenv("GITHUB_SHA")?.take(7) ?: "local")
     }
 
     signingConfigs {

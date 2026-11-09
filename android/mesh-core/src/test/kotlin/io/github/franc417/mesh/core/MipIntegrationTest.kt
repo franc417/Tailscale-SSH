@@ -362,6 +362,19 @@ class MipIntegrationTest {
     }
 
     @Test
+    fun `leaving on purpose does not disturb the session`() = withAgent { agent ->
+        val rec = Recorder()
+        val client = MipClient(config(agent), rec)
+        client.connect()
+        client.leave()
+        client.move(1f, 1f)
+        Thread.sleep(600)
+        assertTrue(client.isConnected)           // the agent understood LEAVE (or ignored it) and carried on
+        assertTrue(rec.disconnects.isEmpty())
+        client.close()
+    }
+
+    @Test
     fun `closing in the background ends the session once and never blocks the caller`() = withAgent { agent ->
         val rec = Recorder()
         val client = MipClient(config(agent), rec)

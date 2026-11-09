@@ -239,6 +239,9 @@ class MipClient(private val config: Config, private val listener: Listener) : In
 
     fun releaseAll() = send(MipCodec.releaseAll())
 
+    /** Tells the computer this phone is leaving on purpose, so a song that is playing there keeps playing. Send it just before closing. */
+    fun leave() = send(MipCodec.leave())
+
     private val sunshineWaiter = SunshineWaiter()
 
     /** True when the connected computer's agent can approve a Sunshine pairing for this phone (it is a recent enough agent). */

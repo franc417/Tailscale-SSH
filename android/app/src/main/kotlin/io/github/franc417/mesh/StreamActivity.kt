@@ -64,6 +64,7 @@ class StreamActivity : Activity() {
     private lateinit var pinView: TextView
     private lateinit var openPinPage: TextView
     private lateinit var retryButton: TextView
+    private lateinit var soundChip: TextView
     private lateinit var copyDetailsButton: TextView
     private var errorDetail: String = ""
     private lateinit var statusChip: TextView
@@ -200,6 +201,22 @@ class StreamActivity : Activity() {
         setOnClickListener { onClick() }
     }
 
+    private fun soundLabel(): String = "Sound: " + if (AudioPrefs.onComputer(this)) "Computer" else "Phone"
+
+    /** Switches where the sound plays and restarts the stream, because the choice is made when the stream starts. */
+    private fun toggleSound() {
+        AudioPrefs.setOnComputer(this, !AudioPrefs.onComputer(this))
+        soundChip.text = soundLabel()
+        Toast.makeText(this, if (AudioPrefs.onComputer(this)) "Sound stays on the computer" else "Sound plays on the phone", Toast.LENGTH_SHORT).show()
+        restart()
+    }
+
+    /** Closes the desktop view like Close, but first tells the computer this is on purpose so a song playing there keeps playing. */
+    private fun leaveKeepingMusic() {
+        inputLink?.leave()
+        surfaceView.postDelayed({ finish() }, 300) // lets the message leave before the connection is closed
+    }
+
     private fun buildTopBar(): View {
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -209,6 +226,9 @@ class StreamActivity : Activity() {
         }
         val gap = { View(this).apply { layoutParams = LinearLayout.LayoutParams(Ui.dp(this@StreamActivity, 6), 1) } }
         bar.addView(chip("\u2715  Close") { finish() })
+        bar.addView(gap())
+        // Leave: close the desktop view but tell the computer it is on purpose, so its music keeps playing through the end of the stream.
+        bar.addView(chip("Leave") { leaveKeepingMusic() })
         bar.addView(gap())
         statusChip = chip("") { copyReport() }.apply {
             visibility = View.INVISIBLE // invisible, not gone: it holds the space that keeps the other chips on the right
@@ -231,6 +251,9 @@ class StreamActivity : Activity() {
         bar.addView(gap())
         qualityChip = chip(presetList[presetIndex].first.substringBefore(" ")) { showQualityPicker() }
         bar.addView(qualityChip)
+        bar.addView(gap())
+        soundChip = chip(soundLabel()) { toggleSound() }
+        bar.addView(soundChip)
         bar.addView(gap())
         bar.addView(chip("Keyboard") { setKeyboardVisible(keyboardBox.visibility != View.VISIBLE) })
         return bar

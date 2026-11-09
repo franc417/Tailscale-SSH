@@ -41,7 +41,7 @@ object CrashReporter {
     @Suppress("DEPRECATION")
     private fun describe(context: Context, thread: Thread, error: Throwable): String {
         val installed = try {
-            context.packageManager.getPackageInfo(context.packageName, 0).let { "${it.versionName}, installed ${stamp(Date(it.lastUpdateTime))}" }
+            context.packageManager.getPackageInfo(context.packageName, 0).let { "${it.versionName} build ${context.getString(R.string.mesh_build)}, installed ${stamp(Date(it.lastUpdateTime))}" }
         } catch (ignored: Throwable) {
             "unknown"
         }

@@ -51,6 +51,7 @@ class MainActivity : Activity() {
         val titles = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         titles.addView(Ui.text(this, "Mesh", 28f, Ui.TEXT, bold = true))
         titles.addView(Ui.text(this, "Your computers", 14f, Ui.MUTED))
+        titles.addView(Ui.text(this, "Build " + getString(R.string.mesh_build), 11f, Ui.MUTED))
         header.addView(titles)
         column.addView(header)
         column.addView(Ui.gap(this, 16))

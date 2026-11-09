@@ -19,6 +19,7 @@ class MipCodecTest {
         assertEquals("000108", MipCodec.releaseAll().toHex())
         assertEquals("0008010102aabb027068", MipCodec.hello(byteArrayOf(0xAA.toByte(), 0xBB.toByte()), "ph").toHex())
         assertEquals("000109", MipCodec.bye().toHex())
+        assertEquals("00010c", MipCodec.leave().toHex())
     }
 
     @Test

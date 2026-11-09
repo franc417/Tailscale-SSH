@@ -84,6 +84,7 @@ T_RELEASE_ALL = 0x08
 T_BYE = 0x09
 T_SUNSHINE_PAIR = 0x0A    # "pair my desktop view with this PIN" (see SunshineLink)
 T_MOVE_ABS = 0x0B         # put the pointer at a spot on the streamed screen (touch mode)
+T_LEAVE = 0x0C            # "I am leaving the desktop on purpose": keep the music playing through the end of the stream
 # ---- host -> phone
 T_HELLO_OK = 0x81
 T_ERROR = 0x82
@@ -195,6 +196,10 @@ def msg_bye() -> bytes:
 
 def msg_move_abs(x: int, y: int) -> bytes:
     return encode_frame(T_MOVE_ABS, struct.pack("!HH", _clamp_abs(x), _clamp_abs(y)))
+
+
+def msg_leave() -> bytes:
+    return encode_frame(T_LEAVE, b"")
 
 
 def msg_sunshine_pair(pin: str, name: str) -> bytes:
@@ -2660,12 +2665,68 @@ class TailnetTrust:
         return True, device, f"{device} is signed in to Tailscale as {own[1] or 'you'}"
 
 
+# ---------------------------------------------------------------- keeping the music going when the phone leaves
+#
+# Ending a stream can pause a song that was playing on this computer: Sunshine moves the sound output to its own and back again, and
+# some players (browsers, Spotify) pause when their output changes. When the phone says it is LEAVING on purpose (T_LEAVE), the agent
+# notes which media players are playing at that moment (any MPRIS player on the session bus) and, for a few seconds while the stream
+# ends, presses Play on the ones that turn Paused. A player paused by a person is not touched: only players that were playing
+# at the moment of leaving are ever resumed.
+
+MPRIS_PREFIX = "org.mpris.MediaPlayer2."
+
+
+class MediaKeeper:
+    def __init__(self, runner=subprocess.run, which=shutil.which, sleep=time.sleep, clock=time.monotonic, environ=os.environ) -> None:
+        self.runner, self.which, self.sleep, self.clock, self.environ = runner, which, sleep, clock, environ
+
+    def _gdbus(self, *args: str) -> Optional[str]:
+        if self.which("gdbus") is None:
+            return None
+        try:
+            done = self.runner(["gdbus", "call", "--session", *args], capture_output=True, text=True, timeout=5, env=dict(self.environ))
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return done.stdout if done.returncode == 0 else None
+
+    def players(self) -> List[str]:
+        out = self._gdbus("--dest", "org.freedesktop.DBus", "--object-path", "/org/freedesktop/DBus", "--method", "org.freedesktop.DBus.ListNames")
+        return sorted(set(re.findall(r"org\.mpris\.MediaPlayer2\.[A-Za-z0-9_.\-]+", out or "")))
+
+    def status(self, name: str) -> str:
+        out = self._gdbus("--dest", name, "--object-path", "/org/mpris/MediaPlayer2", "--method", "org.freedesktop.DBus.Properties.Get",
+                          "org.mpris.MediaPlayer2.Player", "PlaybackStatus")
+        match = re.search(r"'(Playing|Paused|Stopped)'", out or "")
+        return match.group(1) if match else ""
+
+    def play(self, name: str) -> bool:
+        return self._gdbus("--dest", name, "--object-path", "/org/mpris/MediaPlayer2", "--method", "org.mpris.MediaPlayer2.Player.Play") is not None
+
+    def playing(self) -> List[str]:
+        return [name for name in self.players() if self.status(name) == "Playing"]
+
+    def keep_playing(self, wait: float = 5.0, poll: float = 0.4) -> List[str]:
+        """Blocks for up to [wait] seconds; resumes (once each) the players that were playing now and turn Paused. Returns their names."""
+        was = self.playing()
+        resumed: List[str] = []
+        if not was:
+            return resumed
+        deadline = self.clock() + wait
+        while self.clock() < deadline and len(resumed) < len(was):
+            self.sleep(poll)
+            for name in was:
+                if name not in resumed and self.status(name) == "Paused" and self.play(name):
+                    resumed.append(name)
+        return resumed
+
+
 class Server:
     def __init__(self, injector: Injector, token: bytes, host_name: str = "",
                  hello_timeout: float = HELLO_TIMEOUT, idle_timeout: float = IDLE_TIMEOUT,
                  log: Callable[[str], None] = lambda s: None, sunshine: Optional["SunshineLink"] = None,
-                 tailnet: Optional["TailnetTrust"] = None) -> None:
+                 tailnet: Optional["TailnetTrust"] = None, media: Optional["MediaKeeper"] = None) -> None:
         self.sunshine = sunshine
+        self.media = media                # keeps the music going when the phone says it is leaving on purpose
         self.tailnet = tailnet            # when set, phones of the owner's own Tailscale account need no token
         self._tailnet_peers: set = set()  # writers let in by Tailscale (their HELLO_OK says so)
         self._tasks: set = set()          # running Sunshine pairings, kept so they are not garbage collected
@@ -2778,9 +2839,22 @@ class Server:
                 task = asyncio.ensure_future(self._sunshine_pair(writer, pin, name, self._active_peer))
                 self._tasks.add(task)
                 task.add_done_callback(self._tasks.discard)
+            elif msg_type == T_LEAVE:
+                if self.media is not None:
+                    task = asyncio.ensure_future(asyncio.get_running_loop().run_in_executor(None, self._keep_media, self._active_name))
+                    self._tasks.add(task)
+                    task.add_done_callback(self._tasks.discard)
             elif msg_type == T_BYE:
                 return
             # unknown types are ignored so a newer phone can talk to an older agent
+
+    def _keep_media(self, name: str) -> None:
+        try:
+            resumed = self.media.keep_playing()
+        except Exception as exc:   # a courtesy: it must never matter
+            self.log(f"could not keep the music going: {exc}")
+            return
+        self.log(f"{name} left on purpose" + (f": kept the music going ({', '.join(n.replace(MPRIS_PREFIX, '') for n in resumed)})" if resumed else ""))
 
     def _features(self) -> int:
         features = FEATURE_TEXT | FEATURE_HIRES_SCROLL | FEATURE_SUNSHINE_PAIR
@@ -2845,7 +2919,7 @@ def _log(message: str) -> None:
 async def serve(directory: str, port: int, injector: Injector, log=_log, host: str = "0.0.0.0", tailnet_trust: bool = True) -> None:
     cert, key, token = ensure_identity(directory)
     tailnet = TailnetTrust(directory) if tailnet_trust else None
-    server = Server(injector, token, log=log, sunshine=SunshineLink(directory), tailnet=tailnet)
+    server = Server(injector, token, log=log, sunshine=SunshineLink(directory), tailnet=tailnet, media=MediaKeeper())
     if tailnet is None:
         log("Tailscale trust is OFF: every phone must pair with the token")
     else:
