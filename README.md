@@ -179,6 +179,38 @@ as burned, regardless of whether it's still needed for anything.
 ## Mesh app (in progress)
 
 A phone app (`android/`) that controls your computers: a trackpad and keyboard over its own encrypted input channel
-(`mesh_input.py` on the computer, `android/mesh-core` on the phone), with streamed video to follow.
-How the channel works: [docs/MESH-INPUT-PROTOCOL.md](docs/MESH-INPUT-PROTOCOL.md). How to try it:
-[docs/MESH-TESTING.md](docs/MESH-TESTING.md).
+(`mesh_input.py` on the computer, `android/mesh-core` on the phone), and the computer's desktop streamed to the phone
+(Sunshine on the computer, Moonlight's client engine inside the app). How the channel works:
+[docs/MESH-INPUT-PROTOCOL.md](docs/MESH-INPUT-PROTOCOL.md). Every command: [docs/COMMANDS.md](docs/COMMANDS.md).
+How to try things and what is verified: [docs/MESH-TESTING.md](docs/MESH-TESTING.md).
+
+### Quick start (Tailscale)
+
+Needs the computer (Linux with a desktop session; tested on Arch + GNOME/Wayland) and the phone signed in to the
+**same Tailscale account**. Nothing to pair and no token to copy.
+
+1. **On the computer**, in a clone of this repo:
+
+   ```
+   python3 mesh_input.py doctor     # read-only checklist: what is missing and why
+   python3 mesh_input.py setup      # fixes what it can, asking before each step
+   ```
+
+   `setup` checks Tailscale, input permission (`/dev/uinput`), the agent's identity and service, Sunshine and its own
+   service, Sunshine's login for the agent, the video encoder and graphics driver, and Sunshine's secure port. It
+   ends by printing what to type on the phone. Problems it cannot fix itself (for example a missing package) are
+   listed with the command to run.
+2. **On the phone**: install the `mesh-debug` APK (the artifact of the latest green run under this repo's Actions
+   tab), open Mesh, tap **Add desktop**, type the computer's Tailscale name or address, and leave the *Pairing info*
+   box empty. The agent lets the phone in because it is signed in to the same Tailscale account, and the phone
+   remembers the computer's certificate from then on.
+3. Tap **Open desktop**. The first time, the app pairs with Sunshine by itself (the agent approves the PIN).
+4. **Sound**: with two or more desktops, tap a desktop's card to highlight it; the *Sound for ...* button at the top
+   then belongs to that desktop (computer or phone), so each desktop keeps its own choice.
+
+Not on Tailscale (or another account)? Run `python3 mesh_input.py pair-info` on the computer and paste its output
+into the *Pairing info* box instead; that path uses a token and works on a LAN.
+
+What is not proven yet: it has been tried on one computer and one phone. Streaming a phone-shaped virtual screen
+(`screen-phone`), the Leave button's music handling, and the per-desktop sound choice still need real-device testing
+(see MESH-TESTING.md for the current list).
