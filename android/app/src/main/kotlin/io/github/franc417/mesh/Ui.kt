@@ -13,6 +13,7 @@ import android.widget.TextView
 object Ui {
     val INK = Color.parseColor("#0B0B0C")
     val SURFACE = Color.parseColor("#141416")
+    val SELECTED = Color.parseColor("#1F1F24")
     val BORDER = Color.parseColor("#2B2B30")
     val TEXT = Color.parseColor("#EDEDED")
     val MUTED = Color.parseColor("#8A8A92")

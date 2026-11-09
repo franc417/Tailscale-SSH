@@ -221,6 +221,7 @@ class ComputerFormActivity : Activity() {
             .setMessage("This phone will forget the pairing. The computer keeps its own pairing token until you reset it there.")
             .setPositiveButton("Remove") { _, _ ->
                 store.remove(c.id)
+                AudioPrefs.forget(this, c.id)
                 finish()
             }
             .setNegativeButton("Cancel", null)

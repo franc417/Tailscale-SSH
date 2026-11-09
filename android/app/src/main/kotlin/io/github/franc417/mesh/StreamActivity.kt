@@ -201,13 +201,13 @@ class StreamActivity : Activity() {
         setOnClickListener { onClick() }
     }
 
-    private fun soundLabel(): String = "Sound: " + if (AudioPrefs.onComputer(this)) "Computer" else "Phone"
+    private fun soundLabel(): String = "Sound: " + if (AudioPrefs.onComputer(this, computer.id)) "Computer" else "Phone"
 
     /** Switches where the sound plays and restarts the stream, because the choice is made when the stream starts. */
     private fun toggleSound() {
-        AudioPrefs.setOnComputer(this, !AudioPrefs.onComputer(this))
+        AudioPrefs.setOnComputer(this, computer.id, !AudioPrefs.onComputer(this, computer.id))
         soundChip.text = soundLabel()
-        Toast.makeText(this, if (AudioPrefs.onComputer(this)) "Sound stays on the computer" else "Sound plays on the phone", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, if (AudioPrefs.onComputer(this, computer.id)) "Sound stays on the computer" else "Sound plays on the phone", Toast.LENGTH_SHORT).show()
         restart()
     }
 
@@ -722,7 +722,7 @@ class StreamActivity : Activity() {
         if (!paired || !surfaceReady || session != null) return
         fitSurface()
         showMessage("Starting the stream", "")
-        session = streamClient.start(h, settings, surfaceView.holder.surface, Events(generation), AudioPrefs.onComputer(this))
+        session = streamClient.start(h, settings, surfaceView.holder.surface, Events(generation), AudioPrefs.onComputer(this, computer.id))
     }
 
     private fun stopStream() {

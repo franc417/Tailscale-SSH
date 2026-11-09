@@ -20,6 +20,11 @@ class MainActivity : Activity() {
 
     private lateinit var store: ComputerStore
     private lateinit var listBox: LinearLayout
+    private lateinit var audioButton: TextView
+    private lateinit var audioHelp: TextView
+
+    /** The computer whose card is highlighted: the sound button at the top belongs to it. */
+    private var selectedId: String? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -60,14 +65,12 @@ class MainActivity : Activity() {
             startActivity(Intent(this, ComputerFormActivity::class.java))
         })
         column.addView(Ui.gap(this, 16))
-        // Where the sound comes out, chosen before opening a desktop (the computer by default).
-        val audioHelp = Ui.text(this, AudioChoice.explanation(AudioPrefs.onComputer(this)), 12f, Ui.MUTED)
-        lateinit var audioButton: TextView
-        audioButton = Ui.button(this, AudioChoice.buttonLabel(AudioPrefs.onComputer(this))) {
-            val now = !AudioPrefs.onComputer(this)
-            AudioPrefs.setOnComputer(this, now)
-            audioButton.text = AudioChoice.buttonLabel(now)
-            audioHelp.text = AudioChoice.explanation(now)
+        // Where the sound comes out for the highlighted computer, chosen before opening its desktop (the computer by default).
+        audioHelp = Ui.text(this, "", 12f, Ui.MUTED)
+        audioButton = Ui.button(this, "") {
+            val id = selectedId ?: return@button
+            AudioPrefs.setOnComputer(this, id, !AudioPrefs.onComputer(this, id))
+            refreshAudio()
         }
         column.addView(audioButton)
         column.addView(Ui.gap(this, 6))
@@ -83,17 +86,43 @@ class MainActivity : Activity() {
         }
     }
 
+    /** Shows the sound choice of the highlighted computer (hidden while there is none). */
+    private fun refreshAudio() {
+        val computer = store.all().firstOrNull { it.id == selectedId }
+        if (computer == null) {
+            audioButton.visibility = View.GONE
+            audioHelp.visibility = View.GONE
+            return
+        }
+        val onComputer = AudioPrefs.onComputer(this, computer.id)
+        audioButton.visibility = View.VISIBLE
+        audioHelp.visibility = View.VISIBLE
+        audioButton.text = AudioChoice.buttonLabel(computer.name, onComputer)
+        audioHelp.text = AudioChoice.explanation(onComputer)
+    }
+
+    private fun select(id: String) {
+        selectedId = id
+        AudioPrefs.setSelectedId(this, id)
+        renderList()
+    }
+
     private fun renderList() {
         listBox.removeAllViews()
         val computers = store.all()
+        selectedId = AudioChoice.pickSelected(computers.map { it.id }, selectedId ?: AudioPrefs.selectedId(this))
+        refreshAudio()
         if (computers.isEmpty()) {
             listBox.addView(Ui.text(this, "No computers yet. Tap Add desktop.", 14f, Ui.MUTED))
             return
         }
         for (c in computers) {
+            // With two or more computers the tapped one is highlighted (white border); the sound button at the top is its own.
+            val highlighted = computers.size > 1 && c.id == selectedId
             val card = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
-                background = Ui.box(this@MainActivity)
+                background = if (highlighted) Ui.box(this@MainActivity, fill = Ui.SELECTED, stroke = Ui.TEXT) else Ui.box(this@MainActivity)
+                setOnClickListener { select(c.id) }
                 val p = Ui.dp(this@MainActivity, 16)
                 setPadding(p, p, p, p)
                 addView(Ui.text(this@MainActivity, c.name, 17f, Ui.TEXT, bold = true))
