@@ -3,6 +3,12 @@
 Run them in a terminal inside the desktop, from the Tailscale-SSH folder (`cd ~/Downloads/Tailscale-SSH`).
 Update first: `git pull https://github.com/franc417/Tailscale-SSH.git main`
 
+## The easy way: `meshd` (new)
+
+`python3 meshd.py install` does the whole first-time setup for your distribution; afterwards `meshd` shows the state of the
+agent, Sunshine and the supervisor, and `meshd enable|disable|start|stop|restart|logs|login|pair` manage them. See
+[MESHD.md](MESHD.md). The commands below are the lower-level pieces it is built from.
+
 ## First time on a computer (or to repair one)
 
 | Command | What it does |

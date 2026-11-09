@@ -950,9 +950,10 @@ class SunshineLink:
         status, _ = self._call("GET", "/api/pin", auth=False)
         return status in (301, 302, 303, 307, 308)
 
-    def create_login(self, username: str = "mesh") -> str:
-        """Sets Sunshine's first web login (only possible while it has none) and saves it. Returns the password."""
-        password = secrets.token_urlsafe(18)
+    def create_login(self, username: str = "mesh", password: Optional[str] = None) -> str:
+        """Sets Sunshine's first web login (only possible while it has none) and saves it. Returns the password
+        (the one given, else a random one)."""
+        password = password or secrets.token_urlsafe(18)
         status, data = self._call("POST", "/api/password", auth=False, body={
             "newUsername": username, "newPassword": password, "confirmNewPassword": password})
         if status != 200 or not (isinstance(data, dict) and data.get("status") is True):

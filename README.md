@@ -189,17 +189,17 @@ How to try things and what is verified: [docs/MESH-TESTING.md](docs/MESH-TESTING
 Needs the computer (Linux with a desktop session; tested on Arch + GNOME/Wayland) and the phone signed in to the
 **same Tailscale account**. Nothing to pair and no token to copy.
 
-1. **On the computer**, in a clone of this repo:
+1. **On the computer**, in a clone (or unzipped copy) of this repo:
 
    ```
-   python3 mesh_input.py doctor     # read-only checklist: what is missing and why
-   python3 mesh_input.py setup      # fixes what it can, asking before each step
+   python3 meshd.py install
    ```
 
-   `setup` checks Tailscale, input permission (`/dev/uinput`), the agent's identity and service, Sunshine and its own
-   service, Sunshine's login for the agent, the video encoder and graphics driver, and Sunshine's secure port. It
-   ends by printing what to type on the phone. Problems it cannot fix itself (for example a missing package) are
-   listed with the command to run.
+   It detects your distribution, installs what is missing (asking before each step), sets up Sunshine's web account (a new
+   Sunshine gets the username and password you choose; an existing account is asked for and checked), runs the input
+   agent, Sunshine and a supervisor in the background (at login, at boot, again after a crash or a reconnection), and
+   prints what to type on the phone. From then on `meshd` shows what is running. Details: [docs/MESHD.md](docs/MESHD.md).
+   (`python3 mesh_input.py doctor` / `setup` still work as the lower-level checklist.)
 2. **On the phone**: install the `mesh-debug` APK (the artifact of the latest green run under this repo's Actions
    tab), open Mesh, tap **Add desktop**, type the computer's Tailscale name or address, and leave the *Pairing info*
    box empty. The agent lets the phone in because it is signed in to the same Tailscale account, and the phone
