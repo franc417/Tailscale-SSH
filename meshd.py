@@ -8,7 +8,7 @@
     meshd disable         stop and unregister the background services
     meshd start|stop|restart [agent|sunshine|supervisor|all]
     meshd logs [-f]       what the background services printed
-    meshd pair            what to type (or paste) on the phone to add this computer
+    meshd pair            what to type, scan (QR code) or paste on the phone to add this computer
     meshd supervise       the supervisor itself (the service runs this; you do not need to)
 
 Standard library only. It drives mesh_input.py (the input agent, doctor/setup, Sunshine helpers) which sits next to this file.
@@ -16,6 +16,7 @@ Everything is a systemd *user* service: no root once the packages are installed.
 """
 
 import argparse
+import base64
 import getpass
 import json
 import os
@@ -25,6 +26,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.parse
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Deque, Dict, List, Optional, Tuple
@@ -34,6 +36,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import mesh_input as mi  # noqa: E402
+import meshqr  # noqa: E402
 
 APP = "meshd"
 TITLE = "Mesh Host"          # the name shown at the top of every screen; change it here
@@ -760,7 +763,24 @@ def copy_to_clipboard(env: Env, text: str) -> Optional[str]:
     return None
 
 
-def pair_text(env: Env, say: Callable[[str], None] = print) -> int:
+def pair_uri(info: dict, max_addresses: int = 3) -> str:
+    """The pairing info as one short link, for the QR code: mesh://pair?v=1&p=PORT&f=FINGERPRINT&t=TOKEN&h=NAME&a=ADDR,ADDR.
+    The fingerprint and the token travel as base64url (43 characters each instead of 64), and only IPv4 addresses are listed,
+    so the code stays small (a small code is the difference between scanning at once and not at all with a weak camera).
+    The app's PairInfo.parse reads this and the long JSON alike."""
+    def b64(hexstring: str) -> str:
+        return base64.urlsafe_b64encode(bytes.fromhex(hexstring)).rstrip(b"=").decode()
+
+    addresses = [a for a in info.get("addresses", []) if ":" not in a][:max_addresses]
+    parts = [f"v={info['version']}", f"p={info['port']}", f"f={b64(info['fingerprint'])}", f"t={b64(info['token'])}"]
+    if info.get("host"):
+        parts.append("h=" + urllib.parse.quote(str(info["host"]), safe=""))
+    if addresses:
+        parts.append("a=" + ",".join(urllib.parse.quote(a, safe=".") for a in addresses))
+    return "mesh://pair?" + "&".join(parts)
+
+
+def pair_text(env: Env, say: Callable[[str], None] = print, qr: bool = False, png: Optional[str] = None, columns: int = 80) -> int:
     ts = mi.tailscale_summary(env.runner, env.which)
     try:
         info = mi.pair_info(env.directory, env.port)
@@ -773,10 +793,22 @@ def pair_text(env: Env, say: Callable[[str], None] = print) -> int:
         say(f"    Addresses:     {ts['name'] or ts['ip']}")
         say( "    Pairing info:  leave empty")
     else:
-        say("\n  Tailscale is not running here, so use the pairing info below (the phone must be able to reach this computer's address).")
+        say("\n  Tailscale is not running here, so use the QR code or the pairing info below (the phone must reach this computer's address, for example on the same Wi-Fi).")
+    if qr or png:
+        matrix = meshqr.encode(pair_uri(info).encode())
+        if qr:
+            say("\n  No Tailscale, or another account: in the app tap Add desktop, then Scan QR code, and point the camera at this.")
+            say("  (Make the terminal text bigger if it will not scan. Anyone who can see this code can use this computer's keyboard and mouse: do not share a screenshot.)\n")
+            say(meshqr.render_terminal(matrix, scale=2 if columns >= 2 * (len(matrix) + 4) else 1))
+        if png:
+            try:
+                meshqr.write_png(png, matrix)
+                say(f"\n  The code is also saved as {png} (open it on a screen; delete it afterwards, it holds the pairing secret).")
+            except OSError as exc:
+                say(f"\n  could not write {png}: {exc}")
     line = json.dumps(info)
     tool = copy_to_clipboard(env, line)
-    say("\n  Different account, or no Tailscale: paste this into the Pairing info box:")
+    say("\n  Or paste this into the Pairing info box:")
     say(f"    {line}")
     if tool:
         say(f"    (already copied with {tool})")
@@ -808,7 +840,10 @@ def main(argv: Optional[List[str]] = None, env: Optional[Env] = None) -> int:
     p = sub.add_parser("logs", help="what the services printed")
     p.add_argument("-n", type=int, default=60)
     p.add_argument("-f", action="store_true")
-    sub.add_parser("pair", help="what to type or paste on the phone")
+    p = sub.add_parser("pair", help="what to type, scan or paste on the phone")
+    p.add_argument("--qr", action="store_true", help="draw the QR code even when the output is not a terminal")
+    p.add_argument("--no-qr", action="store_true", help="do not draw the QR code")
+    p.add_argument("--png", metavar="FILE", default=None, help="also save the QR code as a picture")
     p = sub.add_parser("supervise", help="the supervisor loop (run by its service)")
     p.add_argument("--interval", type=float, default=10.0)
     args = ap.parse_args(argv)
@@ -840,7 +875,7 @@ def main(argv: Optional[List[str]] = None, env: Optional[Env] = None) -> int:
         print(f"\n{style.bold('Sunshine account')}")
         code = login(env) or code
         print()
-        pair_text(env)
+        pair_text(env, qr=sys.stdout.isatty(), columns=shutil.get_terminal_size().columns)
         print("\n" + status_text(env, style))
         return code
     if command == "login":
@@ -863,7 +898,7 @@ def main(argv: Optional[List[str]] = None, env: Optional[Env] = None) -> int:
         except KeyboardInterrupt:
             return 0
     if command == "pair":
-        return pair_text(env)
+        return pair_text(env, qr=(args.qr or sys.stdout.isatty()) and not args.no_qr, png=args.png, columns=shutil.get_terminal_size().columns)
     if command == "supervise":
         try:
             Supervisor(env).run(args.interval)

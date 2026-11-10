@@ -621,3 +621,71 @@ def test_pair_without_tailscale_shows_the_info_only(world, monkeypatch):
     said = []
     meshd.pair_text(world, say=said.append)
     assert "Tailscale is not running" in "\n".join(said) and "leave empty" not in "\n".join(said)
+
+
+# ---- the pairing link and QR code
+
+INFO = {"version": 1, "port": 47600, "fingerprint": "ab" * 32, "token": "cd" * 32, "host": "mkz",
+        "addresses": ["192.168.1.5", "100.67.163.21", "fd7a:115c:a1e0::1"]}
+GOLDEN_URI = ("mesh://pair?v=1&p=47600&f=q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s"
+              "&t=zc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc0&h=mkz&a=192.168.1.5,100.67.163.21")
+
+
+def test_the_pairing_link_is_compact_and_has_a_fixed_shape():
+    # the Kotlin test PairInfoTest.theCompactLinkFromTheHostIsRead uses this very string: change both together
+    assert meshd.pair_uri(INFO) == GOLDEN_URI
+
+
+def test_the_link_keeps_only_ipv4_addresses_and_at_most_three():
+    info = dict(INFO, addresses=["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4", "fe80::1"])
+    assert meshd.pair_uri(info).endswith("a=10.0.0.1,10.0.0.2,10.0.0.3")
+
+
+def test_the_link_without_a_name_or_addresses():
+    uri = meshd.pair_uri(dict(INFO, host="", addresses=[]))
+    assert "&h=" not in uri and "&a=" not in uri
+
+
+def test_a_name_with_odd_characters_is_escaped():
+    assert "h=my%20pc%26co" in meshd.pair_uri(dict(INFO, host="my pc&co"))
+
+
+def test_the_link_is_small_enough_for_a_code_a_weak_camera_can_read():
+    import meshqr
+    matrix = meshqr.encode(meshd.pair_uri(INFO).encode())
+    assert len(matrix) <= 49          # version 8 or smaller
+
+
+def test_pair_draws_the_qr_code_when_asked_and_explains_how_to_scan_it(world, monkeypatch):
+    monkeypatch.setattr(mi, "pair_info", lambda d, p: dict(INFO))
+    world.system.tailscale = {"BackendState": "Stopped", "Self": {}}
+    said = []
+    meshd.pair_text(world, say=said.append, qr=True, columns=120)
+    text = "\n".join(said)
+    assert "Scan QR code" in text and "\x1b[38;5;16" in text and "do not share a screenshot" in text
+    assert text.count("\n") > 25                  # the code itself is many lines
+
+
+def test_pair_uses_the_small_drawing_on_a_narrow_terminal(world, monkeypatch):
+    monkeypatch.setattr(mi, "pair_info", lambda d, p: dict(INFO))
+    wide, narrow = [], []
+    meshd.pair_text(world, say=wide.append, qr=True, columns=200)
+    meshd.pair_text(world, say=narrow.append, qr=True, columns=60)
+    code_wide = max(wide, key=len)
+    code_narrow = max(narrow, key=len)
+    assert code_wide.count("\n") + 1 == 45 + 4 and code_narrow.count("\n") + 1 == (45 + 4 + 1) // 2
+
+
+def test_pair_without_the_flag_draws_no_code(world, monkeypatch):
+    monkeypatch.setattr(mi, "pair_info", lambda d, p: dict(INFO))
+    said = []
+    meshd.pair_text(world, say=said.append)
+    assert "\x1b" not in "\n".join(said)
+
+
+def test_pair_can_save_the_code_as_a_picture(world, monkeypatch, tmp_path):
+    monkeypatch.setattr(mi, "pair_info", lambda d, p: dict(INFO))
+    out = tmp_path / "pair.png"
+    said = []
+    meshd.pair_text(world, say=said.append, png=str(out))
+    assert out.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n" and any("saved as" in line for line in said)
