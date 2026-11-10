@@ -90,4 +90,70 @@ class PairInfoTest {
         val pretty = "{\n \"version\": 1,\n \"port\": 47600,\n \"fingerprint\": \"$fp\",\n \"token\": \"$tok\",\n \"addresses\": [\n  \"100.1.2.3\",\n  \"10.0.0.5\"\n ]\n}"
         assertEquals(listOf("100.1.2.3", "10.0.0.5"), PairInfo.parse(pretty).addresses)
     }
+
+    // ---- the short link in the QR code (the same string is GOLDEN_URI in tests/test_meshd.py: change both together)
+
+    private val link = "mesh://pair?v=1&p=47600&f=q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s" +
+        "&t=zc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc0&h=mkz&a=192.168.1.5,100.67.163.21"
+
+    @Test
+    fun `the compact link printed by meshd pair is read`() {
+        assertEquals(PairInfo(1, 47600, fp, tok, "mkz", listOf("192.168.1.5", "100.67.163.21")), PairInfo.parse(link))
+    }
+
+    @Test
+    fun `a link with text around it still parses`() {
+        assertEquals(fp, PairInfo.parse("scanned: $link  (thanks)").fingerprint)
+        assertEquals(tok, PairInfo.parse("\"$link\"").tokenHex)
+    }
+
+    @Test
+    fun `a link without a name or addresses parses with both empty`() {
+        val info = PairInfo.parse("mesh://pair?v=1&p=4711&f=q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s&t=zc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc0")
+        assertEquals("", info.hostName)
+        assertTrue(info.addresses.isEmpty())
+        assertEquals(4711, info.port)
+    }
+
+    @Test
+    fun `an escaped name in a link is unescaped`() {
+        assertEquals("my pc&co", PairInfo.parse(link.replace("h=mkz", "h=my%20pc%26co")).hostName)
+    }
+
+    @Test
+    fun `addresses that cannot work are dropped from a link`() {
+        assertEquals(listOf("192.168.1.5"), PairInfo.parse(link.replace("a=192.168.1.5,100.67.163.21", "a=0.0.0.0,192.168.1.5,192.168.1.5")).addresses)
+    }
+
+    @Test
+    fun `a link missing its token or fingerprint is refused with a plain message`() {
+        assertTrue(rejected(link.replace(Regex("&t=[^&]*"), "")).contains("pairing token"))
+        assertTrue(rejected(link.replace(Regex("&f=[^&]*"), "")).contains("fingerprint"))
+    }
+
+    @Test
+    fun `a damaged or short value in a link is refused`() {
+        assertTrue(rejected(link.replace("f=q6urq6ur", "f=!!!!q6ur")).contains("damaged"))
+        assertTrue(rejected(link.replace(Regex("t=[^&]*"), "t=zc3N")).contains("32 bytes"))
+    }
+
+    @Test
+    fun `a link for another protocol version names both versions`() {
+        val message = rejected(link.replace("v=1", "v=9"))
+        assertTrue(message.contains("version 9"))
+    }
+
+    @Test
+    fun `a link with no port is refused`() {
+        assertTrue(rejected(link.replace("&p=47600", "")).contains("port"))
+    }
+
+    @Test
+    fun `the scanner accepts either form of pairing info and ignores anything else`() {
+        assertTrue(PairInfo.looksLikePairing(link))
+        assertTrue(PairInfo.looksLikePairing(agentOutput))
+        assertTrue(!PairInfo.looksLikePairing("https://example.com/menu"))
+        assertTrue(!PairInfo.looksLikePairing("WIFI:S:home;T:WPA;P:secret;;"))
+    }
 }
+

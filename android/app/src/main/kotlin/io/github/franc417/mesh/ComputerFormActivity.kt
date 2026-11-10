@@ -4,6 +4,7 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.os.Bundle
 import android.text.InputType
 import android.view.Gravity
@@ -91,7 +92,7 @@ class ComputerFormActivity : Activity() {
             column.addView(Ui.gap(this, 14))
         }
 
-        column.addView(label(if (editing == null) "Pairing info (only without Tailscale)" else "New pairing info (optional)"))
+        column.addView(label(if (editing == null) "Pairing info (only without Tailscale): scan or paste" else "New pairing info (optional)"))
         if (editing != null) {
             column.addView(Ui.text(this, "Only needed if the agent on the computer was reinstalled or its pairing was reset. It replaces the saved pairing, and its port wins over the one above.", 12f, Ui.MUTED))
             column.addView(Ui.gap(this, 6))
@@ -102,6 +103,8 @@ class ComputerFormActivity : Activity() {
         }
         column.addView(pairInput)
         column.addView(Ui.gap(this, 10))
+        column.addView(Ui.button(this, "Scan QR code") { scanCode() })
+        column.addView(Ui.text(this, "On the computer run  meshd pair  and scan the code it prints.", 12f, Ui.MUTED).apply { setPadding(0, Ui.dp(this@ComputerFormActivity, 6), 0, Ui.dp(this@ComputerFormActivity, 10)) })
         column.addView(Ui.button(this, "Paste from clipboard") { pasteFromClipboard() })
         column.addView(Ui.gap(this, 22))
 
@@ -145,6 +148,20 @@ class ComputerFormActivity : Activity() {
         background = Ui.box(this@ComputerFormActivity)
         val h = Ui.dp(this@ComputerFormActivity, 14)
         setPadding(h, Ui.dp(this@ComputerFormActivity, 12), h, Ui.dp(this@ComputerFormActivity, 12))
+    }
+
+    private fun scanCode() {
+        startActivityForResult(Intent(this, ScanActivity::class.java), REQUEST_SCAN)
+    }
+
+    @Deprecated("the result of the scanning screen")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQUEST_SCAN || resultCode != RESULT_OK) return
+        val text = data?.getStringExtra(ScanActivity.EXTRA_TEXT) ?: return
+        pairInput.setText(text)
+        val name = try { PairInfo.parse(text).hostName } catch (e: PairInfo.ParseException) { "" }
+        toast("Scanned the pairing info of " + name.ifEmpty { "the computer" } + ". Tap Add.")
     }
 
     private fun pasteFromClipboard() {
@@ -233,5 +250,6 @@ class ComputerFormActivity : Activity() {
     companion object {
         /** Present: edit that computer. Absent: add a new one. */
         const val EXTRA_ID = "computer_id"
+        private const val REQUEST_SCAN = 41
     }
 }

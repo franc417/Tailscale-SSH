@@ -5,6 +5,9 @@
     <!-- Needed to hold the low-latency Wi-Fi lock while the desktop view is open -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- Only for scanning the pairing QR code; a phone without a camera can still paste the pairing info -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <!-- usesCleartextTraffic: Sunshine answers discovery and the first step of pairing (port 47989) over plain HTTP by
          design; the pairing exchange itself is encrypted with the PIN and everything after it uses pinned HTTPS. Android
@@ -33,6 +36,12 @@
             android:name=".ComputerFormActivity"
             android:exported="false"
             android:windowSoftInputMode="adjustResize" />
+
+        <!-- Scans the pairing QR code printed by `meshd pair`: portrait, camera picture with a square in the middle. -->
+        <activity
+            android:name=".ScanActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
 
         <!-- The desktop view: landscape, full screen. Video and audio come from the streaming core, input goes over Mesh's own channel. -->
         <activity

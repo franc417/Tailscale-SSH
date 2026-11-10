@@ -632,7 +632,7 @@ GOLDEN_URI = ("mesh://pair?v=1&p=47600&f=q6urq6urq6urq6urq6urq6urq6urq6urq6urq6u
 
 
 def test_the_pairing_link_is_compact_and_has_a_fixed_shape():
-    # the Kotlin test PairInfoTest.theCompactLinkFromTheHostIsRead uses this very string: change both together
+    # the Kotlin test PairInfoTest `the compact link printed by meshd pair is read` uses this very string: change both together
     assert meshd.pair_uri(INFO) == GOLDEN_URI
 
 
