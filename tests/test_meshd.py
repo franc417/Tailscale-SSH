@@ -150,7 +150,8 @@ def world(tmp_path):
     system.unit(meshd.SUPERVISOR_UNIT)
     env = meshd.Env(directory=str(tmp_path / "agent"), port=47600, runner=system, which=lambda n: "/usr/bin/" + n, environ={}, tools=tools,
                     link=link, connect=lambda h, p, t=2.0: p in ports or (h, p) in ports, uptime=lambda: 10000.0,
-                    unit_directory=str(tmp_path / "units"), wall=clock.wall, sleep=clock.sleep, user="mkz", access=lambda p, m: True)
+                    unit_directory=str(tmp_path / "units"), wall=clock.wall, sleep=clock.sleep, user="mkz", access=lambda p, m: True,
+                    mesh_probe=lambda: "ok")
     os.makedirs(env.directory)
     with open(os.path.join(env.directory, meshd.STATE_FILE), "w") as f:
         json.dump({"time": clock.now - 4}, f)
@@ -303,7 +304,7 @@ def test_a_bare_arch_machine_gets_every_step_with_real_commands():
     plan = meshd.install_plan("arch", False, False, False, False, "intel")
     commands = [s.command for s in plan]
     assert any("tailscale.com/install.sh" in c for c in commands)
-    assert "sudo tailscale up" in commands
+    assert any(c.startswith("sudo tailscale up --operator=") for c in commands)
     assert any("lizardbyte/sunshine" in c for c in commands)
     assert any("/dev/udev" not in c and "85-sunshine.rules" in c for c in commands)
     assert any("intel-media-driver" in c for c in commands)
@@ -331,7 +332,7 @@ def test_install_runs_the_steps_after_asking_and_writes_the_launcher(world, tmp_
     code = meshd.install(world, say=said.append, ask=lambda q: "y", os_release=OS["arch"], shell=lambda c: ran.append(c) or 0,
                          bin_dir=str(tmp_path / "bin"))
     assert code == 0
-    assert "sudo tailscale up" in ran
+    assert any(c.startswith("sudo tailscale up") for c in ran)
     launcher = tmp_path / "bin" / "meshd"
     assert launcher.exists() and os.access(launcher, os.X_OK) and "meshd.py" in launcher.read_text()
     assert any("Detected: Arch Linux" in line for line in said)
@@ -689,3 +690,103 @@ def test_pair_can_save_the_code_as_a_picture(world, monkeypatch, tmp_path):
     said = []
     meshd.pair_text(world, say=said.append, png=str(out))
     assert out.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n" and any("saved as" in line for line in said)
+
+
+# ---- one install for both tools: meshd sets up `mesh` (the Termux/SSH tool) from this same folder
+
+def test_a_computer_without_mesh_is_offered_it_installed_from_this_folder_then_prepared():
+    plan = meshd.install_plan("arch", True, True, True, True, "", mesh_state="missing")
+    titles = [s.title for s in plan]
+    assert titles[0].startswith("Install mesh") and titles[1].startswith("Prepare this computer for mesh")
+    assert plan[0].command == f"bash {meshd.shlex.quote(os.path.join(meshd.HERE, 'install.sh'))}"
+    assert "tailscale_ssh.py" in plan[1].command and plan[1].command.endswith(" setup")
+    assert all(s.optional for s in plan)
+    assert "no second sign-in" in plan[1].note
+
+
+def test_an_installed_but_never_prepared_mesh_only_gets_the_preparation():
+    plan = meshd.install_plan("arch", True, True, True, True, "", mesh_state="unconfigured")
+    assert [s.title.split(" for ")[0] for s in plan] == ["Prepare this computer"]
+
+
+def test_a_ready_mesh_is_left_alone():
+    assert meshd.install_plan("arch", True, True, True, True, "", mesh_state="ok") == []
+
+
+def test_with_yes_the_preparation_asks_nothing_either():
+    plan = meshd.install_plan("arch", True, True, True, True, "", mesh_state="unconfigured", assume_yes=True)
+    assert plan[0].command.endswith(" setup -y")
+
+
+def test_mesh_state_from_the_files_on_disk(tmp_path):
+    home = tmp_path / "home"
+    assert meshd.detect_mesh_state({}, str(home)) == "missing"
+    engine = home / ".local" / "share" / "tailscale-ssh"
+    engine.mkdir(parents=True)
+    (engine / "tailscale_ssh.py").write_text("x")
+    assert meshd.detect_mesh_state({}, str(home)) == "unconfigured"
+    conf = home / ".config" / "tailscale-ssh"
+    conf.mkdir(parents=True)
+    (conf / "config.json").write_text('{"configured": false}')
+    assert meshd.detect_mesh_state({}, str(home)) == "unconfigured"
+    (conf / "config.json").write_text('{"configured": true}')
+    assert meshd.detect_mesh_state({}, str(home)) == "ok"
+    (conf / "config.json").write_text("not json")
+    assert meshd.detect_mesh_state({}, str(home)) == "unconfigured"
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    (other / "config.json").write_text('{"configured": true}')
+    assert meshd.detect_mesh_state({"TSSH_CONFIG_DIR": str(other)}, str(home)) == "ok"      # the same override mesh itself honours
+
+
+def test_install_runs_the_mesh_steps_in_order_after_the_others(world, tmp_path):
+    world.mesh_state = lambda: "missing"
+    ran = []
+    code = meshd.install(world, say=lambda t: None, yes=True, os_release=OS["arch"], shell=lambda c: ran.append(c) or 0, bin_dir=str(tmp_path / "bin"))
+    assert code == 0 and len(ran) == 2
+    assert ran[0].startswith("bash ") and ran[0].endswith("install.sh'") or ran[0].endswith("install.sh")
+    assert "tailscale_ssh.py" in ran[1] and ran[1].endswith(" setup -y")
+
+
+def test_declining_the_optional_mesh_steps_is_not_a_failure(world, tmp_path):
+    world.mesh_state = lambda: "missing"
+    said = []
+    code = meshd.install(world, say=said.append, ask=lambda q: "n", os_release=OS["arch"], shell=lambda c: 0, bin_dir=str(tmp_path / "bin"))
+    assert code == 0 and sum("skipped (optional)" in line for line in said) == 2
+
+
+def test_a_failing_optional_mesh_step_does_not_fail_the_install_but_is_reported(world, tmp_path):
+    world.mesh_state = lambda: "unconfigured"
+    said = []
+    code = meshd.install(world, say=said.append, yes=True, os_release=OS["arch"], shell=lambda c: 1, bin_dir=str(tmp_path / "bin"))
+    assert code == 0 and any("optional: everything else is unaffected" in line for line in said)
+
+
+def test_a_failing_required_step_still_fails_even_when_mesh_is_fine(world, tmp_path):
+    world.system.tailscale = {"BackendState": "Stopped", "Self": {}}
+    assert meshd.install(world, say=lambda t: None, yes=True, os_release=OS["arch"], shell=lambda c: 1, bin_dir=str(tmp_path / "bin")) == 1
+
+
+def test_pair_tells_the_phone_how_to_reach_a_terminal_here(world, monkeypatch):
+    monkeypatch.setattr(mi, "pair_info", lambda d, p: dict(INFO))
+    said = []
+    meshd.pair_text(world, say=said.append)
+    text = "\n".join(said)
+    assert "pkg install python curl" in text and "mesh add mkz" in text and "mesh add 100.67.163.21" in text
+    assert "meshd install" not in text                      # mesh is already set up here
+
+
+def test_pair_says_to_prepare_mesh_here_first_when_it_is_not(world, monkeypatch):
+    monkeypatch.setattr(mi, "pair_info", lambda d, p: dict(INFO))
+    world.mesh_state = lambda: "unconfigured"
+    said = []
+    meshd.pair_text(world, say=said.append)
+    assert "on this computer first:  meshd install" in "\n".join(said)
+
+
+def test_pair_without_tailscale_has_no_termux_block(world, monkeypatch):
+    monkeypatch.setattr(mi, "pair_info", lambda d, p: dict(INFO))
+    world.system.tailscale = {"BackendState": "Stopped", "Self": {}}
+    said = []
+    meshd.pair_text(world, say=said.append)
+    assert "Termux" not in "\n".join(said)

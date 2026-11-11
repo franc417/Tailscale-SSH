@@ -21,6 +21,7 @@ import getpass
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -149,7 +150,7 @@ def _read_uptime() -> float:
 class Env:
     def __init__(self, directory: Optional[str] = None, port: int = mi.DEFAULT_PORT, runner=subprocess.run, which=shutil.which,
                  environ=os.environ, tools=None, link=None, connect=None, uptime=None, unit_directory: Optional[str] = None,
-                 wall=time.time, sleep=time.sleep, user: Optional[str] = None, access=os.access) -> None:
+                 wall=time.time, sleep=time.sleep, user: Optional[str] = None, access=os.access, mesh_probe=None) -> None:
         self.directory = directory or mi.default_dir()
         self.port, self.runner, self.which, self.environ = port, runner, which, environ
         self.tools = tools or mi.ProcessTools(runner=runner, which=which, environ=environ)
@@ -158,6 +159,7 @@ class Env:
         self.uptime = uptime or _read_uptime
         self.unit_directory = unit_directory or mi.unit_dir()
         self.wall, self.sleep, self.access = wall, sleep, access
+        self.mesh_state = mesh_probe or (lambda: detect_mesh_state(environ))
         self.user = user or getpass.getuser()
 
     def run(self, args: List[str], timeout: float = 20.0) -> Tuple[int, str]:
@@ -667,15 +669,46 @@ class InstallStep:
     title: str
     command: str = ""        # a shell command to run (sudo asks for the password itself); empty = a manual step
     note: str = ""
+    optional: bool = False   # declining or failing it does not make `meshd install` fail
 
 
-def install_plan(family: str, has_tailscale: bool, tailscale_running: bool, has_sunshine: bool, uinput_ok: bool, gpu: str) -> List[InstallStep]:
+def detect_mesh_state(environ=os.environ, home: Optional[str] = None) -> str:
+    """The shell-access tool (`mesh`, tailscale_ssh.py) on this computer: 'missing' (not installed), 'unconfigured' (installed, its setup never
+    finished: no SSH server or key prepared) or 'ok'."""
+    home = home or os.path.expanduser("~")
+    if not os.path.exists(os.path.join(home, ".local", "share", "tailscale-ssh", "tailscale_ssh.py")):
+        return "missing"
+    conf_dir = environ.get("TSSH_CONFIG_DIR") or os.path.join(home, ".config", "tailscale-ssh")
+    try:
+        with open(os.path.join(conf_dir, "config.json")) as f:
+            return "ok" if json.load(f).get("configured") else "unconfigured"
+    except (OSError, ValueError):
+        return "unconfigured"
+
+
+def mesh_steps(state: str, assume_yes: bool = False, directory: str = HERE) -> List[InstallStep]:
+    """Installing `mesh` from THIS folder (nothing is downloaded) and running its setup. Tailscale is already signed in by then, so mesh's own
+    sign-in step sees 'already connected': one sign-in for both tools."""
+    steps: List[InstallStep] = []
+    if state == "missing":
+        steps.append(InstallStep("Install mesh: a terminal on this computer from your phone (Termux), and a live list of your devices",
+                                 f"bash {shlex.quote(os.path.join(directory, 'install.sh'))}",
+                                 "installed from this folder; optional, the Mesh app does not need it", optional=True))
+    if state in ("missing", "unconfigured"):
+        steps.append(InstallStep("Prepare this computer for mesh (SSH server and key)",
+                                 f"TSSH_BRAND=mesh python3 {shlex.quote(os.path.join(directory, 'tailscale_ssh.py'))} setup" + (" -y" if assume_yes else ""),
+                                 "uses the Tailscale account you just signed in with: no second sign-in", optional=True))
+    return steps
+
+
+def install_plan(family: str, has_tailscale: bool, tailscale_running: bool, has_sunshine: bool, uinput_ok: bool, gpu: str,
+                 mesh_state: str = "ok", assume_yes: bool = False) -> List[InstallStep]:
     steps: List[InstallStep] = []
     if not has_tailscale:
         steps.append(InstallStep("Install Tailscale (the private network between your phone and this computer)", TAILSCALE_INSTALL,
                                  "Tailscale's own installer, for every distribution"))
     if not tailscale_running:
-        steps.append(InstallStep("Sign this computer in to Tailscale (use the same account as on the phone)", "sudo tailscale up",
+        steps.append(InstallStep("Sign this computer in to Tailscale (use the same account as on the phone)", f"sudo tailscale up --operator={getpass.getuser()}",
                                  "it prints a link to open in a browser"))
     if not has_sunshine:
         if family == "arch":
@@ -694,6 +727,7 @@ def install_plan(family: str, has_tailscale: bool, tailscale_running: bool, has_
     elif gpu and family != "arch":
         steps.append(InstallStep("Install your graphics chip's VA-API video driver (package names differ per distribution)", "",
                                  "then run  meshd setup  to check the encoder"))
+    steps.extend(mesh_steps(mesh_state, assume_yes))
     return steps
 
 
@@ -724,7 +758,7 @@ def install(env: Env, say: Callable[[str], None] = print, ask: Callable[[str], s
     uinput_ok = env.access("/dev/uinput", os.W_OK)
     code, lspci = env.run(["lspci"], timeout=8.0)
     plan = install_plan(family, ts["state"] != "missing", ts["state"] == "Running", env.which("sunshine") is not None,
-                        uinput_ok, mi.gpu_vendor(lspci if code == 0 else ""))
+                        uinput_ok, mi.gpu_vendor(lspci if code == 0 else ""), env.mesh_state(), yes)
     problems = 0
     if not plan:
         say("Nothing to install: everything needed is already here.")
@@ -739,12 +773,12 @@ def install(env: Env, say: Callable[[str], None] = print, ask: Callable[[str], s
         for line in step.command.splitlines():
             say(f"   $ {line}")
         if not yes and ask("   Run it? [Y/n] ").strip().lower() in ("n", "no"):
-            say("   skipped")
-            problems += 1
+            say("   skipped" + (" (optional)" if step.optional else ""))
+            problems += 0 if step.optional else 1
             continue
         if shell(step.command) != 0:
-            say("   that did not finish; fix it and run  meshd install  again")
-            problems += 1
+            say("   that did not finish; fix it and run  meshd install  again" + ("  (optional: everything else is unaffected)" if step.optional else ""))
+            problems += 0 if step.optional else 1
     path, on_path = install_launcher(bin_dir or os.path.join(os.path.expanduser("~"), ".local", "bin"))
     say(f"\nThe command is now {path}" + ("" if on_path else "   (add its folder to your PATH, or run it by that path)"))
     return 1 if problems else 0
@@ -812,6 +846,13 @@ def pair_text(env: Env, say: Callable[[str], None] = print, qr: bool = False, pn
     say(f"    {line}")
     if tool:
         say(f"    (already copied with {tool})")
+    if ts["state"] == "Running" and (ts["name"] or ts["ip"]):
+        say("\n  A terminal on this computer from Termux (optional):")
+        say("    on the phone:  pkg install python curl")
+        say("                   curl -fsSL https://raw.githubusercontent.com/franc417/Tailscale-SSH/main/install.sh | bash")
+        say(f"                   mesh add {ts['name'] or ts['ip']}" + (f"      (if that name does not resolve: mesh add {ts['ip']})" if ts["name"] and ts["ip"] else ""))
+        if env.mesh_state() != "ok":
+            say("    on this computer first:  meshd install   (sets up mesh and its SSH server)")
     return 0
 
 

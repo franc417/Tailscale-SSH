@@ -50,6 +50,23 @@ time):
 - **Generates an SSH key** (ed25519) if you don't have one, and offers to copy it to a
   device the first time you connect to it, so later connections don't need a password.
 
+**On a phone (Termux) no API key is needed.** Android has no `tailscale` command, so the full device list
+would need a Tailscale API key (long, and it expires within 90 days). Setup instead offers to add a device by its
+Tailscale name or address, and you can do it any time:
+
+```
+mesh add mkz                      # a name (or the full mkz.tail1234.ts.net)
+mesh add 100.67.163.21 --name pc  # or an address, with the label you want in the list
+```
+
+It only needs the phone to be on the tailnet. Added devices appear in the same live list, found by probing SSH like
+any other; `mesh forget <name>` removes one. On the computer, `meshd pair` prints the exact `mesh add` line to type.
+Paste an API key too if you want every device listed automatically (`mesh setup --api-key <key>`); if that key
+expires, the devices you added by name keep working and the list says why the rest is missing.
+
+If you already ran `python3 meshd.py install` on the computer, it offered to install and prepare `mesh` too, from the
+same folder and with the Tailscale sign-in you already did: one install, one sign-in.
+
 Update any install later with `mesh update` (pulls the latest engine from GitHub).
 
 ## Using it
@@ -57,6 +74,7 @@ Update any install later with `mesh update` (pulls the latest engine from GitHub
 ```
 mesh                   # arrow-key list of every reachable device — pick one, hit enter
 mesh pixel              # connect straight to a device by name (prefix match is fine)
+mesh add <name>         # add a device by name (no API key needed on a phone)
 mesh u0_a327@pixel      # ...or override the username
 mesh laptop -- tmux attach  # pass a remote command after --
 mesh list               # print the list once and exit (add --json for scripts)

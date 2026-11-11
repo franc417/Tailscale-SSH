@@ -24,6 +24,7 @@ import re
 import select
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -40,7 +41,7 @@ try:  # POSIX only; Windows falls back to a numbered prompt
 except ImportError:  # pragma: no cover
     termios = tty = None
 
-__version__ = "0.4.3"
+__version__ = "0.5.0"
 REPO = "franc417/Tailscale-SSH"
 REPO_FILE = "tailscale_ssh.py"
 BRAND = "tailscale-ssh"  # set for real in main(); module default for direct imports
@@ -128,7 +129,7 @@ def save_json(path: Path, data, private: bool = False) -> None:
 
 
 def load_config() -> dict:
-    cfg = dict(DEFAULTS)
+    cfg = copy.deepcopy(DEFAULTS)   # a copy of the nested parts too, so changing the loaded settings never changes the defaults
     cfg.update(load_json(CONF_FILE, {}))
     legacy = cfg.pop("api_key", None)  # pre-0.3 configs stored one unnamed key at the top level
     if legacy and not cfg.get("accounts"):
@@ -243,6 +244,7 @@ class Node:
     probed: bool = False
     ssh_port: int | None = None
     latency: float | None = None
+    manual: bool = False          # added with `mesh add` (found by name, not listed by Tailscale)
 
     @property
     def ip(self) -> str:
@@ -383,17 +385,141 @@ def fetch_api(key: str, show_all: bool):
     return parse_api(api_get_devices(key), my_ip, show_all)
 
 
+# ───────────────────── devices added by name (no API key needed) ─────────────────────
+#
+# On Android there is no `tailscale` command, so the full device list needs a Tailscale API key. Not everyone wants to
+# make one (it is long and expires within 90 days). `mesh add <name-or-address>` adds a single device by name instead:
+# the phone just has to be on the tailnet. They show up in the same list, found by probing SSH like any other device.
+
+def is_ip(text: str) -> bool:
+    try:
+        ipaddress.ip_address(text)
+        return True
+    except ValueError:
+        return False
+
+
+def _dns_skip_name(data: bytes, pos: int) -> int:
+    while True:
+        if pos >= len(data):
+            raise ValueError("short packet")
+        length = data[pos]
+        if length == 0:
+            return pos + 1
+        if length & 0xC0 == 0xC0:
+            return pos + 2
+        pos += 1 + length
+
+
+def dns_lookup_a(name: str, server: str = "100.100.100.100", port: int = 53, timeout: float = 2.0) -> str | None:
+    """Asks one DNS server for an IPv4 address (a minimal A query over UDP). Tailscale's own resolver listens on
+    100.100.100.100 whenever Tailscale is on, so this finds a tailnet name even when the phone's resolver does not."""
+    labels = [label for label in name.rstrip(".").split(".") if label]
+    if not labels or any(len(label) > 63 for label in labels):
+        return None
+    try:
+        qname = b"".join(bytes([len(label)]) + label.encode("ascii") for label in labels) + b"\x00"
+    except UnicodeEncodeError:
+        return None
+    txid = os.urandom(2)
+    query = txid + b"\x01\x00" + b"\x00\x01" + b"\x00\x00\x00\x00\x00\x00" + qname + b"\x00\x01\x00\x01"
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(query, (server, port))
+        data, _ = sock.recvfrom(1500)
+    except OSError:
+        return None
+    finally:
+        sock.close()
+    try:
+        if len(data) < 12 or data[:2] != txid or data[3] & 0x0F != 0:
+            return None
+        questions, answers = struct.unpack(">HH", data[4:8])
+        pos = 12
+        for _ in range(questions):
+            pos = _dns_skip_name(data, pos) + 4
+        for _ in range(answers):
+            pos = _dns_skip_name(data, pos)
+            rtype, rclass, _ttl, rdlen = struct.unpack(">HHIH", data[pos:pos + 10])
+            pos += 10
+            if rtype == 1 and rclass == 1 and rdlen == 4:
+                return ".".join(str(b) for b in data[pos:pos + 4])
+            pos += rdlen
+    except (ValueError, struct.error):
+        return None
+    return None
+
+
+def resolve_host(host: str) -> str | None:
+    """An address for what the person typed: an IP is used as it is; a name goes to the system resolver first, then straight
+    to Tailscale's own resolver (TSSH_DNS=host[:port] overrides it, for tests)."""
+    host = host.strip().rstrip(".")
+    if not host:
+        return None
+    if is_ip(host):
+        return host
+    try:
+        for family, _, _, _, addr in socket.getaddrinfo(host, None, socket.AF_INET):
+            return addr[0]
+    except OSError:
+        pass
+    server, _, port = (os.environ.get("TSSH_DNS") or "100.100.100.100").partition(":")
+    return dns_lookup_a(host, server, int(port or 53))
+
+
+_RESOLVED: dict = {}
+
+
+def resolve_cached(host: str, ok_for: float = 60.0, failed_for: float = 8.0) -> str | None:
+    """resolve_host, remembered for a while: the live list asks again every few seconds."""
+    now = time.time()
+    hit = _RESOLVED.get(host)
+    if hit and now < hit[1]:
+        return hit[0]
+    ip = resolve_host(host)
+    _RESOLVED[host] = (ip, now + (ok_for if ip else failed_for))
+    return ip
+
+
+def manual_nodes(cfg: dict) -> list:
+    nodes = []
+    for label, entry in (cfg.get("manual_devices") or {}).items():
+        host = str((entry or {}).get("host") or label)
+        ip = resolve_cached(host)
+        nodes.append(Node(name=label, fqdn=(host if "." in host and not is_ip(host) else ""), ips=[ip] if ip else [],
+                          os=str((entry or {}).get("os") or ""), online=bool(ip), mine=True, manual=True))
+    return nodes
+
+
 def fetch_nodes(cfg: dict, show_all: bool):
+    manual = manual_nodes(cfg)
     key = active_api_key(cfg)
+    nodes = meta = None
     if ts_cli():
         try:
-            return fetch_cli(show_all)
+            nodes, meta = fetch_cli(show_all)
         except TSError:
             if not key:
                 raise  # no fallback available -- surface the real CLI error
-    if key:
-        return fetch_api(key, show_all)
-    raise TSError("Tailscale isn't set up on this device yet", f"Run: {BRAND} setup")
+    if nodes is None and key:
+        try:
+            nodes, meta = fetch_api(key, show_all)
+        except TSError as e:
+            if not manual or ts_cli() or not local_tailscale_ip():
+                raise
+            # the key stopped working, but devices added by name still can: show them and say why the rest is missing
+            nodes, meta = [], {"backend": "manual", "tailnet": "", "self": None,
+                               "notice": f"{e}. Showing the devices you added by name."}
+    if nodes is None:
+        if not manual:
+            raise TSError("Tailscale isn't set up on this device yet", f"Run: {BRAND} setup")
+        if not local_tailscale_ip():
+            raise TSError("Tailscale isn't connected on this device", "Open the Tailscale app and switch it on")
+        nodes, meta = [], {"backend": "manual", "tailnet": "", "self": None}
+    known = {n.name for n in nodes} | {ip for n in nodes for ip in n.ips}
+    nodes = list(nodes) + [m for m in manual if m.name not in known and not (m.ip and m.ip in known)]
+    return nodes, meta
 
 
 # ───────────────────────────── probing ─────────────────────────────
@@ -470,9 +596,12 @@ class Monitor:
         with self._lock:
             for n in nodes:
                 c = self._cache.get(n.name)
-                if c and n.online:
+                probeable = n.online or (n.manual and bool(n.ip))
+                if c and probeable:
                     n.probed, n.ssh_port, n.latency = True, c[0], c[1]
-                elif not n.online:
+                    if n.manual and c[0] is None:
+                        n.online = False
+                elif not probeable:
                     self._cache.pop(n.name, None)
             self.nodes, self.meta, self.error = self._sorted(nodes), meta, None
             self.version += 1
@@ -482,10 +611,12 @@ class Monitor:
             with self._lock:
                 n.probed = True
                 n.ssh_port, n.latency = r if r else (None, None)
+                if n.manual:
+                    n.online = bool(r)      # nothing else tells us whether a device added by name is up
                 self._cache[n.name] = (n.ssh_port, n.latency)
                 self.version += 1
 
-        targets = [n for n in nodes if n.online and n.ip]
+        targets = [n for n in nodes if (n.online or n.manual) and n.ip]
         if targets:
             with cf.ThreadPoolExecutor(max_workers=min(16, len(targets))) as ex:
                 list(ex.map(work, targets))
@@ -562,6 +693,8 @@ def render(nodes, meta, err, busy, sel, interactive, width, brand, tick=0):
     L.append(paint(head, "title") + paint(tail, "dim"))
     if me:
         L.append(paint(_trunc(f"this device: {me.name}  {g('sep')}  {me.ip}", W), "dim"))
+    if (meta or {}).get("notice"):
+        L.append(paint(_trunc(f" {g('half')} {meta['notice']}", W), "warn"))
     rule = paint(g("rule") * min(W, 96), "dim")
     L.append(rule)
 
@@ -1282,14 +1415,71 @@ def cmd_watch(ns, cfg, devices, brand) -> int:
         out.flush()
 
 
-def cmd_forget(ns, devices) -> int:
+def add_device(cfg: dict, host: str, label: str | None = None) -> bool:
+    """Saves one device found by name or address (no API key needed) and says whether it answers SSH right now."""
+    host = host.strip()
+    ip = resolve_host(host)
+    if not ip:
+        bad(f"Couldn't find '{host}'.")
+        if not is_ip(host) and "." not in host:
+            info("Try its full Tailscale name (like mkz.tail1234.ts.net) or its 100.x address.")
+        else:
+            info("Check the spelling, and that Tailscale is on here and on that device.")
+        info("On that computer, `meshd pair` (or `tailscale ip -4`) shows its name and address.")
+        return False
+    if not label:
+        if is_ip(host):
+            label = ask("Name to show in the list", ip) if sys.stdin.isatty() else ip
+        else:
+            label = host.split(".")[0].lower()
+    cfg.setdefault("manual_devices", {})[label] = {"host": host}
+    save_config(cfg)
+    ok(f"Added {label}  ({ip})")
+    found = probe_ssh(ip, list(cfg.get("probe_ports") or [22]))
+    if found:
+        ok(f"{label} answers SSH on port {found[0]}  ({found[1]:.0f} ms)")
+    elif ip.startswith("100.") and not local_tailscale_ip() and not ts_cli():
+        warn("Tailscale isn't connected on this device, so I can't reach it yet. Switch it on, then run mesh.")
+    else:
+        warn(f"Nothing answers SSH on {label} yet, so it will show as offline.")
+        info("It needs an SSH server running (on a laptop: run `mesh setup` there, or start sshd).")
+    return True
+
+
+def cmd_add(ns, cfg, devices, brand) -> int:
+    host = ns.words[1] if len(ns.words) > 1 else None
+    if not host:
+        if not sys.stdin.isatty():
+            die(f"Usage: {brand} add <name-or-address> [--name LABEL]", "No API key needed: the name or 100.x address of a device on your tailnet.")
+        info("Add a device by its Tailscale name or address (no API key needed).")
+        info("On that computer, `meshd pair` (or `tailscale ip -4`) shows them.")
+        host = ask("Name or address (like mkz or 100.64.1.2)")
+        if not host:
+            return 1
+    if not add_device(cfg, host, ns.name):
+        return 1
+    print()
+    info(f"Run `{brand}` to see it in the list, or `{brand} {(ns.name or host.split('.')[0]).lower()}` to connect.")
+    if not cfg.get("configured"):
+        info(f"First time here? `{brand} setup` also prepares an SSH key so you don't need a password each time.")
+    return 0
+
+
+def cmd_forget(ns, devices, cfg=None) -> int:
     if len(ns.words) < 2:
         die("Usage: forget <device>")
     name = ns.words[1]
-    if devices.pop(name, None) is None:
+    removed = False
+    if devices.pop(name, None) is not None:
+        save_json(DEV_FILE, devices)
+        ok(f"Forgot saved user/port for {name}")
+        removed = True
+    if cfg is not None and (cfg.get("manual_devices") or {}).pop(name, None) is not None:
+        save_config(cfg)
+        ok(f"Removed {name} from the devices you added by name")
+        removed = True
+    if not removed:
         die(f"Nothing remembered for '{name}'.")
-    save_json(DEV_FILE, devices)
-    ok(f"Forgot saved user/port for {name}")
     return 0
 
 
@@ -1433,8 +1623,10 @@ def cmd_doctor(cfg, devices) -> int:
         n = len(cfg.get("accounts") or {})
         extra = f", {n - 1} other saved" if n > 1 else ""
         ok(f"no CLI here, using the '{cfg.get('active_account')}' API key{extra}")
+    elif cfg.get("manual_devices"):
+        ok(f"no CLI or API key here; using the {len(cfg['manual_devices'])} device(s) you added by name")
     else:
-        bad(f"no tailscale CLI and no API key. Run: {BRAND} setup")
+        bad(f"no tailscale CLI and no API key. Run: {BRAND} add <name>  (or {BRAND} setup)")
     ip = local_tailscale_ip()
     ok(f"this device is on the tailnet ({ip})") if ip else warn("this device has no tailnet address right now")
     local = probe_ssh("127.0.0.1", cfg["probe_ports"])
@@ -1476,9 +1668,25 @@ def step_termux_tailscale(ns, cfg) -> None:
         info("the account this key belongs to if you want these devices to actually be reachable.")
 
     key = ns.api_key or (None if is_new else accounts.get(name, {}).get("api_key"))
-    if not key:
+    if not key and not cfg.get("manual_devices"):
         print()
-        info("Android has no `tailscale` command, so the device list comes from Tailscale's API.")
+        info("How should mesh find your other devices?")
+        info("  1  Add a device by its Tailscale name or address     (no key needed, easiest)")
+        info("  2  Paste a Tailscale API key                         (lists every device by itself; expires within 90 days)")
+        if (ask("Choose 1 or 2", "1") if sys.stdin.isatty() else "2").strip().startswith("1"):
+            info("On the computer, `meshd pair` (or `tailscale ip -4`) shows its name and address.")
+            while True:
+                host = ask("Name or address (like mkz or 100.64.1.2)")
+                if not host:
+                    break
+                if add_device(cfg, host) or not confirm("Try another?", True):
+                    break
+            if cfg.get("manual_devices"):
+                info(f"Add more any time with `{BRAND} add <name>`, or paste an API key later with `{BRAND} setup --api-key <key>`.")
+                return
+    if not key and not cfg.get("manual_devices"):
+        print()
+        info("Android has no `tailscale` command, so the full device list comes from Tailscale's API.")
         info("Create a key: https://login.tailscale.com/admin/settings/keys  →  Generate access token")
         info(f"(keys expire after at most 90 days; run `{BRAND} setup` again to replace it)")
         key = prompt_api_key("termux")
@@ -1494,9 +1702,9 @@ def step_termux_tailscale(ns, cfg) -> None:
             bad(str(e))
             key = prompt_api_key("termux") if confirm("Try a different key?", True) else None
 
-    if name not in accounts:
+    if name not in accounts and not cfg.get("manual_devices"):
         warn("No working API key -- this phone won't be able to list other devices yet.")
-        info(f"Run `{BRAND} setup --api-key <key>` any time to add one.")
+        info(f"Run `{BRAND} add <name>` to add a device by name, or `{BRAND} setup --api-key <key>` to add a key.")
 
 
 def step_linux_tailscale(ns, cfg, plat: str) -> None:
@@ -1623,6 +1831,7 @@ HELP = """\
   {brand} <device>            connect directly (name, prefix or IP; user@device works)
   {brand} <device> -- <cmd>   run a command there (e.g. tmux attach)
 
+  add <name-or-address>       add a device by name (no API key needed; --name LABEL to rename)
   list [--json] [-a]          show devices once
   watch                       live view without connecting
   gui [device]                remote desktop (experimental): sets up Sunshine there, opens Moonlight
@@ -1630,14 +1839,14 @@ HELP = """\
   accounts [use <name>|add]   list/switch/add Tailscale accounts on this device
   doctor                      diagnose problems
   update                      update from GitHub
-  forget <device>             drop the saved user/port for a device
+  forget <device>             drop the saved user/port for a device (and a device added by name)
   config                      show settings
 
 options: -u USER  -p PORT  -i KEYFILE  -a/--all (include devices shared with you)
          -y (assume yes)  --plain (no colour)  -V/--version
 """
 
-SUBS = {"list", "ls", "watch", "gui", "setup", "accounts", "doctor", "update", "forget", "config", "version", "help"}
+SUBS = {"list", "ls", "watch", "gui", "setup", "accounts", "add", "doctor", "update", "forget", "config", "version", "help"}
 
 
 def main(argv=None) -> int:
@@ -1664,6 +1873,7 @@ def main(argv=None) -> int:
     p.add_argument("--authkey")
     p.add_argument("--api-key")
     p.add_argument("--account")
+    p.add_argument("--name")
     p.add_argument("-h", "--help", action="store_true")
     p.add_argument("-V", "--version", action="store_true")
     ns = p.parse_intermixed_args(argv)
@@ -1690,9 +1900,11 @@ def main(argv=None) -> int:
     if cmd == "config":
         return cmd_config(cfg)
     if cmd == "forget":
-        return cmd_forget(ns, devices)
+        return cmd_forget(ns, devices, cfg)
     if cmd == "accounts":
         return cmd_accounts(ns, cfg, brand)
+    if cmd == "add":
+        return cmd_add(ns, cfg, devices, brand)
 
     if not cfg.get("configured") and sys.stdin.isatty() and sys.stdout.isatty() and not ns.json:
         print(paint(f"\nFirst run: let's get this device ready.", "accent"))

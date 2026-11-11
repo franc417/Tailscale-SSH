@@ -20,6 +20,24 @@ type `meshd` anywhere to see the state of everything.
 | `meshd logs [-f]` | what they printed |
 | `meshd pair` | what to type on the phone (and the pairing info, copied to the clipboard, for other cases) |
 
+## One install for both tools
+
+`meshd install` also offers (as optional steps, from this same folder, nothing downloaded) to install **`mesh`**, the
+shell-access tool, and to prepare this computer for it (SSH server and key). Tailscale is already signed in by then, so
+`mesh` does not ask you to sign in a second time. `mesh` is only needed for a terminal on this computer from your phone's
+Termux; the Mesh app does not use it.
+
+On the phone, `meshd pair` prints the exact lines:
+
+```
+pkg install python curl
+curl -fsSL https://raw.githubusercontent.com/franc417/Tailscale-SSH/main/install.sh | bash
+mesh add mkz        # or: mesh add 100.67.163.21
+```
+
+`mesh add` needs no Tailscale API key: it finds the computer by name or address (asking Tailscale's own resolver at
+100.100.100.100 when the phone's resolver does not know a tailnet name) and lists it with the others.
+
 ## What runs in the background
 
 Three systemd **user** services (no root after the packages are installed):
