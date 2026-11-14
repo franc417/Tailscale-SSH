@@ -19,6 +19,7 @@ type `meshd` anywhere to see the state of everything.
 | `meshd start\|stop\|restart [agent\|sunshine\|supervisor\|all]` | control them |
 | `meshd logs [-f]` | what they printed |
 | `meshd pair` | what to type on the phone (and the pairing info, copied to the clipboard, for other cases) |
+| `meshd share web PORT` | share a web app on this computer as a link for any browser (Tailscale Funnel), approve who comes in, revoke any time: see [MESH-GUEST.md](MESH-GUEST.md) |
 
 ## One install for both tools
 

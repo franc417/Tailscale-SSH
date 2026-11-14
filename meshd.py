@@ -9,6 +9,7 @@
     meshd start|stop|restart [agent|sunshine|supervisor|all]
     meshd logs [-f]       what the background services printed
     meshd pair            what to type, scan (QR code) or paste on the phone to add this computer
+    meshd share web 80    share a web app (XAMPP, phpMyAdmin...) as a link for any browser through Tailscale Funnel; revoke it any time
     meshd supervise       the supervisor itself (the service runs this; you do not need to)
 
 Standard library only. It drives mesh_input.py (the input agent, doctor/setup, Sunshine helpers) which sits next to this file.
@@ -859,6 +860,10 @@ def pair_text(env: Env, say: Callable[[str], None] = print, qr: bool = False, pn
 # ---------------------------------------------------------------- command line
 
 def main(argv: Optional[List[str]] = None, env: Optional[Env] = None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["share"]:        # `meshd share ...` has its own sub-commands and help
+        import meshshare
+        return meshshare.main(["--dir", mi.default_dir(), *argv[1:]])
     ap = argparse.ArgumentParser(prog=APP, description=f"{TITLE}: the computer's side of the Mesh phone app")
     ap.add_argument("--dir", default=mi.default_dir(), help="where the agent keeps its certificate and token")
     ap.add_argument("--port", type=int, default=mi.DEFAULT_PORT)
@@ -885,6 +890,8 @@ def main(argv: Optional[List[str]] = None, env: Optional[Env] = None) -> int:
     p.add_argument("--qr", action="store_true", help="draw the QR code even when the output is not a terminal")
     p.add_argument("--no-qr", action="store_true", help="do not draw the QR code")
     p.add_argument("--png", metavar="FILE", default=None, help="also save the QR code as a picture")
+    p = sub.add_parser("share", add_help=False, help="share a web app as a link for any browser, then revoke it (meshd share -h)")
+    p.add_argument("rest", nargs=argparse.REMAINDER)
     p = sub.add_parser("supervise", help="the supervisor loop (run by its service)")
     p.add_argument("--interval", type=float, default=10.0)
     args = ap.parse_args(argv)
@@ -940,6 +947,9 @@ def main(argv: Optional[List[str]] = None, env: Optional[Env] = None) -> int:
             return 0
     if command == "pair":
         return pair_text(env, qr=(args.qr or sys.stdout.isatty()) and not args.no_qr, png=args.png, columns=shutil.get_terminal_size().columns)
+    if command == "share":
+        import meshshare
+        return meshshare.main(["--dir", args.dir, *args.rest])
     if command == "supervise":
         try:
             Supervisor(env).run(args.interval)
