@@ -15,7 +15,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install test dependencies
-        run: python -m pip install pytest evdev
+        run: |
+          python -m pip install pytest evdev
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg   # the screen-share tests use real H.264 and Opus
       - name: Run tests
         run: |
           set +e

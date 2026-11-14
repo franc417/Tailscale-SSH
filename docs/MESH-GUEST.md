@@ -36,6 +36,39 @@ Funnel limits (Tailscale's, not ours): public ports 443, 8443 or 10000 only (`--
 limit they do not publish. TLS ends on your computer; Tailscale's relay cannot read the traffic. The public address exists only
 while a share is open.
 
+## Step 2: share the whole screen, with sound: `meshd share screen`
+
+```
+meshd share doctor                          # check what this needs and what to install (do this first)
+meshd share screen                          # the main monitor, with sound; the guest uses their own keyboard and mouse
+meshd share screen --quality text           # sharpest (code, tables); smooth = for a weak connection; balanced is the default
+meshd share screen --monitor eDP-1 --no-sound --view-only --lock-on-end --ttl 45m
+meshd share pause | resume                  # freeze their picture and ignore their keys, then undo
+meshd share viewonly on | off               # turn their keyboard and mouse off or on while they watch
+```
+
+The guest opens the link in a recent Chrome, Edge, Firefox or Safari, you allow them in (same 4 digit code on both screens), they
+click **Start**, and they see your screen. Their mouse and keyboard act on your computer. The bar at the top of their page has
+Full screen (in Chrome/Edge this also captures Alt+Tab and other shortcuts), Sound on/off, My cursor, **Leave** (they go out; the
+link stays open and a new visit needs your approval again) and **Close** (the link is dead for good).
+
+How it works: GNOME's screen-cast (one monitor, no pop-up) -> PipeWire -> GStreamer -> H.264 (VA-API hardware when it works,
+x264 software otherwise; picked automatically from what is installed) and the default output's sound -> Opus. They travel over one
+WebSocket through the same Funnel address; the browser decodes with its own hardware decoder (WebCodecs). The capture runs only
+while a guest is connected (GNOME's recording indicator is on only then), it stops the moment they leave or you revoke, and the
+helper processes end with the share even if it is killed.
+
+Quality: `text` 1920x1080, `balanced` 1600x900, `smooth` 1280x720, all 30 frames/s. If a guest's connection cannot keep up, frames
+are dropped until the next key frame (once a second), so the picture freezes briefly instead of falling behind. Expect about a
+quarter to half a second of delay through Funnel (a measure, not a promise): fine for presenting, not for games.
+
+Input rules: only real key names are accepted, rates are limited, Ctrl+Alt+F1..F12 (switch to a text console) and Alt+SysRq are
+blocked, held keys are released when the guest leaves, and with `--view-only` or `pause` nothing the guest types reaches the
+computer. Without permission for `/dev/uinput` (the Mesh app needs it too) the guest can watch but not type; `doctor` says so.
+
+Needs (Arch): `sudo pacman -S gjs gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugin-pipewire gst-plugin-va`
+(add `gst-plugins-ugly` for the software encoder). `meshd share doctor` lists exactly what is missing.
+
 ## How the link is protected
 
 | Risk | What stops it |
@@ -61,7 +94,11 @@ that is streaming), the gateway in front of a real web app (redirects, cookies, 
 the Funnel commands against a fake `tailscale` (including the approval link and an old CLI without `--yes`), the control socket,
 and the whole flow in a real Chromium (`tests/test_meshshare_browser.py`, needs Playwright, skipped in CI).
 
-**Not tested yet:** the real Funnel on your tailnet (nobody has run it end to end), a real PHP/XAMPP app, other browsers.
+The screen share is tested end to end with ffmpeg standing in for GStreamer (real H.264 and Opus through the gateway into a real
+Chromium that decodes, draws and plays them, and whose mouse, keys and wheel arrive at the injector): `tests/test_meshscreen.py`.
+
+**Not tested yet:** the real Funnel on your tailnet (nobody has run it end to end), a real PHP app, other browsers, and for the
+screen share the real GNOME capture and GStreamer/VA-API encoder on your hardware (they cannot run where the tests run).
 Known limits: WebSocket pages and uploads sent without a length are not supported through the share yet; text pages are sent
 uncompressed (so their links can be rewritten).
 
@@ -69,5 +106,5 @@ uncompressed (so their links can be rewritten).
 
 - **Phone app button** on the home screen: create the link, copy/share it, approve, see who is in, Revoke. The app will use the
   same control socket `meshd share` uses (`share.sock`, owner-only), so no new rules are needed.
-- **Guest screen (the whole desktop in the browser, with sound, using the guest's keyboard and mouse):** the same gate and
-  link, with a screen stream instead of a web app (design in the chat that started this; build after the steps above work).
+- **Guest screen of a virtual monitor** (share only a second, virtual monitor so the main screen is never in the stream).
+- **WebRTC + relay** for networks where WebSocket over Funnel is too slow.

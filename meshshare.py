@@ -51,6 +51,9 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+import meshguestui  # noqa: E402
+import meshws  # noqa: E402
+
 GATE = "/_mesh"
 COOKIE = "mesh_guest"
 DEFAULT_TTL = 30 * 60
@@ -306,6 +309,11 @@ class ShareManager:
         visitor.last_seen = self.clock()
         return got
 
+    def note_activity(self, token: str) -> None:
+        got = self.session(token)
+        if got and got[1].state == "active":
+            got[1].last_seen = self.clock()
+
     def status(self, token: str) -> dict:
         got = self.session(token)
         if not got:
@@ -523,6 +531,7 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         super().__init__(address, handler)
         self.manager = manager
         self.public_origin = f"http://127.0.0.1:{address[1]}"
+        self.hub = None       # the screen stream, for shares of kind "screen"
         self.slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
 
     def process_request(self, request, client_address) -> None:
@@ -555,11 +564,12 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
     def manager(self) -> ShareManager:
         return self.server.manager
 
-    def reply(self, status: int, body: bytes = b"", content_type: str = "text/html; charset=utf-8", extra: Optional[List[Tuple[str, str]]] = None) -> None:
+    def reply(self, status: int, body: bytes = b"", content_type: str = "text/html; charset=utf-8", extra: Optional[List[Tuple[str, str]]] = None,
+              headers: Optional[Dict[str, str]] = None) -> None:
         self.send_response_only(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
-        for key, value in SECURITY_HEADERS.items():
+        for key, value in {**SECURITY_HEADERS, **(headers or {})}.items():
             self.send_header(key, value)
         if status >= 400:
             self.send_header("Connection", "close")
@@ -614,6 +624,12 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 return self.reply(200, LANDING_JS.encode(), "text/javascript; charset=utf-8")
             if path == GATE + "/landing.css":
                 return self.reply(200, LANDING_CSS.encode(), "text/css; charset=utf-8")
+            if path == GATE + "/screen.js":
+                return self.reply(200, meshguestui.SCREEN_JS.encode(), "text/javascript; charset=utf-8")
+            if path == GATE + "/screen.css":
+                return self.reply(200, meshguestui.SCREEN_CSS.encode(), "text/css; charset=utf-8")
+            if path == GATE + "/ws":
+                return self.websocket()
             if path == GATE + "/status":
                 return self.reply_json(200, self.manager.status(self.token()))
             if re.fullmatch(re.escape(GATE) + r"/g/[A-Za-z0-9_-]{1,64}", path):
@@ -643,6 +659,34 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 return self.reply_json(200 if done else 403, {"ok": done}, [("Set-Cookie", f"{COOKIE}=; Path=/; Max-Age=0")])
         return self.reply(404, notice_page("Not found", ""))
 
+    # ---- the screen stream: a WebSocket the browser opens after Start
+    def websocket(self) -> None:
+        token = self.token()
+        got = self.manager.touch(token)
+        hub = self.server.hub
+        if not got or got[0].kind != "screen" or hub is None:
+            return self.reply(403, b"", "text/plain")
+        if not meshws.is_upgrade(self.headers):
+            return self.reply(400, b"", "text/plain")
+        origin, host = self.headers.get("Origin"), (self.headers.get("Host") or "").lower()
+        if origin and urllib.parse.urlsplit(origin).netloc.lower() != host:      # another site's page may not drive this screen
+            return self.reply(403, b"", "text/plain")
+        share = got[0]
+        self.close_connection = True
+        self.wfile.write(meshws.handshake_response(self.headers["Sec-WebSocket-Key"]))
+        self.wfile.flush()
+        ws = meshws.WebSocket(self.connection)
+        self.manager.track(share.id, self.connection)
+
+        def valid() -> bool:
+            self.manager.reap()
+            found = self.manager.session(token)
+            return bool(found and found[0].state == "open" and found[1].state == "active")
+        try:
+            hub.serve(ws, valid, lambda: self.manager.note_activity(token))
+        finally:
+            self.manager.untrack(share.id, self.connection)
+
     # ---- the shared app
     def proxy(self) -> None:
         token = self.token()
@@ -659,6 +703,13 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         share, visitor = got
         if share.read_only and self.command not in ("GET", "HEAD", "OPTIONS"):
             return self.reply(405, notice_page("View only", "The owner shared this so it can be looked at, not changed."))
+        if share.kind == "screen":
+            if self.command not in ("GET", "HEAD"):
+                return self.reply(405, notice_page("Not allowed", ""))
+            host = self.headers.get("Host") or ""
+            if not re.fullmatch(r"[A-Za-z0-9.\-]+(:\d{1,5})?", host):
+                host = urllib.parse.urlsplit(self.server.public_origin).netloc
+            return self.reply(200, meshguestui.SCREEN_HTML.encode(), headers={"Content-Security-Policy": meshguestui.screen_csp(host)})
         path = self.path
         if not path.startswith("/"):
             return self.reply(400, notice_page("Bad request", ""))
@@ -974,6 +1025,8 @@ class ShareService:
         self.manager = ShareManager(clock=clock, listener=self.on_event)
         self.gateway = Gateway(self.manager)
         self.control_server: Optional[ControlServer] = None
+        self.hub = None
+        self.lock_on_end = False
         self.stop_event = threading.Event()
         self.link = ""
         self.info: dict = {}
@@ -1000,13 +1053,21 @@ class ShareService:
             with socket.create_connection(("127.0.0.1", port), timeout=2.0):
                 pass
         except OSError:
-            raise ShareError(f"Nothing answers on port {port} of this computer. Start the web app first (for XAMPP: sudo /opt/lampp/lampp start).") from None
+            raise ShareError(f"Nothing answers on port {port} of this computer. Start the web app first, or run  meshd share web  without a port to see what is running.") from None
+        return self._open("web", port, ttl, idle, read_only)
+
+    def open_screen(self, hub, ttl: int = DEFAULT_TTL, idle: int = DEFAULT_IDLE, lock_on_end: bool = False) -> dict:
+        self.hub, self.lock_on_end = hub, lock_on_end
+        return self._open("screen", 0, ttl, idle, False)
+
+    def _open(self, kind: str, target: int, ttl: int, idle: int, read_only: bool) -> dict:
         existing = control_request(self.directory, {"cmd": "list"}, self.environ, timeout=1.0)
         if existing is not None:
             raise ShareError("A share is already open. See it with  meshd share list  or end it with  meshd share revoke.")
         self.cleanup_stale()
-        share, secret = self.manager.create("web", port, ttl, idle, read_only)
+        share, secret = self.manager.create(kind, target, ttl, idle, read_only)
         try:
+            self.gateway.server.hub = self.hub
             gw_port = self.gateway.start()
             origin = self.tunnel.start(gw_port)
             self.gateway.set_public_origin(origin)
@@ -1021,7 +1082,7 @@ class ShareService:
             raise
         self.link = f"{origin}{GATE}/g/{share.id}#{secret}"
         self.info = {"id": share.id, "link": self.link, "origin": origin, "expires": share.expires, "ttl": int(share.expires - share.created),
-                     "read_only": share.read_only}
+                     "read_only": share.read_only, "kind": kind}
         return self.info
 
     def cleanup_stale(self) -> None:
@@ -1051,7 +1112,18 @@ class ShareService:
     def control(self, request: dict) -> dict:
         cmd = request.get("cmd")
         if cmd == "list":
-            return {"ok": True, "shares": self.manager.describe()}
+            rows = self.manager.describe()
+            if self.hub is not None:
+                for row in rows:
+                    if row["kind"] == "screen":
+                        row.update({"paused": self.hub.paused, "view_only": self.hub.view_only, "quality": self.hub.quality, "streaming": self.hub.running})
+            return {"ok": True, "shares": rows}
+        if cmd in ("pause", "resume") and self.hub is not None:
+            self.hub.set_paused(cmd == "pause")
+            return {"ok": True, "message": "Paused: the guest sees a frozen picture and cannot type." if cmd == "pause" else "Resumed."}
+        if cmd == "viewonly" and self.hub is not None:
+            self.hub.set_view_only(bool(request.get("value")))
+            return {"ok": True, "message": "View only: the guest can look but not type or click." if request.get("value") else "The guest can type and click again."}
         if cmd == "approve":
             ok, message = self.manager.approve(request.get("id"), request.get("code"))
             return {"ok": ok, "message": message}
@@ -1086,6 +1158,16 @@ class ShareService:
             self.gateway.stop()
         except Exception:               # noqa: BLE001
             pass
+        if self.hub is not None:
+            try:
+                self.hub.close()        # stops the screen capture and releases any key the guest was holding
+            except Exception:           # noqa: BLE001
+                pass
+            if self.lock_on_end and shutil.which("loginctl"):
+                try:
+                    subprocess.run(["loginctl", "lock-sessions"], timeout=5, capture_output=True)
+                except (OSError, subprocess.SubprocessError):
+                    pass
         if self.control_server is not None:
             try:
                 self.control_server.shutdown()
@@ -1129,6 +1211,12 @@ def _stdin_commands(service: ShareService) -> None:
             service.say("  " + service.manager.approve()[1])
         elif word in ("d", "n", "deny"):
             service.say("  " + service.manager.deny()[1])
+        elif word in ("p", "pause", "resume") and service.hub is not None:
+            service.hub.set_paused(not service.hub.paused)
+            service.say("  Paused." if service.hub.paused else "  Resumed.")
+        elif word in ("v", "viewonly") and service.hub is not None:
+            service.hub.set_view_only(not service.hub.view_only)
+            service.say("  View only." if service.hub.view_only else "  The guest can type and click.")
         elif word in ("l", "list"):
             service.say(format_list(service.manager.describe()))
         elif word in ("r", "q", "revoke", "quit", "end"):
@@ -1144,11 +1232,73 @@ def format_list(rows: List[dict]) -> str:
     for row in rows:
         v = row.get("visitor")
         who = "nobody has opened it" if not v else (f"{v['agent']} ({v['ip']}): " + ("waiting for approval, code " + v["code"] if v["state"] == "pending" else f"in, idle {fmt_seconds(v['idle_for'])}"))
-        lines.append(f"  {row['id']}  web app on port {row['target']}{' (view only)' if row['read_only'] else ''}  expires in {fmt_seconds(row['expires_in'])}  {who}")
+        if row["kind"] == "screen":
+            what = "screen" + (" (paused)" if row.get("paused") else "") + (" (view only)" if row.get("view_only") else "") + (f", {row['quality']}" if row.get("quality") else "")
+        else:
+            what = f"web app on port {row['target']}" + (" (view only)" if row["read_only"] else "")
+        lines.append(f"  {row['id']}  {what}  expires in {fmt_seconds(row['expires_in'])}  {who}")
     return "\n".join(lines)
 
 
-def run_web(args, environ=os.environ, tunnel=None, say: Callable[[str], None] = print, interactive: Optional[bool] = None) -> int:
+def listening_ports(runner=subprocess.run) -> List[int]:
+    """TCP ports something is listening on at this computer (from `ss`), without the ones that are never a web app."""
+    try:
+        done = runner(["ss", "-ltnH"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    ports = set()
+    for line in (done.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        host, _, port = parts[3].rpartition(":")          # 127.0.0.1:80  0.0.0.0:80  *:80  [::]:80  [::1]:8080
+        if port.isdigit() and (host.strip("[]") in ("*", "0.0.0.0", "::", "::1") or host.startswith("127.")):
+            ports.add(int(port))
+    return sorted(p for p in ports if p not in (22, 53, 631, 25, 111, 5353))
+
+
+def answers_http(port: int, timeout: float = 1.0) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(b"HEAD / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            return sock.recv(5) == b"HTTP/"
+    except OSError:
+        return False
+
+
+def find_web_ports(runner=subprocess.run, probe: Callable[[int], bool] = answers_http) -> List[int]:
+    return [port for port in listening_ports(runner) if probe(port)]
+
+
+def run_web(args, environ=os.environ, tunnel=None, say: Callable[[str], None] = print, interactive: Optional[bool] = None,
+            find: Callable[[], List[int]] = find_web_ports, ask: Callable[[str], str] = input) -> int:
+    if args.port is None:
+        found = find()
+        if not found:
+            say("No web server is answering on this computer.\n"
+                "  Start one first, for example your PHP project folder:  php -S 127.0.0.1:8000 -t ~/your-project\n"
+                "  or any folder:  python3 -m http.server 8000   then run  meshd share web 8000   (or give the port you use).")
+            return 1
+        if len(found) == 1:
+            args.port = found[0]
+            say(f"Found a web server on port {args.port}.")
+        else:
+            say("These ports answer as web servers: " + ", ".join(str(p) for p in found))
+            try:
+                args.port = int(ask("Which port should be shared? ").strip())
+            except (ValueError, EOFError):
+                say("Give the port: meshd share web PORT")
+                return 2
+    return _run(args, "web", environ, tunnel, say, interactive)
+
+
+def run_screen(args, environ=os.environ, tunnel=None, say: Callable[[str], None] = print, interactive: Optional[bool] = None, source=None,
+               injector_factory=None) -> int:
+    return _run(args, "screen", environ, tunnel, say, interactive, source=source, injector_factory=injector_factory)
+
+
+def _run(args, kind: str, environ, tunnel, say, interactive, source=None, injector_factory=None) -> int:
     import meshqr
     directory = args.dir
     try:
@@ -1162,7 +1312,18 @@ def run_web(args, environ=os.environ, tunnel=None, say: Callable[[str], None] = 
         ttl = MAX_TTL
     service = ShareService(directory, tunnel, say=say, environ=environ)
     try:
-        info = service.open_web(args.port, ttl, idle, args.read_only)
+        if kind == "web":
+            info = service.open_web(args.port, ttl, idle, args.read_only)
+        else:
+            import mesh_input as mi
+            import meshstream
+            try:
+                source = source or meshstream.GstSource(directory, args.monitor or "", args.quality, args.sound, environ=environ)
+            except meshstream.StreamError as exc:
+                say(f"error: {exc}")
+                return 2
+            hub = meshstream.StreamHub(source, injector_factory or mi.UinputInjector, say=say, view_only=args.view_only, quality=args.quality)
+            info = service.open_screen(hub, ttl, idle, args.lock_on_end)
     except (ShareError, TunnelError) as exc:
         say(f"error: {exc}")
         return 1
@@ -1175,7 +1336,11 @@ def run_web(args, environ=os.environ, tunnel=None, say: Callable[[str], None] = 
         for name in ("SIGINT", "SIGTERM", "SIGHUP"):
             if hasattr(signal, name):
                 previous[name] = signal.signal(getattr(signal, name), stop)
-    say(f"\nSharing the web app on port {args.port} for {fmt_seconds(info['ttl'])}" + (" (view only)" if args.read_only else "") + ".")
+    if kind == "web":
+        say(f"\nSharing the web app on port {args.port} for {fmt_seconds(info['ttl'])}" + (" (view only)" if args.read_only else "") + ".")
+    else:
+        say(f"\nSharing this computer's screen ({args.monitor or 'main monitor'}, quality {args.quality}, "
+            f"{'with sound' if args.sound else 'no sound'}{', view only' if args.view_only else ''}) for {fmt_seconds(info['ttl'])}.")
     say(f"\n  {info['link']}\n")
     if args.qr and sys.stdout.isatty():
         try:
@@ -1225,6 +1390,14 @@ def run_control(args, environ=os.environ, say: Callable[[str], None] = print, as
         reply = control_request(args.dir, {"cmd": "approve", "code": args.code}, environ) or {"ok": False, "message": "The share stopped answering."}
         say(reply.get("message", ""))
         return 0 if reply.get("ok") else 1
+    if cmd in ("pause", "resume"):
+        reply = control_request(args.dir, {"cmd": cmd}, environ)
+        say((reply or {}).get("message", "No share is open."))
+        return 0 if reply and reply.get("ok") else 1
+    if cmd == "viewonly":
+        reply = control_request(args.dir, {"cmd": "viewonly", "value": args.value == "on"}, environ)
+        say((reply or {}).get("message", "No share is open."))
+        return 0 if reply and reply.get("ok") else 1
     if cmd == "deny":
         reply = control_request(args.dir, {"cmd": "deny"}, environ)
         say((reply or {}).get("message", "No share is open."))
@@ -1252,14 +1425,30 @@ def build_parser(default_dir: str) -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="meshd share", description="Share something on this computer as a link that opens in any browser.")
     ap.add_argument("--dir", default=default_dir, help=argparse.SUPPRESS)
     sub = ap.add_subparsers(dest="action", required=True)
-    p = sub.add_parser("web", help="share a web app running on this computer (XAMPP, phpMyAdmin, your own site)")
-    p.add_argument("port", type=int, help="the port the web app listens on (80 for XAMPP)")
+    p = sub.add_parser("web", help="share a web app running on this computer (your PHP project, phpMyAdmin, any local site)")
+    p.add_argument("port", type=int, nargs="?", default=None, help="the port the web app listens on; leave it out to see what is running")
     p.add_argument("--ttl", default="30m", help="how long the link works: 30m (default), 2h ... at most 8h")
     p.add_argument("--idle", default="15m", help="let the visitor out after this long without activity")
     p.add_argument("--read-only", action="store_true", help="the visitor can look but not submit forms or change anything")
     p.add_argument("--tunnel", choices=["funnel", "none"], default="funnel", help="funnel = public https address through Tailscale; none = this computer only (testing)")
     p.add_argument("--https-port", type=int, default=443, choices=[443, 8443, 10000], help="Funnel's public port")
     p.add_argument("--no-qr", dest="qr", action="store_false", help="do not draw the QR code")
+    p = sub.add_parser("screen", help="share this computer's whole screen, with sound; the guest's keyboard and mouse control it")
+    p.add_argument("--monitor", default="", help="which monitor (a connector name such as eDP-1); default: the main one")
+    p.add_argument("--quality", choices=["text", "balanced", "smooth"], default="balanced", help="text = sharpest (most data), smooth = for a weak connection")
+    p.add_argument("--no-sound", dest="sound", action="store_false", help="do not send this computer's sound")
+    p.add_argument("--view-only", action="store_true", help="the guest can watch but not type or click (change later: meshd share viewonly on|off)")
+    p.add_argument("--lock-on-end", action="store_true", help="lock this computer's screen when the share ends")
+    p.add_argument("--ttl", default="30m", help="how long the link works: 30m (default) ... at most 8h")
+    p.add_argument("--idle", default="20m", help="let the guest out after this long without typing or clicking")
+    p.add_argument("--tunnel", choices=["funnel", "none"], default="funnel", help="funnel = public https address through Tailscale; none = this computer only (testing)")
+    p.add_argument("--https-port", type=int, default=443, choices=[443, 8443, 10000], help="Funnel's public port")
+    p.add_argument("--no-qr", dest="qr", action="store_false", help="do not draw the QR code")
+    sub.add_parser("doctor", help="check what the screen share needs (GStreamer, encoder, sound, keyboard access) and what to install")
+    sub.add_parser("pause", help="freeze the guest's picture and ignore their keys until resumed")
+    sub.add_parser("resume", help="undo pause")
+    p = sub.add_parser("viewonly", help="turn the guest's keyboard and mouse off or on")
+    p.add_argument("value", choices=["on", "off"])
     sub.add_parser("list", help="what is open and who is connected")
     sub.add_parser("status", help="same as list")
     p = sub.add_parser("approve", help="let the waiting visitor in")
@@ -1276,6 +1465,14 @@ def main(argv: Optional[List[str]] = None, environ=os.environ, say: Callable[[st
     args = build_parser(mi.default_dir()).parse_args(argv)
     if args.action == "web":
         return run_web(args, environ=environ, say=say)
+    if args.action == "screen":
+        return run_screen(args, environ=environ, say=say)
+    if args.action == "doctor":
+        import meshstream
+        ok, lines = meshstream.doctor(environ=environ)
+        say("Screen share check:\n" + "\n".join(lines))
+        say("\nReady." if ok else "\nNot ready: fix the MISSING lines above, then run  meshd share doctor  again.")
+        return 0 if ok else 1
     return run_control(args, environ=environ, say=say)
 
 
