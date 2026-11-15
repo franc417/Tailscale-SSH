@@ -26,6 +26,7 @@ Standard library only.
 import argparse
 import base64
 import hashlib
+import getpass
 import hmac
 import http.client
 import http.server
@@ -38,6 +39,7 @@ import shutil
 import signal
 import socket
 import socketserver
+import ssl
 import struct
 import subprocess
 import sys
@@ -883,6 +885,82 @@ class NoTunnel:
         pass
 
 
+def _skip_name(packet: bytes, pos: int) -> int:
+    while True:
+        size = packet[pos]
+        if size == 0:
+            return pos + 1
+        if size & 0xC0 == 0xC0:
+            return pos + 2
+        pos += 1 + size
+
+
+def parse_dns_answer(packet: bytes, tid: bytes) -> Optional[List[str]]:
+    """The IPv4 addresses in a DNS answer: [] when the name does not exist (yet), None when the packet is not our answer."""
+    try:
+        if len(packet) < 12 or packet[:2] != tid:
+            return None
+        qd, an = struct.unpack("!HH", packet[4:8])
+        pos = 12
+        for _ in range(qd):
+            pos = _skip_name(packet, pos) + 4
+        ips = []
+        for _ in range(an):
+            pos = _skip_name(packet, pos)
+            rtype, _cls, _ttl, rdlen = struct.unpack("!HHIH", packet[pos:pos + 10])
+            pos += 10
+            if rtype == 1 and rdlen == 4:
+                ips.append(".".join(str(b) for b in packet[pos:pos + 4]))
+            pos += rdlen
+        return ips
+    except (struct.error, IndexError):
+        return None
+
+
+def dns_a(name: str, servers=("1.1.1.1", "8.8.8.8"), timeout: float = 2.0) -> Optional[List[str]]:
+    """IPv4 addresses of a name from a PUBLIC resolver (this computer's own resolver answers tailnet names with a private address).
+    None = no public resolver could be asked (blocked network); [] = asked, and the name is not published yet."""
+    tid = os.urandom(2)
+    query = tid + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + b"".join(bytes([len(part)]) + part.encode("ascii") for part in name.rstrip(".").split(".")) + b"\x00\x00\x01\x00\x01"
+    asked = False
+    for server in servers:
+        host, port = server if isinstance(server, tuple) else (server, 53)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        try:
+            sock.sendto(query, (host, port))
+            answer = parse_dns_answer(sock.recvfrom(2048)[0], tid)
+        except (OSError, UnicodeError):
+            continue
+        finally:
+            sock.close()
+        if answer is not None:
+            asked = True
+            if answer:
+                return answer
+    return [] if asked else None
+
+
+def https_probe(name: str, port: int, ip: str, context: Optional[ssl.SSLContext] = None, timeout: float = 6.0) -> bool:
+    """Does https://name:port/_mesh/status answer 200 when reached at ip with the name as SNI (what a browser does)?"""
+    context = context or ssl.create_default_context()
+    try:
+        with socket.create_connection((ip, port), timeout=timeout) as raw:
+            with context.wrap_socket(raw, server_hostname=name) as tls:
+                tls.settimeout(timeout)
+                tls.sendall(f"GET {GATE}/status HTTP/1.1\r\nHost: {name}\r\nConnection: close\r\nUser-Agent: mesh-check\r\n\r\n".encode())
+                head = b""
+                while b"\r\n" not in head and len(head) < 512:
+                    chunk = tls.recv(256)
+                    if not chunk:
+                        break
+                    head += chunk
+                status = head.split(b"\r\n", 1)[0]
+                return status.startswith(b"HTTP/1.") and status.split(b" ")[1:2] == [b"200"]
+    except (OSError, ssl.SSLError, ValueError):
+        return False
+
+
 def run_live(argv: List[str], timeout: float, on_line: Callable[[str], None]) -> Tuple[int, str]:
     """Run a command, showing its output line by line as it arrives (a command that waits for the person must not look frozen)."""
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True, bufsize=1)
@@ -912,10 +990,14 @@ class FunnelTunnel:
     """Tailscale Funnel: https://<this computer>.<tailnet>.ts.net, TLS ends on this computer, open only while a share is."""
     kind = "funnel"
 
-    def __init__(self, https_port: int = 443, runner=subprocess.run, which=shutil.which, timeout: float = 300.0) -> None:
+    def __init__(self, https_port: int = 443, runner=subprocess.run, which=shutil.which, timeout: float = 300.0,
+                 sudo_runner=subprocess.run, user: Optional[str] = None) -> None:
         if https_port not in (443, 8443, 10000):
             raise TunnelError("Funnel only listens on 443, 8443 or 10000.")
         self.https_port, self.runner, self.which, self.timeout = https_port, runner, which, timeout
+        self.sudo_runner, self.user = sudo_runner, user
+        self.ask: Optional[Callable[[str], str]] = None      # set when a person is at the keyboard: lets us offer the one-time permission fix
+        self.ready_check = False                            # wait until the public address really answers (the real command line turns this on)
         self.local_port: Optional[int] = None
         self.started = False
         self.say: Callable[[str], None] = lambda text: None
@@ -933,6 +1015,64 @@ class FunnelTunnel:
                      + link.group(0).rstrip(".,)") + "\n\n  Waiting for the approval...")
         else:
             self.say("  tailscale: " + line.strip())
+
+    @staticmethod
+    def denied(text: str) -> bool:
+        return bool(re.search(r"access denied|serve config denied|set --operator", text, re.I))
+
+    def fix_operator(self) -> None:
+        """Only root may change Funnel until the user is made Tailscale's operator (once per computer)."""
+        user = self.user or getpass.getuser()
+        command = ["sudo", "tailscale", "set", f"--operator={user}"]
+        manual = (f"Tailscale lets only root change Funnel until it is told your user may. Run this once, then run the command again:\n  "
+                  + " ".join(command))
+        if self.ask is None:
+            raise TunnelError(manual)
+        answer = self.ask(f"\n  Tailscale lets only root change Funnel. Allow your user ({user}) to do it? This runs (it may ask for your password):\n"
+                          f"    {' '.join(command)}\n  [Y/n] ")
+        if answer.strip().lower() in ("n", "no"):
+            raise TunnelError(manual)
+        try:
+            done = self.sudo_runner(command)
+        except OSError as exc:
+            raise TunnelError(f"could not run sudo: {exc}\n" + manual) from None
+        if done.returncode != 0:
+            raise TunnelError("That did not work.\n" + manual)
+        self.say("  Done. This is needed only once on this computer.")
+
+    def configure(self, target: str) -> Tuple[int, str]:
+        code, text = self.funnel("--bg", "--yes", f"--https={self.https_port}", target)
+        if "flag provided but not defined" in text and "yes" in text:
+            code, text = self.funnel("--bg", f"--https={self.https_port}", target)
+        return code, text
+
+    def wait_ready(self, origin: str, resolve=dns_a, probe=https_probe, sleep=time.sleep, clock=time.monotonic,
+                   timeout: float = 660.0, interval: float = 4.0) -> Optional[bool]:
+        """Until the public address really answers (Tailscale publishes the name, then makes the certificate on first use).
+        True = answers; False = gave up waiting; None = cannot be checked from this network."""
+        parts = urllib.parse.urlsplit(origin)
+        host, port = parts.hostname or "", parts.port or 443
+        started, last_note = clock(), -1e9
+        while True:
+            ips = resolve(host)
+            if ips is None:
+                self.say("  (This network blocks public DNS, so the address cannot be checked from here. Try the link on your phone first.)")
+                return None
+            if ips:
+                if any(probe(host, port, ip) for ip in ips):
+                    self.say("  The public address answers.")
+                    return True
+                stage = "the name is published; waiting for the secure connection (Tailscale makes the certificate on first use)"
+            else:
+                stage = "waiting for Tailscale to publish the public name (first time only; Tailscale says this can take up to 10 minutes)"
+            elapsed = clock() - started
+            if elapsed >= timeout:
+                self.say("  Still not reachable from outside after " + str(int(elapsed)) + " s. The link may start working any moment: try it on your phone first.")
+                return False
+            if elapsed - last_note >= 15:
+                last_note = elapsed
+                self.say(f"  {stage}... {int(elapsed)} s")
+            sleep(interval)
 
     def funnel(self, *args: str) -> Tuple[int, str]:
         if not self.live:
@@ -975,15 +1115,16 @@ class FunnelTunnel:
         self.local_port = local_port
         target = f"http://127.0.0.1:{local_port}"
         self.say("  Opening the public address through Tailscale Funnel...")
-        code, text = self.funnel("--bg", "--yes", f"--https={self.https_port}", target)
-        if "flag provided but not defined" in text and "yes" in text:
-            code, text = self.funnel("--bg", f"--https={self.https_port}", target)
+        code, text = self.configure(target)
+        if code != 0 and self.denied(text):
+            self.fix_operator()
+            code, text = self.configure(target)
         link = APPROVE_URL.search(text)
         if code == 124:
             self.stop(quiet=True)
             raise TunnelError(f"Tailscale did not finish within {int(self.timeout)} s." + (" The approval was not given in time: run the command again and approve the link." if link
                               else " The first time can take a few minutes: run the command again."), url=link.group(0) if link else None)
-        if link and code != 0:          # an approval link in the text of a command that then succeeded only means it waited and was approved
+        if link and code != 0 and "Success." not in text and not self.denied(text):   # a link in text that then said Success only means it waited and was approved
             self.stop(quiet=True)
             raise TunnelError("Tailscale needs a one-time approval before Funnel can be used. Open this link, approve, then run the command again:\n  "
                               + link.group(0).rstrip(".,)"), url=link.group(0))
@@ -1130,6 +1271,8 @@ class ShareService:
             gw_port = self.gateway.start()
             origin = self.tunnel.start(gw_port)
             self.gateway.set_public_origin(origin)
+            if getattr(self.tunnel, "ready_check", False):
+                self.tunnel.wait_ready(origin)
             self.control_server = ControlServer(control_path(self.directory, self.environ), self)
             threading.Thread(target=self.control_server.serve_forever, kwargs={"poll_interval": 0.2}, name="mesh-share-control", daemon=True).start()
             with open(self.state_path, "w", encoding="utf-8") as f:
@@ -1369,6 +1512,10 @@ def _run(args, kind: str, environ, tunnel, say, interactive, source=None, inject
     if ttl > MAX_TTL:
         say(f"The longest a share can stay open is {fmt_seconds(MAX_TTL)}.")
         ttl = MAX_TTL
+    if hasattr(tunnel, "ask"):
+        tunnel.ask = input if (interactive if interactive is not None else sys.stdin.isatty()) else None
+    if hasattr(tunnel, "ready_check") and args.tunnel == "funnel":
+        tunnel.ready_check = getattr(args, "wait", True)
     service = ShareService(directory, tunnel, say=say, environ=environ)
     say("Starting the share" + (" (the first time, Tailscale may ask you to approve Funnel: the link will show here)" if tunnel.kind == "funnel" else "") + "...")
     try:
@@ -1495,6 +1642,7 @@ def build_parser(default_dir: str) -> argparse.ArgumentParser:
     p.add_argument("--read-only", action="store_true", help="the visitor can look but not submit forms or change anything")
     p.add_argument("--tunnel", choices=["funnel", "none"], default="funnel", help="funnel = public https address through Tailscale; none = this computer only (testing)")
     p.add_argument("--https-port", type=int, default=443, choices=[443, 8443, 10000], help="Funnel's public port")
+    p.add_argument("--no-wait", dest="wait", action="store_false", help="print the link at once instead of waiting until the public address answers")
     p.add_argument("--no-qr", dest="qr", action="store_false", help="do not draw the QR code")
     p = sub.add_parser("screen", help="share this computer's whole screen, with sound; the guest's keyboard and mouse control it")
     p.add_argument("--monitor", default="", help="which monitor (a connector name such as eDP-1); default: the main one")
@@ -1506,6 +1654,7 @@ def build_parser(default_dir: str) -> argparse.ArgumentParser:
     p.add_argument("--idle", default="20m", help="let the guest out after this long without typing or clicking")
     p.add_argument("--tunnel", choices=["funnel", "none"], default="funnel", help="funnel = public https address through Tailscale; none = this computer only (testing)")
     p.add_argument("--https-port", type=int, default=443, choices=[443, 8443, 10000], help="Funnel's public port")
+    p.add_argument("--no-wait", dest="wait", action="store_false", help="print the link at once instead of waiting until the public address answers")
     p.add_argument("--no-qr", dest="qr", action="store_false", help="do not draw the QR code")
     sub.add_parser("doctor", help="check what the screen share needs (GStreamer, encoder, sound, keyboard access) and what to install")
     sub.add_parser("pause", help="freeze the guest's picture and ignore their keys until resumed")

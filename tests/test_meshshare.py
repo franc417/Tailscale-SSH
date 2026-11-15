@@ -788,3 +788,198 @@ def test_ctrl_c_while_waiting_for_tailscale_leaves_nothing_open(tmp_path, app, h
     with pytest.raises(KeyboardInterrupt):
         service.open_web(app.server_address[1])
     assert service.closed and ms.control_request(home["dir"], {"cmd": "list"}, home["environ"]) is None
+
+
+# ---------------------------------------------------------------- Tailscale's "operator" permission, and waiting for the public address
+
+import shutil  # noqa: E402
+import ssl  # noqa: E402
+import struct  # noqa: E402
+
+
+class OperatorFake(FakeTailscale):
+    """Funnel is approved, but only root may change it until `tailscale set --operator` has been run."""
+
+    DENIED = ("Funnel is not enabled on your tailnet.\nTo enable, visit:\n  https://login.tailscale.com/f/funnel?node=n1\nSuccess.\n"
+              "sending serve config: Access denied: serve config denied\n\nUse 'sudo tailscale funnel --bg --yes --https=443 http://127.0.0.1:1'.\n"
+              "To not require root, use 'sudo tailscale set --operator=$USER' once.")
+
+    def __init__(self):
+        super().__init__()
+        self.fixed = False
+
+    def __call__(self, args, capture_output=True, text=True, timeout=None):
+        sub = args[1:]
+        if sub[:1] == ["funnel"] and "--bg" in sub and not self.fixed:
+            self.calls.append(list(sub))
+            return subprocess.CompletedProcess(args, 1, self.DENIED, "")
+        return super().__call__(args, capture_output, text, timeout)
+
+
+def test_funnel_offers_to_fix_the_operator_permission_and_retries():
+    fake, sudo, said = OperatorFake(), [], []
+
+    def sudo_runner(cmd):
+        sudo.append(cmd)
+        fake.fixed = True
+        return subprocess.CompletedProcess(cmd, 0)
+    asked = []
+    tunnel = ms.FunnelTunnel(443, runner=fake, which=lambda n: "tailscale", sudo_runner=sudo_runner, user="franc")
+    tunnel.say = said.append
+    tunnel.ask = lambda q: asked.append(q) or "y"
+    assert tunnel.start(5555) == "https://mkz.tail1234.ts.net"
+    assert sudo == [["sudo", "tailscale", "set", "--operator=franc"]]
+    assert "sudo tailscale set --operator=franc" in asked[0] and any("only once" in line for line in said)
+    assert sum(1 for c in fake.calls if "--bg" in c) == 2                       # tried, fixed, tried again
+
+
+def test_operator_permission_when_declined_or_nobody_is_there_to_ask():
+    for answer in ("n", None):
+        fake = OperatorFake()
+        tunnel = ms.FunnelTunnel(443, runner=fake, which=lambda n: "tailscale", sudo_runner=lambda c: pytest.fail("must not run sudo"), user="franc")
+        tunnel.ask = (lambda q, a=answer: a) if answer else None
+        with pytest.raises(ms.TunnelError) as err:
+            tunnel.start(5555)
+        message = str(err.value)
+        assert "sudo tailscale set --operator=franc" in message
+        assert "one-time approval" not in message                                 # the approval DID succeed: do not send them back to it
+    tunnel = ms.FunnelTunnel(443, runner=OperatorFake(), which=lambda n: "tailscale", sudo_runner=lambda c: subprocess.CompletedProcess(c, 1), user="franc")
+    tunnel.ask = lambda q: "y"
+    with pytest.raises(ms.TunnelError, match="did not work"):
+        tunnel.start(5555)
+
+
+def test_the_funnel_start_with_success_text_and_an_old_approval_link_is_not_an_error():
+    out = "To enable, visit:\n  https://login.tailscale.com/f/funnel?node=n1\nSuccess.\nAvailable on the internet:\n"
+    tunnel = ms.FunnelTunnel(443, runner=FakeTailscale(funnel=(0, out)), which=lambda n: "tailscale")
+    assert tunnel.start(5555) == "https://mkz.tail1234.ts.net"
+
+
+def dns_response(tid, ips, rcode=0):
+    header = tid + struct.pack("!HHHHH", 0x8180 | rcode, 1, len(ips), 0, 0)
+    question = b"\x03mkz\x07tail123\x02ts\x03net\x00" + struct.pack("!HH", 1, 1)
+    answers = b"".join(b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 60, 4) + bytes(int(p) for p in ip.split(".")) for ip in ips)
+    return header + question + answers
+
+
+def test_parse_dns_answer():
+    tid = b"\x12\x34"
+    assert ms.parse_dns_answer(dns_response(tid, ["34.1.2.3", "34.1.2.4"]), tid) == ["34.1.2.3", "34.1.2.4"]
+    assert ms.parse_dns_answer(dns_response(tid, [], rcode=3), tid) == []             # the name does not exist (yet)
+    assert ms.parse_dns_answer(dns_response(b"\x00\x00", ["1.1.1.1"]), tid) is None    # not the answer to our question
+    assert ms.parse_dns_answer(dns_response(tid, ["1.1.1.1"])[:30], tid) is None       # cut short
+    assert ms.parse_dns_answer(b"", tid) is None
+
+
+def _dns_server(ips, rcode=0):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.settimeout(5)
+
+    def serve():
+        try:
+            query, addr = sock.recvfrom(512)
+            sock.sendto(dns_response(query[:2], ips, rcode), addr)
+        except OSError:
+            pass
+        finally:
+            sock.close()
+    threading.Thread(target=serve, daemon=True).start()
+    return ("127.0.0.1", sock.getsockname()[1])
+
+
+def test_dns_a_asks_a_public_resolver_over_a_real_socket():
+    assert ms.dns_a("mkz.tail123.ts.net", servers=[_dns_server(["34.9.8.7"])]) == ["34.9.8.7"]
+    assert ms.dns_a("mkz.tail123.ts.net", servers=[_dns_server([], rcode=3)]) == []
+    closed = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    closed.bind(("127.0.0.1", 0))
+    port = closed.getsockname()[1]
+    closed.close()
+    assert ms.dns_a("mkz.tail123.ts.net", servers=[("127.0.0.1", port)], timeout=0.3) is None   # nobody to ask: cannot tell
+
+
+@pytest.mark.skipif(not shutil.which("openssl"), reason="openssl not installed")
+def test_https_probe_checks_certificate_name_and_the_answer(tmp_path):
+    key, crt = str(tmp_path / "k.pem"), str(tmp_path / "c.pem")
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", crt, "-days", "1", "-subj", "/CN=mkz.test",
+                    "-addext", "subjectAltName=DNS:mkz.test"], check=True, capture_output=True)
+
+    def server(status):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(crt, key)
+        raw = socket.socket()
+        raw.bind(("127.0.0.1", 0))
+        raw.listen(1)
+        raw.settimeout(10)
+
+        def serve():
+            try:
+                conn, _ = raw.accept()
+                with ctx.wrap_socket(conn, server_side=True) as tls:
+                    tls.recv(1024)
+                    tls.sendall(f"HTTP/1.1 {status}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}".encode())
+            except (OSError, ssl.SSLError):
+                pass
+            finally:
+                raw.close()
+        threading.Thread(target=serve, daemon=True).start()
+        return raw.getsockname()[1]
+
+    trust = ssl.create_default_context(cafile=crt)
+    assert ms.https_probe("mkz.test", server("200 OK"), "127.0.0.1", trust) is True
+    assert ms.https_probe("mkz.test", server("502 Bad Gateway"), "127.0.0.1", trust) is False
+    assert ms.https_probe("other.example", server("200 OK"), "127.0.0.1", trust) is False          # certificate is for another name
+    assert ms.https_probe("mkz.test", 1, "127.0.0.1", trust, timeout=0.5) is False                 # nothing listening
+
+
+def _clocked():
+    t = [0.0]
+    return (lambda: t[0]), (lambda seconds: t.__setitem__(0, t[0] + 20))
+
+
+def test_wait_ready_reports_progress_until_the_address_answers():
+    clock, sleep = _clocked()
+    said = []
+    tunnel = ms.FunnelTunnel(443, runner=FakeTailscale(), which=lambda n: "tailscale")
+    tunnel.say = said.append
+    answers, probes = iter([[], [], ["34.1.2.3"], ["34.1.2.3"]]), iter([False, True])
+    assert tunnel.wait_ready("https://mkz.tail1234.ts.net", resolve=lambda h: next(answers), probe=lambda h, p, ip: next(probes), sleep=sleep, clock=clock) is True
+    text = "\n".join(said)
+    assert "publish the public name" in text and "up to 10 minutes" in text and "certificate" in text and "The public address answers" in text
+
+
+def test_wait_ready_gives_up_and_copes_with_a_blocked_network():
+    clock, sleep = _clocked()
+    said = []
+    tunnel = ms.FunnelTunnel(443, runner=FakeTailscale(), which=lambda n: "tailscale")
+    tunnel.say = said.append
+    assert tunnel.wait_ready("https://mkz.tail1234.ts.net", resolve=lambda h: [], probe=lambda *a: False, sleep=sleep, clock=clock, timeout=50) is False
+    assert any("Still not reachable" in line for line in said)
+    said.clear()
+    assert tunnel.wait_ready("https://mkz.tail1234.ts.net", resolve=lambda h: None, sleep=sleep, clock=clock) is None
+    assert any("blocks public DNS" in line for line in said)
+
+
+def test_service_waits_for_the_address_only_when_asked(app, home):
+    waits = []
+
+    class Tunnel(ms.NoTunnel):
+        ready_check = True
+
+        def wait_ready(self, origin):
+            waits.append(origin)
+    service = ms.ShareService(home["dir"], Tunnel(), say=lambda s: None, environ=home["environ"])
+    service.open_web(app.server_address[1])
+    service.close()
+    assert len(waits) == 1 and waits[0].startswith("http://127.0.0.1:")
+    quiet = ms.NoTunnel()
+    service = ms.ShareService(home["dir"], quiet, say=lambda s: None, environ=home["environ"])
+    service.open_web(app.server_address[1])
+    service.close()
+    assert len(waits) == 1
+
+
+def test_cli_has_no_wait_flag():
+    args = ms.build_parser("/tmp").parse_args(["screen", "--no-wait"])
+    assert args.wait is False
+    assert ms.build_parser("/tmp").parse_args(["web", "80"]).wait is True

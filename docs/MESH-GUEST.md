@@ -25,12 +25,16 @@ Links in your pages that point to `http://localhost/...` (common in student proj
 
 ### One-time Tailscale setup for Funnel
 
-Funnel is off until you approve it once (double opt-in, by Tailscale's design):
+Funnel is off until you approve it once (double opt-in, by Tailscale's design). `meshd share` walks you through it and shows
+everything Tailscale says while it waits:
 
-1. `meshd share web 80` the first time prints a link starting `https://login.tailscale.com/...`. Open it and approve.
-2. If it asks for HTTPS certificates: Tailscale admin console, DNS page, turn on **MagicDNS** and **HTTPS Certificates**.
-3. Run the command again. The first time the new `*.ts.net` name can need a few minutes to spread: open the link on your phone
-   (mobile data) before giving it to anyone.
+1. The first run prints a link starting `https://login.tailscale.com/...`. Open it on any device and approve. The command carries
+   on by itself (it waits up to 5 minutes). If Tailscale asks for HTTPS certificates or MagicDNS, turn them on in its admin console.
+2. If Tailscale then says `Access denied: serve config denied`, only root may change Funnel yet. `meshd share` offers to run
+   `sudo tailscale set --operator=$USER` for you (answer Y; it asks for your password). Needed once per computer.
+3. The first time, the public name of your computer has to appear on the internet: Tailscale says public DNS records can take up to
+   10 minutes to show up, and the certificate is made on first use. `meshd share` waits and tells you when the address really answers
+   (`--no-wait` skips the wait and prints the link at once). Later shares are immediate.
 
 Funnel limits (Tailscale's, not ours): public ports 443, 8443 or 10000 only (`--https-port`), TCP/TLS only, and a bandwidth
 limit they do not publish. TLS ends on your computer; Tailscale's relay cannot read the traffic. The public address exists only
