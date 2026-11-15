@@ -46,7 +46,7 @@ while a share is open.
 meshd share doctor                          # check what this needs and what to install (do this first)
 meshd share screen                          # the main monitor, with sound; the guest uses their own keyboard and mouse
 meshd share screen --quality text           # sharpest (code, tables); smooth = for a weak connection; balanced is the default
-meshd share screen --monitor eDP-1 --no-sound --view-only --lock-on-end --ttl 45m
+meshd share screen --monitor eDP-1 --no-sound --view-only --lock-on-end --ttl 45m --fps 24
 meshd share pause | resume                  # freeze their picture and ignore their keys, then undo
 meshd share viewonly on | off               # turn their keyboard and mouse off or on while they watch
 ```
@@ -62,9 +62,35 @@ WebSocket through the same Funnel address; the browser decodes with its own hard
 while a guest is connected (GNOME's recording indicator is on only then), it stops the moment they leave or you revoke, and the
 helper processes end with the share even if it is killed.
 
-Quality: `text` 1920x1080, `balanced` 1600x900, `smooth` 1280x720, all 30 frames/s. If a guest's connection cannot keep up, frames
-are dropped until the next key frame (once a second), so the picture freezes briefly instead of falling behind. Expect about a
-quarter to half a second of delay through Funnel (a measure, not a promise): fine for presenting, not for games.
+Typing the link on the other computer: the terminal prints a **short link** first, `https://<name>.ts.net/j/ABCD-EFGH` (the code uses
+letters and digits that cannot be mixed up; case and the dash do not matter), and says you can also open just
+`https://<name>.ts.net` and type the code in the box that appears. The long link (with the secret in it) is for copy and paste. The
+short code is protected the same way: you still approve every visit, wrong codes are limited per address, and a stranger guessing
+codes can never close your share.
+
+Picture quality: `--quality auto` (the default) picks `balanced` (up to 1600x900) when a hardware encoder is installed and the lighter
+`smooth` (up to 1280x720) for a software one; `text` is the sharpest (up to 1920x1080, the most data). `--fps N` (5 to 60) changes the
+speed; more pictures per second means more data and more work (60 only makes sense with a hardware encoder).
+
+The picture adapts to the guest's window, in the normal view and in full screen: the page tells the computer how big its window is,
+the computer sends a picture of the monitor's own shape that is no bigger than the window can show (no wasted pixels, nothing
+stretched), and when the window changes a lot (full screen, a different window size) the encoder restarts with a better size after
+about a second. The page itself has **Fit** (the whole picture, bars if the shapes differ), **Fill** (covers the window, crops the
+edges) and **Stretch**; the choice is remembered.
+
+What is really happening is shown, not guessed: every 10 seconds the terminal prints a line such as
+`stream: 29 fps made, 2860 kbps, guest 0.1 s behind, video 85% of a core`, and says what limits it when the computer makes fewer
+pictures than promised (a software encoder that is too slow, or an idle screen: GNOME only sends pictures when something changes).
+The page's bar shows fps, kbps, the round trip, and `late` (how far behind real time the pictures are arriving). A guest that falls
+behind is never allowed more than about half a second of backlog: pictures are dropped and it jumps to the next key frame.
+
+Watching the screen on the same computer is the worst case and is detected: the picture contains the picture (a tunnel), every
+pixel changes every frame so the encoder works at its hardest, the same processor also decodes and draws, and the sound would echo.
+The page says so and turns the sound off. Test from another computer.
+
+Hardware encoding is the big saving. On Arch: `sudo pacman -Syu` (a full upgrade, never `-Sy` alone), then
+`sudo pacman -S gst-plugin-va intel-media-driver libva-utils`; `vainfo` should list an H.264 encode entry (`VAEntrypointEncSlice`), and
+`meshd share doctor` then shows `vah264enc`.
 
 Input rules: only real key names are accepted, rates are limited, Ctrl+Alt+F1..F12 (switch to a text console) and Alt+SysRq are
 blocked, held keys are released when the guest leaves, and with `--view-only` or `pause` nothing the guest types reaches the

@@ -9,12 +9,14 @@ Standard library only; it drives `gjs` (the screen-cast session) and `gst-launch
 crash in either one ends the stream, never the share. Capture runs only while a guest is connected.
 """
 
+import ipaddress
 import json
 import os
 import re
 import select
 import shutil
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -33,9 +35,12 @@ PRESETS: Dict[str, Tuple[int, int, int, int]] = {
     "balanced": (1600, 900, 30, 3500),
     "smooth": (1280, 720, 30, 2200),        # for a weak connection
 }
-DEFAULT_QUALITY = "balanced"
-MAX_BACKLOG = 1_500_000        # bytes waiting for one guest before frames are dropped until the next key frame
+DEFAULT_QUALITY = "auto"        # a hardware encoder gets "balanced", a software encoder the lighter "smooth"
+AUTO_HARDWARE, AUTO_SOFTWARE = "balanced", "smooth"
+MIN_BACKLOG = 120_000          # bytes: a guest's queue is never trimmed below this
+MAX_LATENCY = 0.6              # seconds of video a guest's queue may hold; more and frames are dropped until the next key frame
 MAX_GOP_FRAMES = 150
+HEALTH_EVERY = 10.0            # seconds between the stream-health lines on the owner's terminal
 INPUT_RATE = 600               # input events per second one guest may send (a bucket, so bursts are fine)
 INPUT_BURST = 240
 
@@ -210,43 +215,88 @@ def fit_size(width: int, height: int, max_w: int, max_h: int) -> Tuple[int, int]
     return max(2, int(width * scale) // 2 * 2), max(2, int(height * scale) // 2 * 2)
 
 
+def settings_for(quality: str, hardware: bool, native: Tuple[int, int], fps: Optional[int] = None, view: Optional[Tuple[int, int]] = None) -> dict:
+    """The picture to send. Never bigger than the monitor, the preset's ceiling, or what the guest's window can actually show;
+    always the monitor's own shape (so nothing is stretched), both sides even."""
+    name = quality if quality in PRESETS else (AUTO_HARDWARE if hardware else AUTO_SOFTWARE)
+    max_w, max_h, base_fps, base_kbps = PRESETS[name]
+    cap_w, cap_h = max_w, max_h
+    if view and view[0] > 0 and view[1] > 0:
+        cap_w, cap_h = min(max_w, max(640, int(view[0]))), min(max_h, max(360, int(view[1])))
+    width, height = fit_size(native[0], native[1], cap_w, cap_h)
+    rate = int(min(60, max(5, fps or base_fps)))
+    kbps = int(base_kbps * (width * height / float(max_w * max_h)) ** 0.75 * (rate / float(base_fps)))
+    return {"quality": name, "width": width, "height": height, "fps": rate, "kbps": max(600, kbps)}
+
+
+def probe_native_size(node: int, probe: "GstProbe", runner=subprocess.run, env: Optional[dict] = None, timeout: float = 6.0) -> Optional[Tuple[int, int]]:
+    """The real size of the captured monitor's pictures (what PipeWire negotiated), read from GStreamer's own caps line."""
+    if not probe.which("gst-launch-1.0"):
+        return None
+    src = ["pipewiresrc", *_opts(probe, "pipewiresrc", [("path", str(node)), ("do-timestamp", "true"), ("keepalive-time", "100"), ("num-buffers", "3")])]
+    text = ""
+    try:
+        done = runner(["gst-launch-1.0", "-v", *src, "!", "fakesink", "sync=false"], capture_output=True, text=True, timeout=timeout, env=env)
+        text = done.stdout or ""
+    except subprocess.TimeoutExpired as exc:
+        out = exc.stdout
+        text = out.decode(errors="replace") if isinstance(out, bytes) else (out or "")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sizes = re.findall(r"width=\(int\)(\d+),\s*height=\(int\)(\d+)", text)
+    return (int(sizes[-1][0]), int(sizes[-1][1])) if sizes else None
+
+
 def _opts(probe: GstProbe, element: str, wanted: List[Tuple[str, str]]) -> List[str]:
     """name=value options, only the ones this build of the element knows."""
     known = probe.props(element) or set()
     return [f"{name}={value}" for name, value in wanted if name in known]
 
 
-def video_candidates(probe: GstProbe, node: int, width: int, height: int, fps: int, kbps: int) -> List[Tuple[str, List[str]]]:
-    """Pipelines to try, best first: (name of the encoder, gst-launch arguments)."""
+def video_candidates(probe: GstProbe, node: int, native: Tuple[int, int], quality: str = DEFAULT_QUALITY, fps: Optional[int] = None,
+                     view: Optional[Tuple[int, int]] = None) -> List[Tuple[str, List[str], dict]]:
+    """Pipelines to try, best first: (encoder name, gst-launch arguments, the picture settings that pipeline uses)."""
     source = ["pipewiresrc", *_opts(probe, "pipewiresrc", [("path", str(node)), ("do-timestamp", "true"), ("keepalive-time", "100")])]
     if "path=" not in " ".join(source):
         source += _opts(probe, "pipewiresrc", [("target-object", str(node))])
-    head = ["gst-launch-1.0", "-q", *source, "!", "queue", "max-size-buffers=3", "leaky=downstream", "!", "videorate", "!", f"video/x-raw,framerate={fps}/1", "!"]
     tail = ["!", "h264parse", "config-interval=-1", "!", "video/x-h264,stream-format=byte-stream,alignment=au", "!", "fdsink", "fd=1", "sync=false"]
-    out: List[Tuple[str, List[str]]] = []
-    if probe.has("h264parse"):
-        if probe.has("vah264enc") and probe.has("vapostproc"):
-            enc = ["vah264enc", *_opts(probe, "vah264enc", [("bitrate", str(kbps)), ("key-int-max", str(fps)), ("b-frames", "0"), ("rate-control", "cbr"),
-                                                              ("target-usage", "4"), ("aud", "true")])]
-            out.append(("vah264enc (VA-API hardware)", head + ["vapostproc", "!", f"video/x-raw(memory:VAMemory),format=NV12,width={width},height={height}", "!"] + enc + tail))
-        if probe.has("vaapih264enc") and probe.has("vaapipostproc"):
-            enc = ["vaapih264enc", *_opts(probe, "vaapih264enc", [("bitrate", str(kbps)), ("keyframe-period", str(fps)), ("max-bframes", "0"), ("rate-control", "cbr")])]
-            out.append(("vaapih264enc (VA-API hardware)", head + ["vaapipostproc", "!", f"video/x-raw,format=NV12,width={width},height={height}", "!"] + enc + tail))
-        if probe.has("x264enc") and probe.has("videoconvert") and probe.has("videoscale"):
-            enc = ["x264enc", *_opts(probe, "x264enc", [("bitrate", str(kbps)), ("key-int-max", str(fps)), ("bframes", "0"), ("tune", "zerolatency"),
-                                                          ("speed-preset", "ultrafast"), ("aud", "true"), ("byte-stream", "true")])]
-            out.append(("x264enc (software)", head + ["videoconvert", "!", "videoscale", "!", f"video/x-raw,format=I420,width={width},height={height}", "!"] + enc + tail))
-        if probe.has("openh264enc") and probe.has("videoconvert") and probe.has("videoscale"):
-            enc = ["openh264enc", *_opts(probe, "openh264enc", [("bitrate", str(kbps * 1000)), ("gop-size", str(fps)), ("rate-control", "bitrate"),
-                                                                  ("usage-type", "screen"), ("complexity", "low")])]
-            out.append(("openh264enc (software)", head + ["videoconvert", "!", "videoscale", "!", f"video/x-raw,format=I420,width={width},height={height}", "!"] + enc + tail))
+    out: List[Tuple[str, List[str], dict]] = []
+    if not probe.has("h264parse"):
+        return out
+
+    def head(cfg: dict) -> List[str]:
+        return ["gst-launch-1.0", "-q", *source, "!", "queue", "max-size-buffers=3", "leaky=downstream", "!", "videorate", "!", f"video/x-raw,framerate={cfg['fps']}/1", "!"]
+
+    def software_chain(cfg: dict) -> List[str]:       # scale first (fewer pixels to convert), then to the encoder's format
+        return ["videoscale", *_opts(probe, "videoscale", [("n-threads", "2")]), "!", f"video/x-raw,width={cfg['width']},height={cfg['height']}", "!",
+                "videoconvert", *_opts(probe, "videoconvert", [("n-threads", "2")]), "!", "video/x-raw,format=I420", "!"]
+
+    if probe.has("vah264enc") and probe.has("vapostproc"):
+        cfg = settings_for(quality, True, native, fps, view)
+        enc = ["vah264enc", *_opts(probe, "vah264enc", [("bitrate", str(cfg["kbps"])), ("key-int-max", str(cfg["fps"])), ("b-frames", "0"), ("rate-control", "cbr"),
+                                                          ("target-usage", "4"), ("aud", "true")])]
+        out.append(("vah264enc (VA-API hardware)", head(cfg) + ["vapostproc", "!", f"video/x-raw(memory:VAMemory),format=NV12,width={cfg['width']},height={cfg['height']}", "!"] + enc + tail, cfg))
+    if probe.has("vaapih264enc") and probe.has("vaapipostproc"):
+        cfg = settings_for(quality, True, native, fps, view)
+        enc = ["vaapih264enc", *_opts(probe, "vaapih264enc", [("bitrate", str(cfg["kbps"])), ("keyframe-period", str(cfg["fps"])), ("max-bframes", "0"), ("rate-control", "cbr")])]
+        out.append(("vaapih264enc (VA-API hardware)", head(cfg) + ["vaapipostproc", "!", f"video/x-raw,format=NV12,width={cfg['width']},height={cfg['height']}", "!"] + enc + tail, cfg))
+    if probe.has("x264enc") and probe.has("videoconvert") and probe.has("videoscale"):
+        cfg = settings_for(quality, False, native, fps, view)
+        enc = ["x264enc", *_opts(probe, "x264enc", [("bitrate", str(cfg["kbps"])), ("key-int-max", str(cfg["fps"])), ("bframes", "0"), ("tune", "zerolatency"),
+                                                      ("speed-preset", "ultrafast"), ("aud", "true"), ("byte-stream", "true"), ("vbv-buf-capacity", "300")])]
+        out.append(("x264enc (software)", head(cfg) + software_chain(cfg) + enc + tail, cfg))
+    if probe.has("openh264enc") and probe.has("videoconvert") and probe.has("videoscale"):
+        cfg = settings_for(quality, False, native, fps, view)
+        enc = ["openh264enc", *_opts(probe, "openh264enc", [("bitrate", str(cfg["kbps"] * 1000)), ("gop-size", str(cfg["fps"])), ("rate-control", "bitrate"),
+                                                              ("usage-type", "screen"), ("complexity", "low")])]
+        out.append(("openh264enc (software)", head(cfg) + software_chain(cfg) + enc + tail, cfg))
     return out
 
 
 def audio_candidates(probe: GstProbe, sink: Optional[str]) -> List[Tuple[str, List[str]]]:
     if not all(probe.has(e) for e in ("opusenc", "rtpopuspay", "rtpstreampay", "audioconvert", "audioresample")):
         return []
-    enc = ["opusenc", *_opts(probe, "opusenc", [("bitrate", "96000"), ("frame-size", "10"), ("audio-type", "restricted-lowdelay")])]
+    enc = ["opusenc", *_opts(probe, "opusenc", [("bitrate", "96000"), ("frame-size", "20"), ("audio-type", "restricted-lowdelay")])]
     chain = ["!", "audioconvert", "!", "audioresample", "!", "audio/x-raw,rate=48000,channels=2", "!", *enc, "!", "rtpopuspay", "!", "rtpstreampay", "!", "fdsink", "fd=1", "sync=false"]
     out: List[Tuple[str, List[str]]] = []
     if sink and probe.has("pulsesrc"):
@@ -438,62 +488,107 @@ class ScreenCapture:
 # ---------------------------------------------------------------- one running source: capture + video encoder + audio encoder
 
 class GstSource:
-    """What the hub needs: .info, .start(on_video, on_audio, on_end), .stop()."""
+    """What the hub needs: .info, .start(on_video, on_audio, on_end), .stop(), and for adapting to the guest's window
+    .wants_restart(view) / .restart_video(view) / .view."""
 
     def __init__(self, directory: str, connector: str = "", quality: str = DEFAULT_QUALITY, sound: bool = True, environ=os.environ,
                  runner=subprocess.run, popen=subprocess.Popen, which=shutil.which, capture: Optional[ScreenCapture] = None,
-                 probe: Optional[GstProbe] = None) -> None:
-        if quality not in PRESETS:
-            raise StreamError(f"quality is one of {', '.join(PRESETS)}")
-        self.directory, self.connector, self.quality, self.sound = directory, connector, quality, sound
+                 probe: Optional[GstProbe] = None, fps: Optional[int] = None) -> None:
+        if quality != "auto" and quality not in PRESETS:
+            raise StreamError(f"quality is one of auto, {', '.join(PRESETS)}")
+        self.directory, self.connector, self.quality, self.sound, self.fps = directory, connector, quality, sound, fps
         self.environ, self.runner, self.popen, self.which = environ, runner, popen, which
         self.capture = capture or ScreenCapture(directory, environ, popen, which)
         self.probe = probe or GstProbe(runner, which)
         self.procs: List = []
+        self.video = None
+        self.audio_name = ""
         self.stopping = False
+        self.gen = 0
+        self.lock = threading.RLock()
+        self.cb: Optional[Tuple] = None
+        self.cap: dict = {}
+        self.native: Tuple[int, int] = (0, 0)
+        self.view: Optional[Tuple[int, int]] = None
+        self.cfg: dict = {}
         self.info: dict = {}
         self.encoder = ""
         self.log_path = os.path.join(directory, "guest-gst.log")
 
+    # ---- starting
     def start(self, on_video: Callable[[bytes, bool], None], on_audio: Callable[[bytes], None], on_end: Callable[[str], None]) -> None:
         if not self.which("gst-launch-1.0"):
-            raise StreamError("GStreamer is not installed (Arch: sudo pacman -S gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugin-pipewire gst-plugin-va).")
+            raise StreamError("GStreamer is not installed (Arch: sudo pacman -S gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugin-pipewire).")
         self.stopping = False
-        max_w, max_h, fps, kbps = PRESETS[self.quality]
-        cap = self.capture.start(self.connector)
+        self.cb = (on_video, on_audio, on_end)
+        self.cap = self.capture.start(self.connector)
         try:
-            width, height = fit_size(*(cap.get("size") or [0, 0]), max_w, max_h)
-            candidates = video_candidates(self.probe, int(cap["node"]), width, height, fps, kbps)
-            if not candidates:
-                raise StreamError("no H.264 encoder is available to GStreamer. Run  meshd share doctor  to see what to install.")
-            video = self._first_working(candidates, "video")
-            if video is None:
-                raise StreamError("GStreamer could not encode the screen. Run  meshd share doctor ; the details are in " + self.log_path)
-            proc, self.encoder, first = video
-            audio_name = ""
+            self.native = probe_native_size(int(self.cap["node"]), self.probe, self.runner, self._env()) or tuple(self.cap.get("size") or (0, 0))
+            self._launch_video()
+            self.audio_name = ""
             if self.sound:
                 sink = default_sink(self.runner, self.which)
                 audio = self._first_working(audio_candidates(self.probe, sink), "audio", first_bytes=False)
                 if audio is not None:
-                    audio_proc, audio_name, _ = audio
+                    audio_proc, self.audio_name, _ = audio
                     threading.Thread(target=self._pump_audio, args=(audio_proc, on_audio), daemon=True, name="mesh-audio").start()
-            self.info = {"width": width, "height": height, "fps": fps, "kbps": kbps, "codec": "h264", "audio": bool(audio_name), "encoder": self.encoder,
-                         "monitor": cap.get("monitor"), "desktop": cap.get("desktop"), "connector": cap.get("connector")}
-            threading.Thread(target=self._pump_video, args=(proc, on_video, on_end, first), daemon=True, name="mesh-video").start()
+            self._publish_info()
         except BaseException:
             self.stop()
             raise
 
+    def _hardware(self) -> bool:
+        return bool(self.encoder) and "VA-API" in self.encoder or (not self.encoder and self.probe.has("vah264enc"))
+
+    def _launch_video(self) -> None:
+        candidates = video_candidates(self.probe, int(self.cap["node"]), self.native, self.quality, self.fps, self.view)
+        if not candidates:
+            raise StreamError("no H.264 encoder is available to GStreamer. Run  meshd share doctor  to see what to install.")
+        found = self._first_working([(name, argv) for name, argv, _ in candidates], "video")
+        if found is None:
+            raise StreamError("GStreamer could not encode the screen. Run  meshd share doctor ; the details are in " + self.log_path)
+        proc, name, first = found
+        self.video, self.encoder = proc, name
+        self.cfg = next(cfg for n, _, cfg in candidates if n == name)
+        self.gen += 1
+        threading.Thread(target=self._pump_video, args=(proc, self.cb[0], self.cb[2], first, self.gen), daemon=True, name="mesh-video").start()
+
+    def _publish_info(self) -> None:
+        self.info = {"width": self.cfg["width"], "height": self.cfg["height"], "fps": self.cfg["fps"], "kbps": self.cfg["kbps"], "quality": self.cfg["quality"],
+                     "codec": "h264", "audio": bool(self.audio_name), "encoder": self.encoder, "native": list(self.native),
+                     "monitor": self.cap.get("monitor"), "desktop": self.cap.get("desktop"), "connector": self.cap.get("connector")}
+
+    # ---- adapting to the guest's window
+    def wants_restart(self, view: Tuple[int, int]) -> bool:
+        """Would a picture sized for this window be clearly better than the one being sent? (Hysteresis: small changes are ignored.)"""
+        if not self.cfg or not self.video:
+            return False
+        new = settings_for(self.quality, self._hardware(), self.native, self.fps, view)
+        old_area, new_area = self.cfg["width"] * self.cfg["height"], new["width"] * new["height"]
+        return old_area > 0 and (new_area > old_area * 1.3 or new_area < old_area * 0.7)
+
+    def restart_video(self, view: Tuple[int, int]) -> None:
+        with self.lock:
+            if self.stopping or not self.cb:
+                return
+            self.view = view
+            old = self.video
+            self.gen += 1                         # the old reader must not report its end as a failure
+            _terminate(old, 2.0)
+            if old in self.procs:
+                self.procs.remove(old)
+            self._launch_video()
+            self._publish_info()
+
+    # ---- the processes
     def _first_working(self, candidates: List[Tuple[str, List[str]]], what: str, first_bytes: bool = True):
         os.makedirs(self.directory, mode=0o700, exist_ok=True)
-        tried = []
         for name, argv in candidates:
             with open(self.log_path, "ab") as log:
                 log.write(f"\n--- {what}: {name}\n{' '.join(argv)}\n".encode())
                 try:
                     proc = self.popen(argv, stdout=subprocess.PIPE, stderr=log, stdin=subprocess.DEVNULL, env=self._env(), preexec_fn=_die_with_parent)
-                except OSError as exc:
-                    tried.append(f"{name}: {exc}")
+                except OSError:
                     continue
             self.procs.append(proc)
             deadline = time.monotonic() + (8.0 if first_bytes else 1.5)
@@ -513,21 +608,22 @@ class GstSource:
             if not first_bytes and proc.poll() is None:
                 return proc, name, b""                       # sound may be silent for a while; a process still running is good enough
             _terminate(proc, 1.0)
-            tried.append(name)
+            if proc in self.procs:
+                self.procs.remove(proc)
         return None
 
     def _env(self) -> dict:
         import mesh_input as mi
         return {**self.environ, **mi.graphical_environment(self.environ)}
 
-    def _pump_video(self, proc, on_video, on_end, first: bytes = b"") -> None:
+    def _pump_video(self, proc, on_video, on_end, first: bytes, gen: int) -> None:
         splitter = AccessUnitSplitter()
         fd = proc.stdout.fileno()
         reason = "the screen stream stopped"
         try:
             for au, key in splitter.feed(first):
                 on_video(au, key)
-            while not self.stopping:
+            while not self.stopping and gen == self.gen:
                 ready, _, _ = select.select([fd], [], [], 0.015)
                 if ready:
                     data = os.read(fd, 65536)
@@ -543,7 +639,7 @@ class GstSource:
                         break
         except (OSError, ValueError):
             pass
-        if not self.stopping:
+        if not self.stopping and gen == self.gen:
             on_end(reason)
 
     def _pump_audio(self, proc, on_audio) -> None:
@@ -564,11 +660,20 @@ class GstSource:
         except (OSError, ValueError):
             pass
 
+    def pids(self) -> Dict[str, int]:
+        found = {}
+        if self.video is not None and self.video.poll() is None:
+            found["video"] = self.video.pid
+        if self.capture.alive() and getattr(self.capture.proc, "pid", None):
+            found["capture"] = self.capture.proc.pid
+        return found
+
     def stop(self) -> None:
         self.stopping = True
-        for proc in self.procs:
-            _terminate(proc, 2.0)
-        self.procs = []
+        with self.lock:
+            for proc in self.procs:
+                _terminate(proc, 2.0)
+            self.procs, self.video = [], None
         self.capture.stop()
 
 
@@ -656,13 +761,42 @@ class GuestInput:
 
 # ---------------------------------------------------------------- the hub: one source, the guests watching it
 
+def is_this_computer(ip: str) -> bool:
+    """Is this address one of this computer's own? (Then the guest is watching the screen on itself: a mirror.)"""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if addr.is_loopback:
+        return True
+    sock = socket.socket(socket.AF_INET6 if addr.version == 6 else socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind((ip, 0))                  # only possible for an address that belongs to this computer
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def proc_ticks(pid: int) -> Optional[int]:
+    """Processor time (user + system, in clock ticks) a process has used so far."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="ascii", errors="replace") as f:
+            fields = f.read().rsplit(")", 1)[1].split()
+        return int(fields[11]) + int(fields[12])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
 class Subscriber:
     """One guest's connection and the queue of what still has to be sent to it."""
 
-    def __init__(self, ws) -> None:
-        self.ws = ws
+    def __init__(self, ws, clock: Callable[[], float] = time.monotonic, mirror: bool = False) -> None:
+        self.ws, self.clock, self.mirror = ws, clock, mirror
         self.items: Deque[Tuple[int, bytes]] = deque()      # (kind, bytes); kind 1 video, 2 audio, 0 text
         self.bytes = 0
+        self.recent: Deque[Tuple[float, int]] = deque()     # (time, bytes) of the video offered in the last two seconds
         self.cond = threading.Condition()
         self.waiting_key = True
         self.dead = False
@@ -672,6 +806,20 @@ class Subscriber:
 
     def start(self) -> None:
         self.thread.start()
+
+    def _rate(self) -> float:
+        now = self.clock()
+        while self.recent and now - self.recent[0][0] > 2.0:
+            self.recent.popleft()
+        return sum(n for _, n in self.recent) / 2.0
+
+    def limit(self) -> int:
+        """Bytes the queue may hold: MAX_LATENCY seconds of what this guest is being sent, but never less than MIN_BACKLOG."""
+        return max(MIN_BACKLOG, int(self._rate() * MAX_LATENCY))
+
+    def backlog_seconds(self) -> float:
+        rate = self._rate()
+        return self.bytes / rate if rate > 1000 else 0.0
 
     def _put(self, kind: int, data: bytes) -> None:
         with self.cond:
@@ -688,7 +836,9 @@ class Subscriber:
         with self.cond:
             if self.waiting_key and not key:
                 return
-            if self.bytes > MAX_BACKLOG and not key:           # the guest cannot keep up: drop until the next key frame
+            self.recent.append((self.clock(), len(frame)))
+            behind = self.bytes > self.limit()
+            if behind and not key:                             # the guest cannot keep up: drop until the next key frame
                 self.items = deque(item for item in self.items if item[0] != 1)
                 self.bytes = sum(len(item[1]) for item in self.items)
                 self.waiting_key = True
@@ -696,6 +846,9 @@ class Subscriber:
                 return
             if key:
                 self.waiting_key = False
+                if behind:                                     # a key frame replaces everything that is still queued
+                    self.items = deque(item for item in self.items if item[0] != 1)
+                    self.bytes = sum(len(item[1]) for item in self.items)
             self.items.append((1, frame))
             self.bytes += len(frame)
             self.cond.notify()
@@ -704,7 +857,7 @@ class Subscriber:
         if self.dead:
             return
         with self.cond:
-            if self.bytes > MAX_BACKLOG:
+            if self.bytes > self.limit():
                 return
             self.items.append((2, frame))
             self.bytes += len(frame)
@@ -733,14 +886,22 @@ class Subscriber:
         with self.cond:
             self.cond.notify_all()
 
+    def reset_for_new_stream(self) -> None:
+        with self.cond:
+            self.items = deque(item for item in self.items if item[0] == 0)
+            self.bytes = sum(len(item[1]) for item in self.items)
+            self.waiting_key = True
+
 
 class StreamHub:
     def __init__(self, source, injector_factory: Callable[[], object], say: Callable[[str], None] = print, view_only: bool = False,
-                 quality: str = DEFAULT_QUALITY, clock: Callable[[], float] = time.monotonic) -> None:
+                 quality: str = DEFAULT_QUALITY, clock: Callable[[], float] = time.monotonic, health_every: float = HEALTH_EVERY) -> None:
         self.source, self.injector_factory, self.say = source, injector_factory, say
         self.quality = quality
         self.clock = clock
+        self.health_every = health_every
         self.lock = threading.RLock()
+        self.restart_lock = threading.Lock()
         self.subs: Set[Subscriber] = set()
         self.gop: List[Tuple[bytes, bool]] = []
         self.headers: Dict[int, bytes] = {}
@@ -750,6 +911,8 @@ class StreamHub:
         self.input: Optional[GuestInput] = None
         self.running = False
         self.end_reason = ""
+        self.n_video = self.b_video = self.n_audio = 0
+        self.stop_ticker = threading.Event()
 
     # ---- what the owner can change while it runs
     def set_view_only(self, value: bool) -> None:
@@ -769,14 +932,14 @@ class StreamHub:
     def info(self, extra: Optional[dict] = None) -> dict:
         src = getattr(self.source, "info", {}) or {}
         data = {"t": "info", "width": src.get("width"), "height": src.get("height"), "fps": src.get("fps"), "codec": "h264", "audio": bool(src.get("audio")),
-                "view_only": self.view_only, "paused": self.paused, "quality": self.quality}
+                "view_only": self.view_only, "paused": self.paused, "quality": src.get("quality") or self.quality, "native": src.get("native")}
         data.update(extra or {})
         return data
 
     def broadcast_info(self) -> None:
         with self.lock:
             for sub in list(self.subs):
-                sub.put_text(json.dumps(self.info()))
+                sub.put_text(json.dumps(self.info({"mirror": sub.mirror})))
 
     # ---- the source's callbacks
     def _pts(self) -> int:
@@ -786,8 +949,9 @@ class StreamHub:
         """Every key frame carries its parameter sets, so a guest can start from any key frame."""
         if not key:
             return frame
-        types = {nal_type(n) for n in split_nals(frame)}
-        for nal in split_nals(frame):
+        nals = split_nals(frame)
+        types = {nal_type(n) for n in nals}
+        for nal in nals:
             if nal_type(nal) in (7, 8):
                 self.headers[nal_type(nal)] = nal
         missing = [self.headers[t] for t in (7, 8) if t not in types and t in self.headers]
@@ -798,6 +962,8 @@ class StreamHub:
     def on_video(self, frame: bytes, key: bool) -> None:
         frame = self._with_headers(frame, key)
         with self.lock:
+            self.n_video += 1
+            self.b_video += len(frame)
             if key:
                 self.gop = [(frame, True)]
             elif self.gop and len(self.gop) < MAX_GOP_FRAMES:
@@ -813,6 +979,7 @@ class StreamHub:
             return
         data = b"\x02\x00" + struct.pack("!I", self._pts()) + packet
         with self.lock:
+            self.n_audio += 1
             for sub in list(self.subs):
                 sub.offer_audio(data)
 
@@ -824,12 +991,55 @@ class StreamHub:
             for sub in list(self.subs):
                 sub.put_text(json.dumps({"t": "end", "why": "The owner's screen stopped being shared."}))
 
+    # ---- health line on the owner's terminal: what is really being produced and sent
+    def _health(self, generation: int) -> None:
+        ticks = {}
+        last = self.clock()
+        last_n, last_b, last_drop = self.n_video, self.b_video, 0
+        while not self.stop_ticker.wait(self.health_every):
+            if generation != getattr(self, "_generation", 0):
+                return
+            now = self.clock()
+            dt = max(0.001, now - last)
+            with self.lock:
+                n, b = self.n_video, self.b_video
+                subs = list(self.subs)
+            if not subs:
+                last, last_n, last_b = now, n, b
+                continue
+            fps, kbps = (n - last_n) / dt, (b - last_b) * 8 / 1000 / dt
+            dropped = sum(sub.dropped for sub in subs)
+            behind = max(sub.backlog_seconds() for sub in subs)
+            parts = [f"{fps:.0f} fps made, {kbps:.0f} kbps", f"guest {behind:.1f} s behind"]
+            if dropped - last_drop:
+                parts.append(f"{dropped - last_drop} stalls (frames dropped to catch up)")
+            pids = getattr(self.source, "pids", lambda: {})()
+            hot = None
+            for name, pid in pids.items():
+                t = proc_ticks(pid)
+                if t is not None and pid in ticks:
+                    pct = (t - ticks[pid]) / float(os.sysconf("SC_CLK_TCK")) / dt * 100
+                    parts.append(f"{name} {pct:.0f}% of a core")
+                    if name == "video":
+                        hot = pct
+                if t is not None:
+                    ticks[pid] = t
+            self.say("  stream: " + ", ".join(parts))
+            target = (getattr(self.source, "info", {}) or {}).get("fps") or 0
+            if target and fps < target * 0.8:
+                software = "software" in (getattr(self.source, "encoder", "") or "")
+                self.say(f"  The computer makes only {fps:.0f} of {target} pictures a second"
+                         + (" and the encoder is the limit: use --quality smooth, lower --fps, or install the hardware encoder (meshd share doctor)." if software
+                            else ": the screen may be idle (the screen only sends pictures when something changes) or the computer is busy."))
+            last, last_n, last_b, last_drop = now, n, b, dropped
+
     # ---- one guest
     def _ensure_started(self) -> None:
         with self.lock:
             if self.running:
                 return
             self.gop, self.headers = [], {}
+            self.n_video = self.b_video = self.n_audio = 0
             self.source.start(self.on_video, self.on_audio, self.on_end)
             self.running = True
             if self.input is None:
@@ -846,14 +1056,54 @@ class StreamHub:
                     abs_map = mi.AbsoluteMap(tuple(mon) if mon else None, tuple(desk) if desk else None)
                     self.input = GuestInput(injector, abs_map, self.view_only)
                     self.input.paused = self.paused
-            self.say(f"  Streaming the screen: {getattr(self.source, 'encoder', '') or 'encoder unknown'}, "
-                     f"{(getattr(self.source, 'info', {}) or {}).get('width')}x{(getattr(self.source, 'info', {}) or {}).get('height')}"
-                     f"{', with sound' if (getattr(self.source, 'info', {}) or {}).get('audio') else ', no sound'}")
+            info = getattr(self.source, "info", {}) or {}
+            self.say(f"  Streaming the screen: {getattr(self.source, 'encoder', '') or 'encoder unknown'}, {info.get('width')}x{info.get('height')} at {info.get('fps')} fps"
+                     f" ({info.get('quality') or self.quality}){', with sound' if info.get('audio') else ', no sound'}")
+            self._generation = getattr(self, "_generation", 0) + 1
+            self.stop_ticker.clear()
+            threading.Thread(target=self._health, args=(self._generation,), daemon=True, name="mesh-health").start()
 
-    def serve(self, ws, still_valid: Callable[[], bool], on_activity: Callable[[], None]) -> str:
+    def apply_view(self, data: dict) -> None:
+        """The guest's window changed size: if a differently sized picture would be clearly better, restart the encoder with it."""
+        w, h = data.get("w"), data.get("h")
+        if any(isinstance(n, bool) or not isinstance(n, (int, float)) or not 160 <= n <= 16384 for n in (w, h)):
+            return
+        view = (int(w), int(h))
+        src = self.source
+        if hasattr(src, "wants_restart") and src.wants_restart(view):
+            threading.Thread(target=self._restart, args=(view,), daemon=True, name="mesh-restart").start()
+        elif hasattr(src, "view"):
+            src.view = view
+
+    def _restart(self, view: Tuple[int, int]) -> None:
+        with self.restart_lock:
+            try:
+                with self.lock:
+                    self.gop = []
+                    for sub in self.subs:
+                        sub.reset_for_new_stream()
+                self.source.restart_video(view)
+                info = getattr(self.source, "info", {}) or {}
+                self.say(f"  The guest's window changed: now sending {info.get('width')}x{info.get('height')} ({getattr(self.source, 'encoder', '')}).")
+                self.broadcast_info()
+            except StreamError as exc:
+                self.say(f"  Could not change the picture size: {exc}")
+
+    def serve(self, ws, still_valid: Callable[[], bool], on_activity: Callable[[], None], client_ip: str = "") -> str:
         """Runs for the length of one guest's connection. Returns why it ended."""
-        sub = Subscriber(ws)
+        sub = Subscriber(ws, mirror=is_this_computer(client_ip) if client_ip else False)
         try:
+            if not self.running and hasattr(self.source, "view"):
+                try:                                  # the page tells us its window size first, so the stream starts at the right size
+                    first = ws.recv(timeout=2.0)
+                    if first and first[0] == "text":
+                        data = json.loads(first[1])
+                        if isinstance(data, dict) and data.get("t") == "v":
+                            w, h = data.get("w"), data.get("h")
+                            if all(isinstance(n, (int, float)) and not isinstance(n, bool) and 160 <= n <= 16384 for n in (w, h)):
+                                self.source.view = (int(w), int(h))
+                except Exception:  # noqa: BLE001 - nothing usable arrived: start with the preset's size
+                    pass
             self._ensure_started()
         except StreamError as exc:
             self.say(f"  Could not start the screen stream: {exc}")
@@ -867,7 +1117,7 @@ class StreamHub:
             self.subs.add(sub)
             catch_up = list(self.gop)
         try:
-            sub.put_text(json.dumps(self.info()))
+            sub.put_text(json.dumps(self.info({"mirror": sub.mirror})))
             for frame, key in catch_up:                    # the picture appears at once, not at the next key frame
                 sub.offer_video(b"\x01" + (b"\x01" if key else b"\x00") + struct.pack("!I", self._pts()) + frame, key)
             sub.start()
@@ -892,6 +1142,8 @@ class StreamHub:
                 if data.get("t") == "p":
                     ts = data.get("ts")
                     sub.put_text(json.dumps({"t": "pong", "ts": ts if isinstance(ts, (int, float)) and not isinstance(ts, bool) else 0}))
+                elif data.get("t") == "v":
+                    self.apply_view(data)
                 elif self.input is not None and self.input.handle(data):
                     on_activity()
             return "gone"
@@ -914,6 +1166,7 @@ class StreamHub:
             if not self.running:
                 return
             self.running = False
+        self.stop_ticker.set()
         self.source.stop()
         self.say("  The screen stream stopped (nobody is watching).")
 

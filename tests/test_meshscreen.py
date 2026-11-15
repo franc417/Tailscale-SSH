@@ -62,36 +62,77 @@ class OggParser:
 
 
 class FfmpegSource:
-    """The Source the hub drives, with a moving test picture and a sine tone instead of the screen."""
+    """The Source the hub drives, with a moving test picture and a sine tone instead of the screen.
+    adaptive=True behaves like GstSource: the picture is sized for the guest's window and restarted when the window changes a lot."""
 
     encoder = "ffmpeg libx264 (test)"
 
-    def __init__(self, sound=True, width=320, height=240):
-        self.width, self.height, self.sound = width, height, sound
-        self.info = {"width": width, "height": height, "fps": 30, "audio": sound, "monitor": [0, 0, width, height], "desktop": [width, height]}
+    def __init__(self, sound=True, width=320, height=240, adaptive=False):
+        self.native = (width, height)
+        self.width, self.height, self.sound, self.adaptive = width, height, sound, adaptive
+        self.view = None
+        self.info = {"width": width, "height": height, "fps": 30, "audio": sound, "quality": "smooth", "monitor": [0, 0, width, height], "desktop": [width, height]}
         self.started = self.stopped = 0
+        self.restarts = []
         self.procs = []
         self.stopping = False
+        self.gen = 0
         self.fail_start = None
+        self.cb = None
+
+    def _size(self):
+        if not self.adaptive:
+            return self.width, self.height
+        cfg = st.settings_for("smooth", False, self.native, 30, self.view)
+        return cfg["width"], cfg["height"]
+
+    def _start_video(self):
+        w, h = self._size()
+        self.info = {**self.info, "width": w, "height": h}
+        video = subprocess.Popen([FFMPEG, "-v", "error", "-re", "-f", "lavfi", "-i", f"testsrc2=size={w}x{h}:rate=30", "-c:v", "libx264", "-preset", "ultrafast",
+                                  "-tune", "zerolatency", "-g", "30", "-bf", "0", "-pix_fmt", "yuv420p", "-f", "h264", "-"], stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
+        self.procs.append(video)
+        self.video = video
+        self.gen += 1
+        threading.Thread(target=self._video, args=(video, self.cb[0], self.gen), daemon=True).start()
 
     def start(self, on_video, on_audio, on_end):
         if self.fail_start:
             raise st.StreamError(self.fail_start)
         self.started += 1
         self.stopping = False
-        video = subprocess.Popen([FFMPEG, "-v", "error", "-re", "-f", "lavfi", "-i", f"testsrc2=size={self.width}x{self.height}:rate=30", "-c:v", "libx264", "-preset", "ultrafast",
-                                  "-tune", "zerolatency", "-g", "30", "-bf", "0", "-pix_fmt", "yuv420p", "-f", "h264", "-"], stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
-        self.procs = [video]
-        threading.Thread(target=self._video, args=(video, on_video), daemon=True).start()
+        self.cb = (on_video, on_audio, on_end)
+        self._start_video()
         if self.sound:
             audio = subprocess.Popen([FFMPEG, "-v", "error", "-re", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-ac", "2", "-c:a", "libopus", "-b:a", "64k",
                                       "-frame_duration", "10", "-f", "ogg", "-"], stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
             self.procs.append(audio)
             threading.Thread(target=self._audio, args=(audio, on_audio), daemon=True).start()
 
-    def _video(self, proc, on_video):
+    def wants_restart(self, view):
+        if not self.adaptive:
+            return False
+        cfg = st.settings_for("smooth", False, self.native, 30, view)
+        old = self.info["width"] * self.info["height"]
+        new = cfg["width"] * cfg["height"]
+        return new > old * 1.3 or new < old * 0.7
+
+    def restart_video(self, view):
+        self.restarts.append(view)
+        self.view = view
+        self.gen += 1
+        old = self.video
+        old.terminate()
+        old.wait(2)
+        self.procs.remove(old)
+        self._start_video()
+
+    def pids(self):
+        return {"video": self.video.pid} if getattr(self, "video", None) else {}
+
+    def _video(self, proc, on_video, gen):
         sp, fd = st.AccessUnitSplitter(), proc.stdout.fileno()
-        while not self.stopping:
+        while not self.stopping and gen == self.gen:
             ready, _, _ = select.select([fd], [], [], 0.015)
             if ready:
                 data = os.read(fd, 65536)
@@ -200,13 +241,13 @@ def collect(ws, want_video=0, want_audio=0, timeout=10.0):
 
 
 class Rig:
-    def __init__(self, tmp_path, sound=True, view_only=False):
+    def __init__(self, tmp_path, sound=True, view_only=False, source=None):
         runtime = tmp_path / "run"
         runtime.mkdir(mode=0o700)
         self.environ = {"XDG_RUNTIME_DIR": str(runtime)}
         self.dir = str(tmp_path / "cfg")
         self.lines = []
-        self.source = FfmpegSource(sound=sound)
+        self.source = source or FfmpegSource(sound=sound)
         self.injector = mi.RecordingInjector()
         self.service = ms.ShareService(self.dir, ms.NoTunnel(), say=self.lines.append, environ=self.environ)
         self.hub = st.StreamHub(self.source, lambda: self.injector, say=self.lines.append, view_only=view_only)
@@ -265,6 +306,36 @@ def test_screen_stream_over_websocket(rig):
         assert {"t": "pong", "ts": 123} in texts
     finally:
         ws.close()
+
+
+def test_the_picture_follows_the_guests_window_and_keeps_the_screens_shape(tmp_path):
+    r = Rig(tmp_path, sound=False, source=FfmpegSource(sound=False, width=1280, height=720, adaptive=True))
+    try:
+        token = r.enter()
+        ws = WsClient(r.port, token)
+        ws.send_json({"t": "v", "w": 800, "h": 450})                              # the page's first message: how big its window is
+        video, _, texts = collect(ws, want_video=8)
+        first = [t for t in texts if t.get("t") == "info"][0]
+        assert (first["width"], first["height"]) == (800, 450) and first["mirror"] is True and r.source.started == 1
+        assert r.source.view == (800, 450) and len(video) >= 8
+        ws.send_json({"t": "v", "w": 830, "h": 470})                              # a small change: nothing restarts
+        time.sleep(0.5)
+        assert r.source.restarts == []
+        first_sps = [n for n in st.split_nals(video[0][6:]) if st.nal_type(n) == 7][0]
+        ws.send_json({"t": "v", "w": 1280, "h": 720})                             # the window grew (full screen): a bigger picture, same shape
+        deadline = time.time() + 10
+        infos, frames = [], []
+        while time.time() < deadline and not (any(i["width"] == 1280 for i in infos) and any(f[1] == 1 and [n for n in st.split_nals(f[6:]) if st.nal_type(n) == 7][0] != first_sps for f in frames)):
+            v, _, t = collect(ws, want_video=3, timeout=1.5)
+            infos += [x for x in t if x.get("t") == "info"]
+            frames += v
+        assert r.source.restarts == [(1280, 720)] and any((i["width"], i["height"]) == (1280, 720) for i in infos)
+        new_key = [f for f in frames if f[1] == 1 and [n for n in st.split_nals(f[6:]) if st.nal_type(n) == 7][0] != first_sps]
+        assert new_key                                                            # the new stream begins at a key frame, with its own parameter sets
+        assert any("window changed" in line for line in r.lines)
+        ws.close()
+    finally:
+        r.close()
 
 
 def test_nobody_gets_the_stream_without_a_session_or_from_another_site(rig):
@@ -476,6 +547,10 @@ def test_guest_watches_and_controls_in_a_real_browser(rig, browser):
     assert page.is_visible("#go")
     page.click("#go")                                                                # a click: sound and input start
     until(page, "() => window.__mesh ? window.__mesh.frames : 0", lambda v: v > 10)
+    assert page.inner_text("#snd") == "Sound off" and page.is_visible("#mirror")        # watching this computer on itself: sound is off by itself, with a note
+    assert page.evaluate("window.__mesh.audioChunks") == 0                               # and nothing is decoded while it is off
+    page.click("#snd")                                                                   # switch the sound on
+    assert page.inner_text("#snd") == "Sound on"
     until(page, "() => window.__mesh.audioChunks", lambda v: v > 3, 10)
     assert page.evaluate("window.__mesh.errors") == [] and not problems
     pixels = page.evaluate("""() => { const c = document.getElementById('screen'); const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
@@ -508,6 +583,23 @@ def test_guest_watches_and_controls_in_a_real_browser(rig, browser):
     page.click("#snd")
     assert page.inner_text("#snd") == "Sound off"
     page.click("#snd")
+    # the page told the computer how big its window is, and fit / fill / stretch change how the picture sits in it
+    assert rig.source.view == (1000, 700)
+    assert page.evaluate("typeof window.__mesh.late") == "number"
+    page.click("#fit")
+    assert page.inner_text("#fit") == "Fill"
+    fill = page.eval_on_selector("#screen", "e => { const r = e.getBoundingClientRect(); return [r.width, r.height]; }")
+    assert abs(fill[0] / fill[1] - 320 / 240) < 0.02 and fill[0] >= 1000 and fill[1] >= 700        # covers the window, same shape (crops the edges)
+    page.click("#fit")
+    assert page.inner_text("#fit") == "Stretch"
+    stretch = page.eval_on_selector("#screen", "e => { const r = e.getBoundingClientRect(); return [r.width, r.height]; }")
+    assert stretch == [1000, 700]
+    page.click("#fit")
+    assert page.inner_text("#fit") == "Fit"
+    page.set_viewport_size({"width": 700, "height": 900})                                   # a taller, narrower window: the picture refits at once
+    time.sleep(0.4)
+    box2 = page.eval_on_selector("#screen", "e => { const r = e.getBoundingClientRect(); return [r.width, r.height]; }")
+    assert abs(box2[0] / box2[1] - 320 / 240) < 0.02 and box2[0] <= 700 and box2[1] <= 900 and abs(box2[0] - 700) < 3
     # Leave: the guest is out, the capture stops, the link stays open for a new approval
     page.click("#leave")
     page.wait_for_selector("#over:not([hidden])", timeout=5000)

@@ -332,6 +332,8 @@ def test_landing_page_never_carries_the_secret_and_is_locked_down(rig):
 
 def test_nothing_of_the_app_is_visible_without_a_session(rig):
     resp, data = rig.http("GET", "/", headers={"Accept": "text/html"})
+    assert resp.status == 200 and b"codein" in data and b"localhost" not in data           # the front door only offers the box for the code
+    resp, data = rig.http("GET", "/page.php", headers={"Accept": "text/html"})
     assert resp.status == 401 and b"localhost" not in data
     assert rig.http("GET", "/anything")[0].status == 401
     assert rig.http("GET", "/_mesh/other")[0].status == 404
@@ -983,3 +985,103 @@ def test_cli_has_no_wait_flag():
     args = ms.build_parser("/tmp").parse_args(["screen", "--no-wait"])
     assert args.wait is False
     assert ms.build_parser("/tmp").parse_args(["web", "80"]).wait is True
+
+
+# ---------------------------------------------------------------- the short code: a link you can type on another computer
+
+def test_short_code_is_easy_to_read_and_type():
+    seen = set()
+    for _ in range(300):
+        code = ms.new_code()
+        assert len(code) == 8 and set(code) <= set(ms.CODE_ALPHABET)
+        seen.add(code)
+    assert len(seen) == 300 and not (set("".join(seen)) & set("01OIL"))                 # nothing to mix up
+    assert ms.format_code("K7M3Q9TX") == "K7M3-Q9TX"
+    for typed in ("k7m3-q9tx", " K7M3 Q9TX ", "K7M3Q9TX", "k7m3q9tx\n"):
+        assert ms.normalize_code(typed) == "K7M3Q9TX"
+
+
+def test_claim_with_the_short_code():
+    clock = Clock()
+    m = ms.ShareManager(clock=clock)
+    share, secret = m.create("web", 80)
+    typed = ms.format_code(share.code).lower()                                          # as typed on a phone: lower case and a dash
+    status, body, token = m.claim_code(typed, "", "1.1.1.1", "Chrome on Windows")
+    assert status == 200 and body["state"] == "pending" and token
+    assert m.claim_code(share.code, "", "2.2.2.2", "x")[0] == 409                        # one person at a time, same as the long link
+    assert m.claim_code("zzzz", token, "1.1.1.1", "x")[0] == 200                         # the waiting visitor reloads: still theirs
+    assert m.approve(share.id, body["code"])[0] and m.touch(token) is not None
+    assert m.leave(token)
+    assert m.claim_code(share.code, "", "1.1.1.1", "x")[0] == 200                        # and back in with the code, after a new approval
+    m.revoke(share.id)
+    assert m.claim_code(share.code, "", "1.1.1.1", "x")[0] == 410
+
+
+def test_wrong_codes_are_refused_and_lock_the_address_not_the_share():
+    m = ms.ShareManager(clock=Clock())
+    share, secret = m.create("web", 80)
+    for _ in range(ms.FAIL_LIMIT):
+        status, body, _ = m.claim_code("AAAA-BBBB", "", "9.9.9.9", "x")
+        assert status == 403 and body["message"] == "That code is not right."
+    assert m.claim_code(share.code, "", "9.9.9.9", "x")[0] == 429                       # even the right code waits out the lock
+    assert m.claim_code("", "", "8.8.8.8", "x")[0] == 403 and m.claim_code(None, "", "8.8.8.8", "x")[0] == 403
+    assert m.claim_code(share.code, "", "8.8.8.8", "x")[0] == 200                        # another address is fine
+    assert share.state == "open" and share.failures == 0                                 # strangers guessing codes cannot close the owner's share
+
+
+def test_short_link_and_join_page_through_the_gateway(rig):
+    code = ms.format_code(rig.share.code)
+    resp, data = rig.http("GET", f"/j/{code}")                                          # the short link: the page that claims it
+    assert resp.status == 200 and b"landing.js" in data and rig.secret.encode() not in data
+    resp, data = rig.http("POST", "/_mesh/j/claim", {"code": code.lower()}, headers={"X-Forwarded-For": "203.0.113.5"})
+    body = json.loads(data)
+    token = [v for k, v in resp.getheaders() if k.lower() == "set-cookie"][0].split("=", 1)[1].split(";")[0]
+    assert resp.status == 200 and body["state"] == "pending" and len(body["code"]) == 4
+    assert rig.manager.approve(rig.share.id, body["code"])[0]
+    assert rig.http("GET", "/echo", cookie=token)[0].status == 200
+    # a stranger who only knows the address sees the box for the code, and nothing of the app
+    resp, data = rig.http("GET", "/", headers={"Accept": "text/html"}, host=HOST)
+    assert resp.status == 401 or b"codein" in data                                      # (the share is taken now: no box needed for a stranger)
+
+
+def test_join_page_for_a_stranger_while_a_share_is_open(rig):
+    resp, data = rig.http("GET", "/", headers={"Accept": "text/html"})
+    assert resp.status == 200 and b"codein" in data and b"localhost" not in data and rig.secret.encode() not in data
+    assert rig.http("GET", "/anything.php", headers={"Accept": "text/html"})[0].status == 401        # only the front door shows the box
+    resp, data = rig.http("POST", "/_mesh/j/claim", {"code": "AAAA-BBBB"})
+    assert resp.status == 403 and json.loads(data)["message"] == "That code is not right."
+    assert rig.http("POST", "/_mesh/j/claim", "not json")[0].status in (400, 403)
+    rig.manager.revoke(rig.share.id)
+    assert rig.http("GET", "/", headers={"Accept": "text/html"})[0].status == 401                    # nothing is open: no box, no hint
+
+
+def test_landing_script_handles_long_link_short_link_and_typed_code(rig):
+    js = rig.http("GET", "/_mesh/landing.js")[1].decode()
+    assert "/_mesh/j/claim" in js and "parts[0] === 'j'" in js and "history.replaceState" in js
+
+
+def test_service_info_carries_the_short_link(app, home):
+    service = ms.ShareService(home["dir"], ms.NoTunnel(), say=lambda s: None, environ=home["environ"])
+    info = service.open_web(app.server_address[1])
+    try:
+        share = next(iter(service.manager.shares.values()))
+        assert info["short"] == f"{info['origin']}/j/{ms.format_code(share.code)}" and info["code"] == ms.format_code(share.code)
+        assert len(info["short"]) < len(info["link"]) - 20
+        assert ms.control_request(home["dir"], {"cmd": "info"}, home["environ"])["info"]["short"] == info["short"]
+    finally:
+        service.close()
+
+
+def test_run_web_prints_the_short_link_first(app, home):
+    args = ms.build_parser(home["dir"]).parse_args(["web", str(app.server_address[1]), "--tunnel", "none", "--no-qr"])
+    out, result = [], {}
+    t = threading.Thread(target=lambda: result.update(code=ms.run_web(args, environ=home["environ"], say=out.append, interactive=False)))
+    t.start()
+    deadline = time.time() + 5
+    while time.time() < deadline and ms.control_request(home["dir"], {"cmd": "list"}, home["environ"]) is None:
+        time.sleep(0.05)
+    ms.control_request(home["dir"], {"cmd": "revoke"}, home["environ"])
+    t.join(5)
+    text = "\n".join(out)
+    assert "To type on the other computer" in text and "/j/" in text and "type the code:" in text
+    assert text.index("/j/") < text.index("/_mesh/g/")                                  # the short one comes first

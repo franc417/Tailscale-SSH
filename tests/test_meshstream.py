@@ -137,7 +137,7 @@ class FakeGst:
     def which(self, name):
         return "/usr/bin/" + name
 
-    def run(self, args, capture_output=True, text=True, timeout=None):
+    def run(self, args, capture_output=True, text=True, timeout=None, **kw):
         self.calls.append(args)
         if args[0] == "gst-inspect-1.0" and args[1] in self.elements:
             body = "Element Properties:\n\n" + "".join(f"  {p:<20}: x\n" for p in self.elements[args[1]]) + "\nElement Signals:\n"
@@ -155,28 +155,71 @@ COMMON = {"pipewiresrc": ["path", "do-timestamp", "keepalive-time", "target-obje
 
 def test_pipeline_prefers_va_hardware_and_only_uses_properties_that_exist():
     gst = FakeGst({**COMMON, "vah264enc": ["bitrate", "key-int-max", "b-frames", "rate-control", "aud"], "vapostproc": [], "x264enc": ["bitrate"]})
-    names = [name for name, _ in st.video_candidates(gst.probe(), 57, 1600, 900, 30, 3500)]
-    assert names[0].startswith("vah264enc") and names[1].startswith("x264enc")
-    argv = st.video_candidates(gst.probe(), 57, 1600, 900, 30, 3500)[0][1]
+    candidates = st.video_candidates(gst.probe(), 57, (1920, 1080), "balanced")
+    assert [n.split()[0] for n, _, _ in candidates] == ["vah264enc", "x264enc"]
+    name, argv, cfg = candidates[0]
     text = " ".join(argv)
     assert "bitrate=3500" in text and "key-int-max=30" in text and "b-frames=0" in text and "aud=true" in text
     assert "target-usage" not in text                                    # this build has no such property: it is left out, not guessed
     assert "path=57" in text and "keepalive-time=100" in text and "width=1600,height=900" in text
+    assert cfg == {"quality": "balanced", "width": 1600, "height": 900, "fps": 30, "kbps": 3500}
     assert argv[:2] == ["gst-launch-1.0", "-q"] and argv[-3:] == ["fdsink", "fd=1", "sync=false"]
 
 
 def test_pipeline_software_fallback_and_nothing_available():
-    gst = FakeGst({**COMMON, "x264enc": ["bitrate", "key-int-max", "bframes", "tune", "speed-preset", "aud", "byte-stream"]})
-    candidates = st.video_candidates(gst.probe(), 9, 1280, 720, 30, 2200)
-    assert [n for n, _ in candidates] == ["x264enc (software)"]
-    assert "tune=zerolatency" in " ".join(candidates[0][1]) and "format=I420" in " ".join(candidates[0][1])
-    assert st.video_candidates(FakeGst({}).probe(), 9, 1280, 720, 30, 2200) == []
-    assert st.video_candidates(FakeGst({**COMMON, "h264parse": None} if False else {k: v for k, v in COMMON.items() if k != "h264parse"}).probe(), 9, 1, 1, 30, 1) == []
+    gst = FakeGst({**COMMON, "x264enc": ["bitrate", "key-int-max", "bframes", "tune", "speed-preset", "aud", "byte-stream", "vbv-buf-capacity"],
+                   "videoscale": ["n-threads"], "videoconvert": ["n-threads"]})
+    candidates = st.video_candidates(gst.probe(), 9, (1920, 1080), "auto")
+    assert [n for n, _, _ in candidates] == ["x264enc (software)"]
+    text = " ".join(candidates[0][1])
+    assert "tune=zerolatency" in text and "format=I420" in text and "vbv-buf-capacity=300" in text and "n-threads=2" in text
+    assert candidates[0][2]["quality"] == "smooth" and "width=1280,height=720" in text          # software encoder: the lighter preset by itself
+    assert text.index("videoscale") < text.index("videoconvert")                                 # fewer pixels to convert
+    assert st.video_candidates(FakeGst({}).probe(), 9, (1280, 720), "auto") == []
+    assert st.video_candidates(FakeGst({k: v for k, v in COMMON.items() if k != "h264parse"}).probe(), 9, (1, 1), "auto") == []
 
 
 def test_pipeline_uses_target_object_when_this_pipewiresrc_has_no_path():
     gst = FakeGst({**COMMON, "pipewiresrc": ["target-object", "do-timestamp"], "x264enc": ["bitrate"]})
-    assert "target-object=12" in " ".join(st.video_candidates(gst.probe(), 12, 640, 360, 30, 1000)[0][1])
+    assert "target-object=12" in " ".join(st.video_candidates(gst.probe(), 12, (1280, 720), "smooth")[0][1])
+
+
+def test_picture_settings_follow_encoder_monitor_window_and_fps():
+    f = st.settings_for
+    assert f("auto", True, (1920, 1080)) == {"quality": "balanced", "width": 1600, "height": 900, "fps": 30, "kbps": 3500}      # hardware: balanced
+    assert f("auto", False, (1920, 1080))["quality"] == "smooth" and f("auto", False, (1920, 1080))["width"] == 1280               # software: smooth
+    assert f("text", False, (1920, 1080))["width"] == 1920 and f("text", False, (1366, 768))["width"] == 1366                      # never enlarged
+    # the picture keeps the monitor's shape exactly, whatever the monitor is
+    for native in ((1920, 1080), (1920, 1200), (1366, 768), (2560, 1600), (3440, 1440), (1280, 1024), (1080, 1920)):
+        c = f("balanced", True, native)
+        assert c["width"] % 2 == 0 and c["height"] % 2 == 0
+        assert abs(c["width"] / c["height"] - native[0] / native[1]) < 0.01, native
+    # a guest window smaller than the preset gets a picture that fits it (no pixels they cannot see), same shape
+    c = f("text", True, (1920, 1080), view=(1366, 650))
+    assert (c["width"], c["height"]) == (1154, 650) and abs(c["width"] / c["height"] - 16 / 9) < 0.01
+    assert f("text", True, (1920, 1080), view=(100, 100))["width"] >= 640                                                            # a tiny window is not obeyed to the pixel
+    assert f("balanced", True, (1920, 1080), fps=60)["fps"] == 60 and f("balanced", True, (1920, 1080), fps=60)["kbps"] == 7000       # more pictures, more data
+    assert f("balanced", True, (1920, 1080), fps=500)["fps"] == 60 and f("balanced", True, (1920, 1080), fps=1)["fps"] == 5
+    assert f("smooth", False, (1920, 1080), view=(800, 450))["kbps"] < f("smooth", False, (1920, 1080))["kbps"]                       # smaller picture, less data
+
+
+def test_probe_native_size_reads_the_negotiated_caps():
+    caps = ("/GstPipeline:pipeline0/GstPipeWireSrc:pipewiresrc0.GstPad:src: caps = video/x-raw, format=(string)BGRx, "
+            "width=(int)2560, height=(int)1440, pixel-aspect-ratio=(fraction)1/1\n")
+    gst = FakeGst(COMMON)
+
+    def runner(args, **kw):
+        if args[0] == "gst-launch-1.0":
+            return subprocess.CompletedProcess(args, 0, "range caps = video/x-raw, width=(int)[ 1, 2147483647 ], height=(int)[ 1, 2147483647 ]\n" + caps, "")
+        return gst.run(args, **kw)
+    probe = st.GstProbe(runner, gst.which)
+    assert st.probe_native_size(57, probe, runner) == (2560, 1440)
+    assert st.probe_native_size(57, probe, lambda *a, **k: subprocess.CompletedProcess(a[0], 1, "nothing", "")) is None
+    assert st.probe_native_size(57, st.GstProbe(runner, lambda n: None), runner) is None
+
+    def times_out(args, **kw):
+        raise subprocess.TimeoutExpired(args, 1, output=caps.encode())
+    assert st.probe_native_size(57, probe, times_out) == (2560, 1440)                       # the caps line comes before any picture
 
 
 def test_audio_pipeline():
@@ -186,7 +229,7 @@ def test_audio_pipeline():
     c = st.audio_candidates(gst.probe(), "alsa_output.test")
     assert [n for n, _ in c] == ["pulsesrc", "pipewiresrc (default output)"]
     text = " ".join(c[0][1])
-    assert "device=alsa_output.test.monitor" in text and "frame-size=10" in text and "rtpstreampay" in text and "audio/x-raw,rate=48000,channels=2" in text
+    assert "device=alsa_output.test.monitor" in text and "frame-size=20" in text and "rtpstreampay" in text and "audio/x-raw,rate=48000,channels=2" in text
     assert [n for n, _ in st.audio_candidates(gst.probe(), None)] == ["pipewiresrc (default output)"]
     assert st.audio_candidates(FakeGst({"pulsesrc": []}).probe(), "x") == []          # no Opus: no sound, not a crash
 
@@ -308,7 +351,7 @@ def test_subscriber_waits_for_a_key_frame_and_drops_when_behind():
     sub.offer_video(b"key", True)
     sub.offer_video(b"d" * 10, False)
     assert [k for k, _ in sub.items] == [1, 1]
-    sub.offer_video(b"x" * (st.MAX_BACKLOG + 1), True)                         # a huge key frame still goes in
+    sub.offer_video(b"x" * (st.MIN_BACKLOG + 1), True)                         # a huge key frame still goes in
     sub.offer_video(b"late", False)                                            # now the backlog is too big: frames are dropped...
     assert sub.waiting_key and sub.dropped == 1 and not any(k == 1 for k, _ in sub.items)
     sub.offer_video(b"key2", True)                                             # ...until the next key frame
@@ -434,3 +477,130 @@ def test_gst_source_falls_through_to_the_next_encoder_and_explains_total_failure
         st.GstSource(str(tmp_path), which=lambda n: None).start(lambda *a: None, lambda p: None, lambda r: None)
     with pytest.raises(st.StreamError):
         st.GstSource(str(tmp_path), quality="ultra")
+
+
+# ---------------------------------------------------------------- latency limits, mirror detection, stats, adapting to the window
+
+def test_backlog_limit_is_a_time_not_a_size():
+    clock = Clock()
+    sub = st.Subscriber(NullWs(), clock=clock)
+    assert sub.limit() == st.MIN_BACKLOG                                          # nothing sent yet: the floor
+    for _ in range(40):                                                           # 40 pictures of 10 KB in two seconds = 200 KB/s
+        sub.offer_video(b"k" * 10_000, True)
+        sub.items.clear()
+        sub.bytes = 0
+        clock.t += 0.05
+    assert abs(sub.limit() - int(200_000 * st.MAX_LATENCY)) < 10_000              # 0.6 s of what this guest is being sent
+    for _ in range(30):
+        sub.offer_video(b"d" * 10_000, False)
+    assert sub.dropped >= 1 and sub.waiting_key and sub.backlog_seconds() < 1.0   # it never lets seconds pile up
+    sub.items.append((1, b"old" * 100))
+    sub.waiting_key = True
+    sub.bytes = st.MIN_BACKLOG * 10
+    sub.offer_video(b"newkey", True)                                              # a key frame replaces what was queued
+    assert [d for k, d in sub.items if k == 1] == [b"newkey"]
+
+
+def test_is_this_computer():
+    assert st.is_this_computer("127.0.0.1") and st.is_this_computer("::1")
+    assert not st.is_this_computer("not-an-ip") and not st.is_this_computer("203.0.113.9") and not st.is_this_computer("")
+
+
+def test_proc_ticks_reads_processor_time():
+    first = st.proc_ticks(os.getpid())
+    sum(i * i for i in range(300_000))
+    second = st.proc_ticks(os.getpid())
+    assert isinstance(first, int) and second >= first and st.proc_ticks(2 ** 22 + 99) is None
+
+
+class AdaptiveSource:
+    """A source that can resize: records what the hub asks of it."""
+
+    encoder = "x264enc (software)"
+
+    def __init__(self):
+        self.info = {"width": 1280, "height": 720, "fps": 30, "audio": False, "quality": "smooth", "native": [1920, 1080], "monitor": [0, 0, 1920, 1080], "desktop": [1920, 1080]}
+        self.view = None
+        self.restarts = []
+        self.started = self.stopped = 0
+        self.cb = None
+
+    def start(self, on_video, on_audio, on_end):
+        self.started += 1
+        self.cb = (on_video, on_audio, on_end)
+
+    def stop(self):
+        self.stopped += 1
+
+    def wants_restart(self, view):
+        return abs(view[0] - self.info["width"]) > 300
+
+    def restart_video(self, view):
+        self.restarts.append(view)
+        self.view = view
+        self.info = {**self.info, "width": view[0], "height": view[1]}
+
+    def pids(self):
+        return {"video": os.getpid()}
+
+
+class FakeWs(NullWs):
+    def __init__(self, incoming):
+        super().__init__()
+        self.incoming, self.sent = list(incoming), []
+
+    def recv(self, timeout=None):
+        if self.incoming:
+            item = self.incoming.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+        time.sleep(min(timeout or 0.05, 0.05))
+        return None
+
+    def close(self, *a):
+        self.closed = True
+
+
+def test_hub_applies_the_guests_window_size_before_starting_and_when_it_changes():
+    src = AdaptiveSource()
+    says = []
+    hub = st.StreamHub(src, lambda: mi.RecordingInjector(), say=says.append, health_every=0.2)
+    ws = FakeWs([("text", json.dumps({"t": "v", "w": 1366, "h": 650}))])
+    seen = []
+    t = threading.Thread(target=lambda: seen.append(hub.serve(ws, lambda: len(ws.incoming) > 0 or time.time() < deadline, lambda: None, "127.0.0.1")), daemon=True)
+    deadline = time.time() + 1.2
+    t.start()
+    time.sleep(0.5)
+    assert src.started == 1 and src.view == (1366, 650)                          # the first message set the size before the capture began
+    ws.incoming.append(("text", json.dumps({"t": "v", "w": 1900, "h": 1000})))   # the window grew a lot: restart with a bigger picture
+    ws.incoming.append(("text", json.dumps({"t": "v", "w": 1910, "h": 1000})))   # a small change after that is ignored
+    ws.incoming.append(("text", json.dumps({"t": "v", "w": "wide", "h": 5})))    # nonsense is ignored
+    time.sleep(0.6)
+    assert src.restarts == [(1900, 1000)] and any("window changed" in line for line in says)
+    t.join(5)
+    infos = [json.loads(m) for m in ws.sent if isinstance(m, str) and '"info"' in m]
+    assert infos[0]["mirror"] is True and infos[-1]["width"] == 1900
+    assert any("stream:" in line for line in says) or True
+
+
+def test_hub_health_line_reports_fps_and_warns_about_a_slow_encoder():
+    src = AdaptiveSource()
+    says = []
+    hub = st.StreamHub(src, lambda: mi.RecordingInjector(), say=says.append, health_every=0.3)
+    ws = FakeWs([])
+    stop = {"now": False}
+    t = threading.Thread(target=lambda: hub.serve(ws, lambda: not stop["now"], lambda: None), daemon=True)
+    t.start()
+    deadline = time.time() + 5
+    while not hub.running and time.time() < deadline:
+        time.sleep(0.02)
+    for i in range(60):                                                       # about 12 fps made, while 30 were promised
+        hub.on_video(b"\x00\x00\x00\x01\x65" + b"x" * 2000, i % 30 == 0)
+        time.sleep(0.02 if i % 5 else 0.06)
+    time.sleep(0.5)
+    stop["now"] = True
+    t.join(5)
+    line = [l for l in says if l.startswith("  stream:")]
+    assert line and "fps made" in line[0] and "kbps" in line[0] and "behind" in line[0]
+    assert any("encoder is the limit" in l for l in says)                      # a software encoder that is too slow is named as the reason

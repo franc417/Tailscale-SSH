@@ -9,7 +9,8 @@ SCREEN_HTML = r"""<!doctype html>
 <div id="stage"><canvas id="screen" tabindex="0"></canvas></div>
 <div id="start"><div><h1>Mesh</h1><p id="note">The owner is sharing their screen with you.</p><button id="go">Start</button>
 <p class="dim">Sound and the keyboard and mouse start when you click Start.</p></div></div>
-<div id="bar" hidden><span id="stat"></span><button id="fs" type="button">Full screen</button><button id="snd" type="button">Sound on</button><button id="cur" type="button">My cursor</button><button id="leave" type="button">Leave</button><button id="close" type="button">Close</button></div>
+<div id="bar" hidden><span id="stat"></span><button id="fs" type="button">Full screen</button><button id="fit" type="button">Fit</button><button id="snd" type="button">Sound on</button><button id="cur" type="button">My cursor</button><button id="leave" type="button">Leave</button><button id="close" type="button">Close</button></div>
+<div id="mirror" hidden></div>
 <div id="over" hidden><div><h1>Mesh</h1><p id="why"></p><button id="again" type="button" hidden>Reconnect</button></div></div>
 <script src="/_mesh/screen.js"></script>
 </body></html>
@@ -29,15 +30,18 @@ button:hover{background:#fff;color:#000}
      opacity:.18;transition:opacity .2s;white-space:nowrap;max-width:100vw;overflow-x:auto}
 #bar:hover,#bar:focus-within{opacity:1}
 #stat{color:#aaa;font-size:.8rem;margin-right:.6rem}
+#mirror{position:fixed;bottom:.6rem;left:50%;transform:translateX(-50%);z-index:4;max-width:90vw;padding:.5rem .9rem;background:rgba(0,0,0,.85);border:1px solid #666;color:#ccc;font-size:.8rem;text-align:center}
+#stage{overflow:hidden}
 """
 
 SCREEN_JS = r"""(function () {
   'use strict';
   var $ = function (id) { return document.getElementById(id); };
-  var canvas = $('screen'), ctx = canvas.getContext('2d', {alpha: false});
+  var canvas = $('screen'), ctx = canvas.getContext('2d', {alpha: false, desynchronized: true});
   var st = {ws: null, vdec: null, adec: null, actx: null, gain: null, nextAudio: 0, sps: null, pps: null, configured: false, needKey: true,
             latest: null, raf: 0, started: false, ended: false, info: {}, shown: false, muted: false,
-            frames: 0, bytes: 0, dropped: 0, audioChunks: 0, errors: [], fps: 0, kbps: 0, rtt: 0, tick: performance.now(), tf: 0, tb: 0};
+            frames: 0, bytes: 0, dropped: 0, audioChunks: 0, errors: [], fps: 0, kbps: 0, rtt: 0, tick: performance.now(), tf: 0, tb: 0,
+            mode: 'fit', minOff: null, late: 0, mirror: false, lastView: '', viewTimer: 0};
   window.__mesh = st;   // read by the automatic tests, harmless otherwise
 
   function note(text) { st.errors.push(text); if (st.errors.length > 20) { st.errors.shift(); } }
@@ -81,6 +85,9 @@ SCREEN_JS = r"""(function () {
   }
   function handleVideo(buf) {
     var u8 = new Uint8Array(buf), key = (u8[1] & 1) === 1, pts = new DataView(buf).getUint32(2);
+    var off = performance.now() - pts;
+    if (st.minOff === null || off < st.minOff) { st.minOff = off; }
+    st.late = st.late * 0.9 + (off - st.minOff) * 0.1;
     var list = nals(u8.subarray(6)), body = [], sps = null, pps = null, i, t;
     for (i = 0; i < list.length; i++) {
       t = list[i][0] & 31;
@@ -104,11 +111,24 @@ SCREEN_JS = r"""(function () {
   }
 
   // ---- drawing
+  function stageSize() { var s = $('stage'); return [s.clientWidth || window.innerWidth, s.clientHeight || window.innerHeight]; }
   function fit() {
-    var scale = Math.min(window.innerWidth / canvas.width, window.innerHeight / canvas.height);
-    canvas.style.width = Math.floor(canvas.width * scale) + 'px';
-    canvas.style.height = Math.floor(canvas.height * scale) + 'px';
+    if (!canvas.width || !canvas.height) { return; }
+    var sz = stageSize(), sw = sz[0], sh = sz[1], scale;
+    if (st.mode === 'stretch') { canvas.style.width = sw + 'px'; canvas.style.height = sh + 'px'; return; }
+    scale = st.mode === 'fill' ? Math.max(sw / canvas.width, sh / canvas.height) : Math.min(sw / canvas.width, sh / canvas.height);
+    canvas.style.width = Math.round(canvas.width * scale) + 'px';
+    canvas.style.height = Math.round(canvas.height * scale) + 'px';
   }
+  // tell the computer how big this window really is (in screen pixels), so it sends a picture of that size and shape
+  function sendView(now) {
+    var sz = stageSize(), dpr = window.devicePixelRatio || 1, w = Math.round(sz[0] * dpr), h = Math.round(sz[1] * dpr), key = w + 'x' + h;
+    if (key === st.lastView) { return; }
+    var go = function () { st.lastView = key; send({t: 'v', w: w, h: h}); };
+    if (now) { go(); return; }
+    clearTimeout(st.viewTimer); st.viewTimer = setTimeout(go, 700);
+  }
+  function refit() { fit(); if (st.started && st.ws && st.ws.readyState === 1) { sendView(false); } }
   function onFrame(frame) {
     if (st.latest) { st.latest.close(); }
     st.latest = frame;
@@ -125,11 +145,12 @@ SCREEN_JS = r"""(function () {
     st.frames++;
     if (!st.shown) { st.shown = true; $('start').hidden = true; $('bar').hidden = false; canvas.focus(); }
   }
-  window.addEventListener('resize', fit);
+  window.addEventListener('resize', refit);
+  if (window.ResizeObserver) { new ResizeObserver(refit).observe($('stage')); }
 
   // ---- sound: Opus packets -> AudioContext, kept close to live
   function handleAudio(buf) {
-    if (!st.actx || !window.AudioDecoder) { return; }
+    if (!st.actx || !window.AudioDecoder || st.muted) { return; }
     if (!st.adec) {
       st.adec = new AudioDecoder({output: onAudio, error: function (e) { note('audio: ' + e.message); st.adec = null; }});
       st.adec.configure({codec: 'opus', sampleRate: 48000, numberOfChannels: 2});
@@ -153,6 +174,13 @@ SCREEN_JS = r"""(function () {
   function control(m) {
     if (m.t === 'info') {
       st.info = m;
+      if (m.mirror && !st.mirror) {
+        st.mirror = true; st.muted = true;
+        if (st.gain) { st.gain.gain.value = 0; }
+        $('snd').textContent = 'Sound off';
+        $('mirror').textContent = 'You are watching this computer on itself, so you see a tunnel of screens and it works twice as hard. Sound is off to stop an echo. For a real test open the link on another computer. (click to hide)';
+        $('mirror').hidden = false;
+      }
       if (m.width && m.height) { $('stat').title = m.width + 'x' + m.height; }
       if (m.paused) { status('Paused by the owner'); }
     } else if (m.t === 'end') { finish(m.why || 'The owner ended this.'); }
@@ -170,6 +198,8 @@ SCREEN_JS = r"""(function () {
     var ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/_mesh/ws');
     ws.binaryType = 'arraybuffer';
     st.ws = ws;
+    st.lastView = '';
+    ws.onopen = function () { sendView(true); };
     ws.onmessage = function (ev) {
       if (typeof ev.data === 'string') { try { control(JSON.parse(ev.data)); } catch (e) { note('control: ' + e.message); } return; }
       var kind = new Uint8Array(ev.data, 0, 1)[0];
@@ -237,10 +267,21 @@ SCREEN_JS = r"""(function () {
   document.addEventListener('fullscreenchange', function () { if (!document.fullscreenElement && navigator.keyboard && navigator.keyboard.unlock) { navigator.keyboard.unlock(); } fit(); });
   $('snd').addEventListener('click', function () {
     st.muted = !st.muted;
+    st.nextAudio = 0;
     if (st.gain) { st.gain.gain.value = st.muted ? 0 : 1; }
     if (st.actx && st.actx.state === 'suspended') { st.actx.resume(); }
     $('snd').textContent = st.muted ? 'Sound off' : 'Sound on';
   });
+  var modes = ['fit', 'fill', 'stretch'], names = {fit: 'Fit', fill: 'Fill', stretch: 'Stretch'};
+  try { var saved = localStorage.getItem('mesh-fit'); if (saved && names[saved]) { st.mode = saved; } } catch (e) { /* storage may be blocked */ }
+  $('fit').textContent = names[st.mode];
+  $('fit').addEventListener('click', function () {
+    st.mode = modes[(modes.indexOf(st.mode) + 1) % modes.length];
+    $('fit').textContent = names[st.mode];
+    try { localStorage.setItem('mesh-fit', st.mode); } catch (e) { /* storage may be blocked */ }
+    fit();
+  });
+  $('mirror').addEventListener('click', function () { $('mirror').hidden = true; });
   $('cur').addEventListener('click', function () { canvas.style.cursor = canvas.style.cursor === 'default' ? 'none' : 'default'; });
   $('leave').addEventListener('click', function () {
     fetch('/_mesh/leave', {method: 'POST', credentials: 'same-origin'}).catch(function () {}).then(function () { finish('You left. Ask the owner for a new link if you need to come back.'); });
@@ -255,7 +296,7 @@ SCREEN_JS = r"""(function () {
     if (dt <= 0) { return; }
     st.fps = Math.round((st.frames - st.tf) / dt); st.kbps = Math.round((st.bytes - st.tb) * 8 / 1000 / dt);
     st.tf = st.frames; st.tb = st.bytes; st.tick = now;
-    if (st.shown && !(st.info && st.info.paused)) { status(st.fps + ' fps  ' + st.kbps + ' kbps  ' + st.rtt + ' ms'); }
+    if (st.shown && !(st.info && st.info.paused)) { status(st.fps + ' fps  ' + st.kbps + ' kbps  ' + st.rtt + ' ms  late ' + Math.round(st.late) + ' ms'); }
     send({t: 'p', ts: now});
   }, 1000);
   if (!window.isSecureContext || !window.VideoDecoder) { $('note').textContent = 'This browser cannot show the shared screen. Open the link in a recent Chrome, Edge, Firefox or Safari.'; $('go').hidden = true; }

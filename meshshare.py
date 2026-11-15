@@ -96,6 +96,21 @@ def new_id() -> str:
     return secrets.token_urlsafe(9)
 
 
+CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"      # no 0 O 1 I L: nothing to mix up when it is read out or typed
+
+
+def new_code() -> str:
+    return "".join(secrets.choice(CODE_ALPHABET) for _ in range(8))
+
+
+def format_code(code: str) -> str:
+    return f"{code[:4]}-{code[4:]}"
+
+
+def normalize_code(text: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(text or "").upper())
+
+
 def digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -154,6 +169,7 @@ class Share:
     reason: str = ""
     visitor: Optional[Visitor] = None
     failures: int = 0
+    code: str = ""          # the short code (8 characters) people can type instead of the long link
 
 
 class ShareManager:
@@ -181,7 +197,7 @@ class ShareManager:
         ttl = max(60, min(int(ttl), MAX_TTL))
         secret = new_secret()
         now = self.clock()
-        share = Share(new_id(), digest(secret), kind, int(target), now, now + ttl, max(60, int(idle)), bool(read_only))
+        share = Share(new_id(), digest(secret), kind, int(target), now, now + ttl, max(60, int(idle)), bool(read_only), code=new_code())
         with self.lock:
             self.shares[share.id] = share
         self.emit("opened", share, ttl=ttl, read_only=read_only)
@@ -247,19 +263,25 @@ class ShareManager:
         self.fails[ip] = recent
         return len(recent) >= FAIL_LIMIT
 
+    def _returning(self, share: Optional[Share], token: str, secret: str) -> Optional[Tuple[int, dict, Optional[str]]]:
+        """A visitor who already has a session may come back with the cookie alone (page reload while waiting, or after approval)."""
+        if share and token and share.visitor and hmac.compare_digest(share.visitor.token_hash, digest(token)):
+            if share.visitor.state != "ended":
+                return 200, {"state": share.visitor.state, "code": share.visitor.code}, None
+            if not secret:
+                return 410, {"error": "ended", "message": REASONS.get(share.visitor.reason, "This share ended.")}, None
+        return None
+
     def claim(self, share_id: str, secret: str, token: str, ip: str, agent: str) -> Tuple[int, dict, Optional[str]]:
-        """-> (http status, json, new session token or None)"""
+        """The long link: share id + secret. -> (http status, json, new session token or None)"""
         locked_share = None
         with self.lock:
             if self._locked_out(ip):
                 return 429, {"error": "slow", "message": "Too many attempts. Wait a few minutes."}, None
             share = self.shares.get(share_id)
-            # A visitor who already has a session may come back with the cookie alone (page reload while waiting, or after approval)
-            if share and token and share.visitor and hmac.compare_digest(share.visitor.token_hash, digest(token)):
-                if share.visitor.state != "ended":
-                    return 200, {"state": share.visitor.state, "code": share.visitor.code}, None
-                if not secret:
-                    return 410, {"error": "ended", "message": REASONS.get(share.visitor.reason, "This share ended.")}, None
+            early = self._returning(share, token, secret)
+            if early:
+                return early
             expected = share.secret_hash if share else digest("-")
             good = hmac.compare_digest(digest(secret or ""), expected) and share is not None
             if not good:
@@ -272,6 +294,29 @@ class ShareManager:
             if locked_share:
                 self.revoke(locked_share.id, "lockout")
             return 403, {"error": "no", "message": "This link is not valid."}, None
+        return self._admit(share, ip, agent)
+
+    def claim_code(self, code: str, token: str, ip: str, agent: str) -> Tuple[int, dict, Optional[str]]:
+        """The short code someone types (or the /j/CODE link). Wrong codes only count against the address that sent them."""
+        wanted = normalize_code(code)
+        with self.lock:
+            if self._locked_out(ip):
+                return 429, {"error": "slow", "message": "Too many attempts. Wait a few minutes."}, None
+            share = next((s for s in self.shares.values() if s.code and hmac.compare_digest(s.code, wanted or "-")), None)
+            if share is None:
+                for other in self.shares.values():       # a visitor who is already in or waiting may reload without a code
+                    early = self._returning(other, token, "")
+                    if early and early[0] == 200:
+                        return early
+                self.fails.setdefault(ip, []).append(self.clock())
+                return 403, {"error": "no", "message": "That code is not right."}, None
+            early = self._returning(share, token, wanted)
+            if early:
+                return early
+        return self._admit(share, ip, agent)
+
+    def _admit(self, share: Share, ip: str, agent: str) -> Tuple[int, dict, Optional[str]]:
+        """The right secret or code was given: the visitor waits for the owner's approval."""
         with self.lock:
             if share.state != "open":
                 return 410, {"error": "ended", "message": REASONS.get(share.reason, "This link was ended.")}, None
@@ -398,6 +443,8 @@ LANDING_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex,nofollow"><title>Mesh</title><link rel="stylesheet" href="/_mesh/landing.css"></head>
 <body><main><h1>Mesh</h1><p id="msg">Opening the shared screen...</p><p id="code"></p>
+<div id="join" hidden><input id="codein" maxlength="12" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="ABCD-EFGH" aria-label="Code">
+<button id="joinbtn" type="button">Join</button></div>
 <p class="dim" id="hint">The owner has to allow this on their computer or phone.</p></main>
 <script src="/_mesh/landing.js"></script></body></html>
 """
@@ -407,15 +454,22 @@ main{max-width:30rem;margin:0 auto;padding:18vh 1.5rem 2rem;text-align:center}
 h1{font-size:1.1rem;letter-spacing:.3em;text-transform:uppercase;margin:0 0 2rem}
 #code{font-size:3.2rem;letter-spacing:.35em;margin:1.2rem 0;min-height:1em}
 .dim{color:#888;font-size:.85rem}
+input{font:inherit;font-size:1.6rem;letter-spacing:.2em;text-transform:uppercase;text-align:center;width:11ch;color:#fff;background:#000;border:1px solid #fff;padding:.4rem}
+button{font:inherit;color:#fff;background:#000;border:1px solid #fff;padding:.55rem 1.1rem;margin-left:.4rem;cursor:pointer}
+button:hover{background:#fff;color:#000}
 """
 
 LANDING_JS = """(function () {
-  var parts = location.pathname.split('/');
-  var id = parts[parts.length - 1];
+  var parts = location.pathname.split('/').filter(Boolean);
   var secret = location.hash.slice(1);
   if (secret) { history.replaceState(null, '', location.pathname); }
   var msg = document.getElementById('msg'), code = document.getElementById('code'), hint = document.getElementById('hint');
+  var join = document.getElementById('join'), input = document.getElementById('codein');
   function show(text, c, h) { msg.textContent = text; code.textContent = c || ''; hint.style.visibility = h ? 'visible' : 'hidden'; }
+  function post(url, body) {
+    return fetch(url, {method: 'POST', credentials: 'same-origin', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)})
+      .then(function (r) { return r.json().then(function (j) { return {ok: r.ok, j: j}; }); });
+  }
   function poll() {
     fetch('/_mesh/status', {credentials: 'same-origin', cache: 'no-store'})
       .then(function (r) { return r.json(); })
@@ -426,11 +480,26 @@ LANDING_JS = """(function () {
       })
       .catch(function () { show('Cannot reach the computer. Trying again...', '', false); setTimeout(poll, 2500); });
   }
-  fetch('/_mesh/g/' + encodeURIComponent(id) + '/claim', {method: 'POST', credentials: 'same-origin',
-        headers: {'Content-Type': 'application/json'}, body: JSON.stringify({secret: secret})})
-    .then(function (r) { return r.json().then(function (j) { return {ok: r.ok, j: j}; }); })
-    .then(function (x) { if (!x.ok) { show(x.j.message || 'This link is not valid.', '', false); return; } poll(); })
-    .catch(function () { show('Cannot reach the computer.', '', false); });
+  function claimCode(value) {
+    join.hidden = true; show('Checking the code...', '', false);
+    post('/_mesh/j/claim', {code: value})
+      .then(function (x) { if (!x.ok) { show(x.j.message || 'That code is not right.', '', false); join.hidden = false; input.focus(); return; } poll(); })
+      .catch(function () { show('Cannot reach the computer.', '', false); join.hidden = false; });
+  }
+  if (parts[0] === '_mesh' && parts[1] === 'g' && parts[2]) {
+    post('/_mesh/g/' + encodeURIComponent(parts[2]) + '/claim', {secret: secret})
+      .then(function (x) { if (!x.ok) { show(x.j.message || 'This link is not valid.', '', false); return; } poll(); })
+      .catch(function () { show('Cannot reach the computer.', '', false); });
+  } else if (parts[0] === 'j' && parts[1]) {
+    claimCode(decodeURIComponent(parts[1]));
+  } else {
+    show('Type the code the owner gave you:', '', false);
+    fetch('/_mesh/status', {credentials: 'same-origin', cache: 'no-store'}).then(function (r) { return r.json(); }).then(function (s) {
+      if (s.state === 'pending' || s.state === 'active') { poll(); } else { join.hidden = false; input.focus(); }
+    }).catch(function () { join.hidden = false; });
+    document.getElementById('joinbtn').addEventListener('click', function () { claimCode(input.value); });
+    input.addEventListener('keydown', function (e) { if (e.key === 'Enter') { claimCode(input.value); } });
+  }
 })();
 """
 
@@ -597,6 +666,12 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
     def token(self) -> str:
         return cookie_value(self.headers.get("Cookie"), COOKIE)
 
+    def session_cookie(self, token: str) -> List[Tuple[str, str]]:
+        found = self.manager.session(token)
+        age = max(60, int(found[0].expires - self.manager.clock())) if found else 3600
+        secure = "; Secure" if self.server.public_origin.startswith("https://") else ""
+        return [("Set-Cookie", f"{COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={age}{secure}")]
+
     def read_json(self) -> Optional[dict]:
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -623,6 +698,8 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0].split("#", 1)[0]
         if path.startswith(GATE + "/") or path == GATE:
             return self.gate(path)
+        if self.command in ("GET", "HEAD") and re.fullmatch(r"/j/[A-Za-z0-9-]{4,20}", path) and not self.manager.touch(self.token()):
+            return self.reply(200, LANDING_HTML.encode())        # the short link: /j/ABCD-EFGH
         return self.proxy()
 
     # ---- the gate
@@ -653,13 +730,14 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
                 secret = data.get("secret")
                 secret = secret if isinstance(secret, str) else ""
                 status, body, token = self.manager.claim(claim.group(1), secret, self.token(), self.ip(), describe_agent(self.headers.get("User-Agent", "")))
-                extra = []
-                if token:
-                    share = self.manager.shares.get(claim.group(1))
-                    age = max(60, int(share.expires - self.manager.clock())) if share else 3600
-                    secure = "; Secure" if self.server.public_origin.startswith("https://") else ""
-                    extra.append(("Set-Cookie", f"{COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={age}{secure}"))
-                return self.reply_json(status, body, extra)
+                return self.reply_json(status, body, self.session_cookie(token) if token else None)
+            if path == GATE + "/j/claim":
+                data = self.read_json()
+                if data is None:
+                    return self.reply_json(400, {"error": "bad", "message": "Bad request."})
+                code = data.get("code")
+                status, body, token = self.manager.claim_code(code if isinstance(code, str) else "", self.token(), self.ip(), describe_agent(self.headers.get("User-Agent", "")))
+                return self.reply_json(status, body, self.session_cookie(token) if token else None)
             if path == GATE + "/leave":
                 done = self.manager.leave(self.token())
                 return self.reply_json(200 if done else 403, {"ok": done}, [("Set-Cookie", f"{COOKIE}=; Path=/; Max-Age=0")])
@@ -684,6 +762,11 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         self.close_connection = True
         self.wfile.write(meshws.handshake_response(self.headers["Sec-WebSocket-Key"]))
         self.wfile.flush()
+        try:
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)      # small pictures must not wait for each other
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except OSError:
+            pass
         ws = meshws.WebSocket(self.connection)
         self.manager.track(share.id, self.connection)
 
@@ -692,7 +775,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             found = self.manager.session(token)
             return bool(found and found[0].state == "open" and found[1].state == "active")
         try:
-            hub.serve(ws, valid, lambda: self.manager.note_activity(token))
+            hub.serve(ws, valid, lambda: self.manager.note_activity(token), self.ip())
         finally:
             self.manager.untrack(share.id, self.connection)
 
@@ -706,6 +789,8 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
             if status.get("state") == "pending":
                 share = self.manager.session(token)[0]
                 return self.reply(302, b"", extra=[("Location", f"{GATE}/g/{share.id}")]) if wants_page else self.reply(401, b"", "text/plain")
+            if wants_page and self.command in ("GET", "HEAD") and self.path.split("?", 1)[0] == "/" and status.get("state") == "none" and self.manager.open_shares():
+                return self.reply(200, LANDING_HTML.encode())          # just the address, then type the code
             if wants_page:
                 return self.reply(401, notice_page("This link is not active.", status.get("message", "")))
             return self.reply(401, b"", "text/plain")
@@ -1283,8 +1368,8 @@ class ShareService:
             self.close()
             raise
         self.link = f"{origin}{GATE}/g/{share.id}#{secret}"
-        self.info = {"id": share.id, "link": self.link, "origin": origin, "expires": share.expires, "ttl": int(share.expires - share.created),
-                     "read_only": share.read_only, "kind": kind}
+        self.info = {"id": share.id, "link": self.link, "short": f"{origin}/j/{format_code(share.code)}", "code": format_code(share.code), "origin": origin,
+                     "expires": share.expires, "ttl": int(share.expires - share.created), "read_only": share.read_only, "kind": kind}
         return self.info
 
     def cleanup_stale(self) -> None:
@@ -1320,6 +1405,8 @@ class ShareService:
                     if row["kind"] == "screen":
                         row.update({"paused": self.hub.paused, "view_only": self.hub.view_only, "quality": self.hub.quality, "streaming": self.hub.running})
             return {"ok": True, "shares": rows}
+        if cmd == "info":
+            return {"ok": True, "info": self.info}
         if cmd in ("pause", "resume") and self.hub is not None:
             self.hub.set_paused(cmd == "pause")
             return {"ok": True, "message": "Paused: the guest sees a frozen picture and cannot type." if cmd == "pause" else "Resumed."}
@@ -1551,16 +1638,19 @@ def _run(args, kind: str, environ, tunnel, say, interactive, source=None, inject
     else:
         say(f"\nSharing this computer's screen ({args.monitor or 'main monitor'}, quality {args.quality}, "
             f"{'with sound' if args.sound else 'no sound'}{', view only' if args.view_only else ''}) for {fmt_seconds(info['ttl'])}.")
-    say(f"\n  {info['link']}\n")
+    say(f"\n  To type on the other computer (any browser):   {info['short']}"
+        f"\n  or open  {info['origin']}  and type the code:  {info['code']}"
+        f"\n\n  To copy and paste (chat, email):   {info['link']}\n")
     if args.qr and sys.stdout.isatty():
         try:
-            matrix = meshqr.encode(info["link"].encode())
+            matrix = meshqr.encode(info["short"].encode())
             say(meshqr.render_terminal(matrix, scale=1))
         except Exception:  # noqa: BLE001
             pass
     say("  Send the link to the person. Nothing opens until you allow it here (or from another terminal: meshd share approve).")
     say("  Ctrl+C, or  meshd share revoke  from anywhere, ends it and closes the public address." + (
-        "\n  Note: the first visit after Funnel is switched on can fail for a few minutes while the new name spreads; try the link on your phone first." if tunnel.kind == "funnel" else ""))
+        "\n  Note: the public address was not checked (--no-wait): the first time it can take several minutes to appear; try the link on your phone first."
+        if tunnel.kind == "funnel" and not getattr(tunnel, "ready_check", False) else ""))
     if (interactive if interactive is not None else sys.stdin.isatty()):
         threading.Thread(target=_stdin_commands, args=(service,), daemon=True).start()
     try:
