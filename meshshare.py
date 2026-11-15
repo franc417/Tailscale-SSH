@@ -534,6 +534,13 @@ class GatewayServer(http.server.ThreadingHTTPServer):
         self.hub = None       # the screen stream, for shares of kind "screen"
         self.slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
 
+    def handle_error(self, request, client_address) -> None:
+        """A guest that vanishes mid-page is normal, not a traceback on the owner's terminal."""
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (OSError, ValueError)):
+            return
+        super().handle_error(request, client_address)
+
     def process_request(self, request, client_address) -> None:
         if not self.slots.acquire(blocking=False):
             try:
@@ -876,16 +883,65 @@ class NoTunnel:
         pass
 
 
+def run_live(argv: List[str], timeout: float, on_line: Callable[[str], None]) -> Tuple[int, str]:
+    """Run a command, showing its output line by line as it arrives (a command that waits for the person must not look frozen)."""
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True, bufsize=1)
+    lines: List[str] = []
+
+    def reader() -> None:
+        for line in proc.stdout:
+            lines.append(line)
+            on_line(line.rstrip("\r\n"))
+    thread = threading.Thread(target=reader, daemon=True, name="mesh-tailscale-out")
+    thread.start()
+    try:
+        code = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        code = 124
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
+    thread.join(2.0)
+    return code, "".join(lines).strip()
+
+
 class FunnelTunnel:
     """Tailscale Funnel: https://<this computer>.<tailnet>.ts.net, TLS ends on this computer, open only while a share is."""
     kind = "funnel"
 
-    def __init__(self, https_port: int = 443, runner=subprocess.run, which=shutil.which, timeout: float = 70.0) -> None:
+    def __init__(self, https_port: int = 443, runner=subprocess.run, which=shutil.which, timeout: float = 300.0) -> None:
         if https_port not in (443, 8443, 10000):
             raise TunnelError("Funnel only listens on 443, 8443 or 10000.")
         self.https_port, self.runner, self.which, self.timeout = https_port, runner, which, timeout
         self.local_port: Optional[int] = None
         self.started = False
+        self.say: Callable[[str], None] = lambda text: None
+        self.live = runner is subprocess.run         # a real run shows tailscale's output as it comes; a test's fake runner is called as before
+        self.shown_link = False
+
+    def on_line(self, line: str) -> None:
+        if not line.strip():
+            return
+        link = APPROVE_URL.search(line)
+        if link and not self.shown_link:
+            self.shown_link = True
+            self.say("\n  Tailscale needs a one-time approval before Funnel (the public address) can be used.\n"
+                     "  Open this link on any device, sign in if asked, approve, and this carries on by itself:\n\n    "
+                     + link.group(0).rstrip(".,)") + "\n\n  Waiting for the approval...")
+        else:
+            self.say("  tailscale: " + line.strip())
+
+    def funnel(self, *args: str) -> Tuple[int, str]:
+        if not self.live:
+            return self.ts("funnel", *args, timeout=self.timeout)
+        binary = self.which("tailscale") or "tailscale"
+        try:
+            return run_live([binary, "funnel", *args], self.timeout, self.on_line)
+        except OSError as exc:
+            return 127, str(exc)
 
     def ts(self, *args: str, timeout: Optional[float] = None) -> Tuple[int, str]:
         binary = self.which("tailscale") or "tailscale"
@@ -918,18 +974,19 @@ class FunnelTunnel:
         origin = self.origin()
         self.local_port = local_port
         target = f"http://127.0.0.1:{local_port}"
-        args = ["funnel", "--bg", "--yes", f"--https={self.https_port}", target]
-        code, text = self.ts(*args, timeout=self.timeout)
+        self.say("  Opening the public address through Tailscale Funnel...")
+        code, text = self.funnel("--bg", "--yes", f"--https={self.https_port}", target)
         if "flag provided but not defined" in text and "yes" in text:
-            code, text = self.ts("funnel", "--bg", f"--https={self.https_port}", target, timeout=self.timeout)
+            code, text = self.funnel("--bg", f"--https={self.https_port}", target)
         link = APPROVE_URL.search(text)
-        if link:
+        if code == 124:
+            self.stop(quiet=True)
+            raise TunnelError(f"Tailscale did not finish within {int(self.timeout)} s." + (" The approval was not given in time: run the command again and approve the link." if link
+                              else " The first time can take a few minutes: run the command again."), url=link.group(0) if link else None)
+        if link and code != 0:          # an approval link in the text of a command that then succeeded only means it waited and was approved
             self.stop(quiet=True)
             raise TunnelError("Tailscale needs a one-time approval before Funnel can be used. Open this link, approve, then run the command again:\n  "
                               + link.group(0).rstrip(".,)"), url=link.group(0))
-        if code == 124:
-            self.stop(quiet=True)
-            raise TunnelError("Tailscale is still setting up the public address (the first time can take a minute). Run the command again.")
         if code != 0:
             raise TunnelError(text or f"tailscale funnel failed (exit {code})")
         self.started = True
@@ -1022,6 +1079,8 @@ class ShareService:
     def __init__(self, directory: str, tunnel, say: Callable[[str], None] = print, clock: Callable[[], float] = time.time,
                  environ=os.environ) -> None:
         self.directory, self.tunnel, self.say, self.clock, self.environ = directory, tunnel, say, clock, environ
+        if hasattr(tunnel, "say"):
+            tunnel.say = say
         self.manager = ShareManager(clock=clock, listener=self.on_event)
         self.gateway = Gateway(self.manager)
         self.control_server: Optional[ControlServer] = None
@@ -1077,7 +1136,7 @@ class ShareService:
                 json.dump({"pid": os.getpid(), "tunnel": self.tunnel.kind, "https_port": getattr(self.tunnel, "https_port", None),
                            "local_port": gw_port, "started": self.clock()}, f)
             os.chmod(self.state_path, 0o600)
-        except Exception:
+        except BaseException:        # includes Ctrl+C while waiting for Tailscale: nothing may be left open
             self.close()
             raise
         self.link = f"{origin}{GATE}/g/{share.id}#{secret}"
@@ -1311,6 +1370,7 @@ def _run(args, kind: str, environ, tunnel, say, interactive, source=None, inject
         say(f"The longest a share can stay open is {fmt_seconds(MAX_TTL)}.")
         ttl = MAX_TTL
     service = ShareService(directory, tunnel, say=say, environ=environ)
+    say("Starting the share" + (" (the first time, Tailscale may ask you to approve Funnel: the link will show here)" if tunnel.kind == "funnel" else "") + "...")
     try:
         if kind == "web":
             info = service.open_web(args.port, ttl, idle, args.read_only)
@@ -1327,6 +1387,9 @@ def _run(args, kind: str, environ, tunnel, say, interactive, source=None, inject
     except (ShareError, TunnelError) as exc:
         say(f"error: {exc}")
         return 1
+    except KeyboardInterrupt:
+        say("\nCancelled. Nothing is left open.")
+        return 130
 
     def stop(_signum, _frame):
         service.manager.revoke_all("revoked")

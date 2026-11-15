@@ -967,7 +967,8 @@ def doctor(runner=subprocess.run, which=shutil.which, environ=os.environ, access
         lines.append("  " + ("ok      " if usable else "MISSING ") + "H.264 encoder: " + (", ".join(usable) if usable else "none (need one of vah264enc, x264enc)")
                      + ("" if usable else "   ->  sudo pacman -S gst-plugin-va   (hardware)   or   sudo pacman -S gst-plugins-ugly   (software)"))
         if usable and usable[0] not in ("vah264enc", "vaapih264enc"):
-            lines.append("          note: only a software encoder was found; it works but uses the processor. For hardware: sudo pacman -S gst-plugin-va")
+            lines.append("          note: only a software encoder was found; it works but uses the processor. For hardware: sudo pacman -S gst-plugin-va\n"
+                         "                (if pacman says 404, your package list is out of date: run  sudo pacman -Syu  first, never just -Sy. You can skip this.)")
         if not usable:
             ok = False
         sound = all(probe.has(e) for e in ("opusenc", "rtpopuspay", "rtpstreampay", "audioconvert", "audioresample")) and (probe.has("pulsesrc") or probe.has("pipewiresrc"))

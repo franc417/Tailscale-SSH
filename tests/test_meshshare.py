@@ -746,3 +746,45 @@ def test_meshd_dispatches_share(home, capsys, monkeypatch):
         meshd.main(["share", "-h"])
     assert stop.value.code == 0 and "web" in capsys.readouterr().out
     assert "meshd share web" in meshd.__doc__
+
+
+# ---------------------------------------------------------------- the real (not faked) run: output must show while it waits
+
+def _fake_tailscale(tmp_path, funnel_body):
+    script = tmp_path / "tailscale"
+    script.write_text("#!/bin/sh\ncase \"$1\" in\n  status) echo '" + TS_OK + "';;\n  funnel) " + funnel_body + ";;\nesac\n")
+    script.chmod(0o755)
+    return str(script)
+
+
+def test_funnel_shows_the_approval_link_while_it_is_still_waiting(tmp_path):
+    script = _fake_tailscale(tmp_path, 'echo "Funnel is not enabled on your tailnet."; echo "To enable, visit:"; echo "  https://login.tailscale.com/f/funnel?node=nXYZ"; sleep 1.5; echo "Available on the internet:"; exit 0')
+    seen = []
+    tunnel = ms.FunnelTunnel(443, which=lambda n: script, timeout=30)
+    tunnel.say = lambda text: seen.append((time.time(), text))
+    origin = tunnel.start(5555)                                 # returns once "approved" (the script exits 0), not an error
+    done = time.time()
+    assert origin == "https://mkz.tail1234.ts.net"
+    shown = [t for t, text in seen if "https://login.tailscale.com/f/funnel?node=nXYZ" in text]
+    assert len(shown) == 1 and done - shown[0] >= 1.0           # the link was on screen well before the command finished
+    assert any("Opening the public address" in text for _, text in seen)
+
+
+def test_funnel_real_run_that_never_finishes_says_so(tmp_path):
+    script = _fake_tailscale(tmp_path, 'echo "visit https://login.tailscale.com/f/funnel?node=n1"; sleep 20')
+    seen = []
+    tunnel = ms.FunnelTunnel(443, which=lambda n: script, timeout=1.5)
+    tunnel.say = lambda text: seen.append(text)
+    with pytest.raises(ms.TunnelError, match="approval was not given in time"):
+        tunnel.start(5555)
+    assert any("login.tailscale.com/f/funnel?node=n1" in text for text in seen)
+
+
+def test_ctrl_c_while_waiting_for_tailscale_leaves_nothing_open(tmp_path, app, home):
+    class Interrupted(ms.FunnelTunnel):
+        def funnel(self, *args):
+            raise KeyboardInterrupt
+    service = ms.ShareService(home["dir"], Interrupted(443, runner=FakeTailscale(), which=lambda n: "tailscale"), say=lambda s: None, environ=home["environ"])
+    with pytest.raises(KeyboardInterrupt):
+        service.open_web(app.server_address[1])
+    assert service.closed and ms.control_request(home["dir"], {"cmd": "list"}, home["environ"]) is None
