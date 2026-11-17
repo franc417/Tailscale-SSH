@@ -584,6 +584,31 @@ def test_hub_applies_the_guests_window_size_before_starting_and_when_it_changes(
     assert any("stream:" in line for line in says) or True
 
 
+class BrokenRestartSource(AdaptiveSource):
+    def restart_video(self, view):
+        self.restarts.append(view)
+        raise subprocess.TimeoutExpired("the old encoder", 2)         # not a StreamError: anything can go wrong while stopping a process
+
+
+def test_hub_says_why_a_resize_failed_unexpectedly_and_keeps_serving_the_guest():
+    src = BrokenRestartSource()
+    says = []
+    hub = st.StreamHub(src, lambda: mi.RecordingInjector(), say=says.append, health_every=0.2)
+    ws = FakeWs([("text", json.dumps({"t": "v", "w": 1366, "h": 650}))])
+    done = []
+    deadline = time.time() + 3
+    t = threading.Thread(target=lambda: done.append(hub.serve(ws, lambda: time.time() < deadline, lambda: None, "127.0.0.1")), daemon=True)
+    t.start()
+    time.sleep(0.4)
+    ws.incoming.append(("text", json.dumps({"t": "v", "w": 1900, "h": 1000})))
+    end = time.time() + 2
+    while time.time() < end and not any("Could not change the picture size" in line for line in says):
+        time.sleep(0.02)
+    assert any("Could not change the picture size" in line and "TimeoutExpired" in line for line in says)
+    assert t.is_alive() and not done                                    # the guest is still connected after it
+    t.join(5)
+
+
 def test_hub_health_line_reports_fps_and_warns_about_a_slow_encoder():
     src = AdaptiveSource()
     says = []

@@ -1088,6 +1088,8 @@ class StreamHub:
                 self.broadcast_info()
             except StreamError as exc:
                 self.say(f"  Could not change the picture size: {exc}")
+            except Exception as exc:  # noqa: BLE001 - whatever else goes wrong must be said, not end this thread without a word
+                self.say(f"  Could not change the picture size ({type(exc).__name__}: {exc}).")
 
     def serve(self, ws, still_valid: Callable[[], bool], on_activity: Callable[[], None], client_ip: str = "") -> str:
         """Runs for the length of one guest's connection. Returns why it ended."""

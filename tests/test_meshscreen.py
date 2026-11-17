@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 
 import pytest
 
@@ -94,7 +95,8 @@ class FfmpegSource:
         self.procs.append(video)
         self.video = video
         self.gen += 1
-        threading.Thread(target=self._video, args=(video, self.cb[0], self.gen), daemon=True).start()
+        self.reader = threading.Thread(target=self._video, args=(video, self.cb[0], self.gen), daemon=True)
+        self.reader.start()
 
     def start(self, on_video, on_audio, on_end):
         if self.fail_start:
@@ -120,11 +122,17 @@ class FfmpegSource:
     def restart_video(self, view):
         self.restarts.append(view)
         self.view = view
-        self.gen += 1
+        self.gen += 1                              # the old reader stops by itself ...
         old = self.video
+        self.reader.join(2)                        # ... and once it has, nobody reads the old encoder's pipe any more
         old.terminate()
-        old.wait(2)
-        self.procs.remove(old)
+        try:
+            old.communicate(timeout=2)             # read away what it still writes (a full pipe keeps ffmpeg from ever exiting) and wait for it
+        except subprocess.TimeoutExpired:
+            old.kill()
+            old.communicate()
+        if old in self.procs:
+            self.procs.remove(old)
         self._start_video()
 
     def pids(self):
@@ -240,6 +248,16 @@ def collect(ws, want_video=0, want_audio=0, timeout=10.0):
     return video, audio, texts
 
 
+def resize_report(r, infos):
+    """One line for a failing assertion: what the hub told the owner, what the source was asked, which sizes reached the guest, and where the helper threads are."""
+    frames, where = sys._current_frames(), []
+    for t in threading.enumerate():
+        if t.name in ("mesh-restart", "mesh-guest-send") and t.ident in frames:
+            top = traceback.extract_stack(frames[t.ident])[-3:]
+            where.append(t.name + "@" + ">".join(f"{os.path.basename(f.filename)}:{f.lineno}" for f in top))
+    return f"restarts={r.source.restarts} sizes_seen={[(i.get('width'), i.get('height')) for i in infos]} owner_lines={r.lines[-6:]} threads={where}"
+
+
 class Rig:
     def __init__(self, tmp_path, sound=True, view_only=False, source=None):
         runtime = tmp_path / "run"
@@ -329,9 +347,9 @@ def test_the_picture_follows_the_guests_window_and_keeps_the_screens_shape(tmp_p
             v, _, t = collect(ws, want_video=3, timeout=1.5)
             infos += [x for x in t if x.get("t") == "info"]
             frames += v
-        assert r.source.restarts == [(1280, 720)] and any((i["width"], i["height"]) == (1280, 720) for i in infos)
+        assert r.source.restarts == [(1280, 720)] and any((i["width"], i["height"]) == (1280, 720) for i in infos), resize_report(r, infos)
         new_key = [f for f in frames if f[1] == 1 and [n for n in st.split_nals(f[6:]) if st.nal_type(n) == 7][0] != first_sps]
-        assert new_key                                                            # the new stream begins at a key frame, with its own parameter sets
+        assert new_key, resize_report(r, infos)                                                            # the new stream begins at a key frame, with its own parameter sets
         assert any("window changed" in line for line in r.lines)
         ws.close()
     finally:
