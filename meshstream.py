@@ -30,13 +30,19 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 # quality presets: widest picture, tallest picture, frames per second, video kilobits per second
-PRESETS: Dict[str, Tuple[int, int, int, int]] = {
-    "text": (1920, 1080, 30, 6000),         # sharp small print (code, tables), the most data
+PRESETS: Dict[str, Tuple[int, int, int, int]] = {      # name: (widest, tallest, pictures a second, kbit/s at that size)
+    "ultra": (2560, 1440, 60, 15000),       # a big, fast picture: wants a hardware encoder and a good connection
+    "high": (1920, 1080, 60, 9000),
+    "text": (1920, 1080, 30, 6000),         # sharp small print (code, tables), the most data per picture
+    "fast": (1280, 720, 60, 4500),          # smooth motion that a software encoder can still manage
     "balanced": (1600, 900, 30, 3500),
-    "smooth": (1280, 720, 30, 2200),        # for a weak connection
+    "smooth": (1280, 720, 30, 2200),        # for a weak computer or connection
+    "low": (960, 540, 30, 1200),
 }
-DEFAULT_QUALITY = "auto"        # a hardware encoder gets "balanced", a software encoder the lighter "smooth"
-AUTO_HARDWARE, AUTO_SOFTWARE = "balanced", "smooth"
+LADDER = ("ultra", "high", "fast", "balanced", "smooth", "low")        # --quality auto moves along this, best first
+DEFAULT_QUALITY = "auto"        # starts at "high" with a hardware encoder and "fast" with a software one, then follows what the computer and the connection can do
+AUTO_HARDWARE, AUTO_SOFTWARE = "high", "fast"
+ADAPT_EVERY = 3.0               # seconds between looks at how the stream is doing (auto quality)
 MIN_BACKLOG = 120_000          # bytes: a guest's queue is never trimmed below this
 MAX_LATENCY = 0.6              # seconds of video a guest's queue may hold; more and frames are dropped until the next key frame
 MAX_GOP_FRAMES = 150
@@ -227,6 +233,47 @@ def settings_for(quality: str, hardware: bool, native: Tuple[int, int], fps: Opt
     rate = int(min(60, max(5, fps or base_fps)))
     kbps = int(base_kbps * (width * height / float(max_w * max_h)) ** 0.75 * (rate / float(base_fps)))
     return {"quality": name, "width": width, "height": height, "fps": rate, "kbps": max(600, kbps)}
+
+
+class QualityGovernor:
+    """Chooses the quality for --quality auto, one rung of LADDER at a time. It steps DOWN quickly when the computer makes fewer
+    pictures than asked or the guest's connection falls behind, and UP slowly: only after a good while, and only when the encoder
+    has room to spare. A rung it had to leave is not tried again for a few minutes, so it does not bounce between two."""
+
+    def __init__(self, start: str, ladder=LADDER, clock: Callable[[], float] = time.monotonic, settle: float = 6.0, down_after: int = 2,
+                 up_after: int = 10, retry_after: float = 300.0, top: Optional[str] = None) -> None:
+        self.ladder = list(ladder)
+        if top in self.ladder:                           # the best rung worth trying (a software encoder is never asked for 1440p)
+            self.ladder = self.ladder[self.ladder.index(top):]
+        self.rung = start if start in self.ladder else self.ladder[len(self.ladder) // 2]
+        self.clock, self.settle, self.down_after, self.up_after, self.retry_after = clock, settle, down_after, up_after, retry_after
+        self.changed = clock()
+        self.bad = self.good = 0
+        self.failed: Dict[str, float] = {}          # rung -> when it had to be left
+
+    def observe(self, fps: float, target: float, behind: float, stalls: int, cpu: Optional[float] = None, cores: int = 1) -> Optional[Tuple[str, str]]:
+        """One look at the stream: pictures made a second against the target, how far behind the slowest guest is (seconds), frames
+        dropped since the last look, the encoder's load (percent of one core) and the number of cores. -> (new rung, why) to change now."""
+        now = self.clock()
+        if now - self.changed < self.settle:            # a restarted encoder needs a moment before its numbers mean anything
+            return None
+        slow = bool(target) and fps < target * 0.85 and (cpu is None or cpu >= 30.0)     # an idle screen sends few pictures too, but then the encoder is not busy
+        late = behind > 0.4 or stalls > 0
+        self.bad, self.good = (self.bad + 1, 0) if (slow or late) else (0, self.good + 1)
+        i = self.ladder.index(self.rung)
+        if self.bad >= self.down_after and i + 1 < len(self.ladder):
+            why = f"the computer makes only {fps:.0f} of {target:.0f} pictures a second" if slow else "the guest's connection cannot keep up"
+            return self._move(i + 1, why, now, left=True)
+        if self.good >= self.up_after and i > 0 and now - self.failed.get(self.ladder[i - 1], -1e9) >= self.retry_after:
+            if cpu is None or cpu * 2.0 <= 0.85 * 100.0 * max(1, cores):                   # the next rung costs about twice as much
+                return self._move(i - 1, "it has been running comfortably for a while", now)
+        return None
+
+    def _move(self, index: int, why: str, now: float, left: bool = False) -> Tuple[str, str]:
+        if left:
+            self.failed[self.rung] = now
+        self.rung, self.changed, self.bad, self.good = self.ladder[index], now, 0, 0
+        return self.rung, why
 
 
 def probe_native_size(node: int, probe: "GstProbe", runner=subprocess.run, env: Optional[dict] = None, timeout: float = 6.0) -> Optional[Tuple[int, int]]:
@@ -497,6 +544,8 @@ class GstSource:
         if quality != "auto" and quality not in PRESETS:
             raise StreamError(f"quality is one of auto, {', '.join(PRESETS)}")
         self.directory, self.connector, self.quality, self.sound, self.fps = directory, connector, quality, sound, fps
+        self.rung: Optional[str] = None            # with quality auto: the rung of LADDER in use (None: the starting one)
+        self.can_retune = quality == "auto"
         self.environ, self.runner, self.popen, self.which = environ, runner, popen, which
         self.capture = capture or ScreenCapture(directory, environ, popen, which)
         self.probe = probe or GstProbe(runner, which)
@@ -540,8 +589,16 @@ class GstSource:
     def _hardware(self) -> bool:
         return bool(self.encoder) and "VA-API" in self.encoder or (not self.encoder and self.probe.has("vah264enc"))
 
+    def _quality(self) -> str:
+        return self.rung if self.quality == "auto" and self.rung else self.quality
+
+    def retune(self, rung: str) -> None:
+        """Auto quality: the next (re)start of the encoder uses this rung of LADDER."""
+        if self.quality == "auto" and rung in PRESETS:
+            self.rung = rung
+
     def _launch_video(self) -> None:
-        candidates = video_candidates(self.probe, int(self.cap["node"]), self.native, self.quality, self.fps, self.view)
+        candidates = video_candidates(self.probe, int(self.cap["node"]), self.native, self._quality(), self.fps, self.view)
         if not candidates:
             raise StreamError("no H.264 encoder is available to GStreamer. Run  meshd share doctor  to see what to install.")
         found = self._first_working([(name, argv) for name, argv, _ in candidates], "video")
@@ -555,7 +612,7 @@ class GstSource:
 
     def _publish_info(self) -> None:
         self.info = {"width": self.cfg["width"], "height": self.cfg["height"], "fps": self.cfg["fps"], "kbps": self.cfg["kbps"], "quality": self.cfg["quality"],
-                     "codec": "h264", "audio": bool(self.audio_name), "encoder": self.encoder, "native": list(self.native),
+                     "codec": "h264", "auto": self.quality == "auto", "audio": bool(self.audio_name), "encoder": self.encoder, "native": list(self.native),
                      "monitor": self.cap.get("monitor"), "desktop": self.cap.get("desktop"), "connector": self.cap.get("connector")}
 
     # ---- adapting to the guest's window
@@ -563,7 +620,7 @@ class GstSource:
         """Would a picture sized for this window be clearly better than the one being sent? (Hysteresis: small changes are ignored.)"""
         if not self.cfg or not self.video:
             return False
-        new = settings_for(self.quality, self._hardware(), self.native, self.fps, view)
+        new = settings_for(self._quality(), self._hardware(), self.native, self.fps, view)
         old_area, new_area = self.cfg["width"] * self.cfg["height"], new["width"] * new["height"]
         return old_area > 0 and (new_area > old_area * 1.3 or new_area < old_area * 0.7)
 
@@ -895,8 +952,10 @@ class Subscriber:
 
 class StreamHub:
     def __init__(self, source, injector_factory: Callable[[], object], say: Callable[[str], None] = print, view_only: bool = False,
-                 quality: str = DEFAULT_QUALITY, clock: Callable[[], float] = time.monotonic, health_every: float = HEALTH_EVERY) -> None:
+                 quality: str = DEFAULT_QUALITY, clock: Callable[[], float] = time.monotonic, health_every: float = HEALTH_EVERY,
+                 adapt_every: float = ADAPT_EVERY, adapt_kwargs: Optional[dict] = None) -> None:
         self.source, self.injector_factory, self.say = source, injector_factory, say
+        self.adapt_every, self.adapt_kwargs, self.governor = adapt_every, dict(adapt_kwargs or {}), None
         self.quality = quality
         self.clock = clock
         self.health_every = health_every
@@ -1062,6 +1121,11 @@ class StreamHub:
             self._generation = getattr(self, "_generation", 0) + 1
             self.stop_ticker.clear()
             threading.Thread(target=self._health, args=(self._generation,), daemon=True, name="mesh-health").start()
+            self.governor = None
+            if self.quality == "auto" and getattr(self.source, "can_retune", False) and info.get("quality") in LADDER:
+                hardware = "VA-API" in (getattr(self.source, "encoder", "") or "")
+                self.governor = QualityGovernor(info["quality"], clock=self.clock, **{"top": "ultra" if hardware else "high", **self.adapt_kwargs})
+                threading.Thread(target=self._adapt, args=(self._generation,), daemon=True, name="mesh-adapt").start()
 
     def apply_view(self, data: dict) -> None:
         """The guest's window changed size: if a differently sized picture would be clearly better, restart the encoder with it."""
@@ -1075,7 +1139,42 @@ class StreamHub:
         elif hasattr(src, "view"):
             src.view = view
 
-    def _restart(self, view: Tuple[int, int]) -> None:
+    def _adapt(self, generation: int) -> None:
+        """Auto quality: every few seconds look at how the stream is doing and move one step along LADDER when it needs to."""
+        ticks: Dict[int, int] = {}
+        last, last_n, last_drop, cores = self.clock(), self.n_video, 0, os.cpu_count() or 1
+        while not self.stop_ticker.wait(self.adapt_every):
+            governor = self.governor
+            if generation != getattr(self, "_generation", 0) or governor is None:
+                return
+            now = self.clock()
+            dt = max(0.001, now - last)
+            with self.lock:
+                n, subs = self.n_video, list(self.subs)
+            if not subs:
+                last, last_n = now, n
+                continue
+            dropped = sum(sub.dropped for sub in subs)
+            cpu = None
+            for name, pid in (getattr(self.source, "pids", lambda: {})() or {}).items():
+                t = proc_ticks(pid)
+                if name == "video" and t is not None and pid in ticks:
+                    cpu = (t - ticks[pid]) / float(os.sysconf("SC_CLK_TCK")) / dt * 100
+                if t is not None:
+                    ticks[pid] = t
+            target = (getattr(self.source, "info", {}) or {}).get("fps") or 0
+            move = governor.observe((n - last_n) / dt, target, max(sub.backlog_seconds() for sub in subs), max(0, dropped - last_drop), cpu, cores)
+            last, last_n, last_drop = now, n, dropped
+            if move:
+                self.say(f"  Quality {move[0]}: {move[1]}.")
+                self._retune(move[0])
+                last, last_n = self.clock(), self.n_video
+
+    def _retune(self, rung: str) -> None:
+        self.source.retune(rung)
+        self._restart(getattr(self.source, "view", None), why=f"Quality {rung}")
+
+    def _restart(self, view: Optional[Tuple[int, int]], why: str = "The guest's window changed") -> None:
         with self.restart_lock:
             try:
                 with self.lock:
@@ -1084,7 +1183,7 @@ class StreamHub:
                         sub.reset_for_new_stream()
                 self.source.restart_video(view)
                 info = getattr(self.source, "info", {}) or {}
-                self.say(f"  The guest's window changed: now sending {info.get('width')}x{info.get('height')} ({getattr(self.source, 'encoder', '')}).")
+                self.say(f"  {why}: now sending {info.get('width')}x{info.get('height')} at {info.get('fps')} fps ({getattr(self.source, 'encoder', '')}).")
                 self.broadcast_info()
             except StreamError as exc:
                 self.say(f"  Could not change the picture size: {exc}")

@@ -1085,3 +1085,13 @@ def test_run_web_prints_the_short_link_first(app, home):
     text = "\n".join(out)
     assert "To type on the other computer" in text and "/j/" in text and "type the code:" in text
     assert text.index("/j/") < text.index("/_mesh/g/")                                  # the short one comes first
+
+
+def test_screen_command_takes_quality_auto_by_default_and_fps(tmp_path):
+    parser = ms.build_parser(str(tmp_path))
+    args = parser.parse_args(["screen"])
+    assert args.quality == "auto" and args.fps is None
+    args = parser.parse_args(["screen", "--quality", "ultra", "--fps", "60"])
+    assert args.quality == "ultra" and args.fps == 60
+    for name in ("auto", "ultra", "high", "text", "fast", "balanced", "smooth", "low"):
+        assert parser.parse_args(["screen", "--quality", name]).quality == name

@@ -45,7 +45,7 @@ while a share is open.
 ```
 meshd share doctor                          # check what this needs and what to install (do this first)
 meshd share screen                          # the main monitor, with sound; the guest uses their own keyboard and mouse
-meshd share screen --quality text           # sharpest (code, tables); smooth = for a weak connection; balanced is the default
+meshd share screen --quality high           # up to 1080p at 60 pictures a second; ultra = up to 1440p; text = sharpest small print at 30
 meshd share screen --monitor eDP-1 --no-sound --view-only --lock-on-end --ttl 45m --fps 24
 meshd share pause | resume                  # freeze their picture and ignore their keys, then undo
 meshd share viewonly on | off               # turn their keyboard and mouse off or on while they watch
@@ -68,9 +68,16 @@ letters and digits that cannot be mixed up; case and the dash do not matter), an
 short code is protected the same way: you still approve every visit, wrong codes are limited per address, and a stranger guessing
 codes can never close your share.
 
-Picture quality: `--quality auto` (the default) picks `balanced` (up to 1600x900) when a hardware encoder is installed and the lighter
-`smooth` (up to 1280x720) for a software one; `text` is the sharpest (up to 1920x1080, the most data). `--fps N` (5 to 60) changes the
-speed; more pictures per second means more data and more work (60 only makes sense with a hardware encoder).
+Picture quality: `--quality auto` (the default) starts at `high` (up to 1920x1080 at 60 pictures a second) with a hardware encoder and
+at `fast` (up to 1280x720 at 60) with a software one, then adjusts itself while the guest watches, one step at a time along
+`ultra` (up to 2560x1440 at 60), `high`, `fast`, `balanced` (1600x900 at 30), `smooth` (1280x720 at 30) and `low` (960x540 at 30).
+It steps down after about 6 seconds when the computer makes fewer pictures than asked or the guest's connection falls behind, and
+steps up (after at least 30 comfortable seconds, and only when the encoder has room to spare) towards `ultra`; a step that did not
+work is not tried again for 5 minutes. The terminal says each change ("Quality balanced: the computer makes only 20 of 60 pictures
+a second."). The picture is never bigger than the monitor or than the guest's window can show. To pin one quality, name it:
+`--quality high`, `--quality text` (1920x1080 at 30, the sharpest small print, the most data per picture) and so on; `--fps N` (5 to 60)
+overrides the speed. 60 pictures a second at 1080p needs a hardware encoder (Arch: `sudo pacman -Syu`, never `-Sy` alone, then
+`sudo pacman -S gst-plugin-va libva-utils`, and `vainfo` should list H264 encoding); a software encoder usually manages 720p at 60.
 
 The picture adapts to the guest's window, in the normal view and in full screen: the page tells the computer how big its window is,
 the computer sends a picture of the monitor's own shape that is no bigger than the window can show (no wasted pixels, nothing

@@ -1612,7 +1612,7 @@ def _run(args, kind: str, environ, tunnel, say, interactive, source=None, inject
             import mesh_input as mi
             import meshstream
             try:
-                source = source or meshstream.GstSource(directory, args.monitor or "", args.quality, args.sound, environ=environ)
+                source = source or meshstream.GstSource(directory, args.monitor or "", args.quality, args.sound, environ=environ, fps=getattr(args, "fps", None))
             except meshstream.StreamError as exc:
                 say(f"error: {exc}")
                 return 2
@@ -1636,7 +1636,7 @@ def _run(args, kind: str, environ, tunnel, say, interactive, source=None, inject
     if kind == "web":
         say(f"\nSharing the web app on port {args.port} for {fmt_seconds(info['ttl'])}" + (" (view only)" if args.read_only else "") + ".")
     else:
-        say(f"\nSharing this computer's screen ({args.monitor or 'main monitor'}, quality {args.quality}, "
+        say(f"\nSharing this computer's screen ({args.monitor or 'main monitor'}, quality {args.quality}{f', {args.fps} fps' if getattr(args, 'fps', None) else ''}, "
             f"{'with sound' if args.sound else 'no sound'}{', view only' if args.view_only else ''}) for {fmt_seconds(info['ttl'])}.")
     say(f"\n  To type on the other computer (any browser):   {info['short']}"
         f"\n  or open  {info['origin']}  and type the code:  {info['code']}"
@@ -1736,7 +1736,10 @@ def build_parser(default_dir: str) -> argparse.ArgumentParser:
     p.add_argument("--no-qr", dest="qr", action="store_false", help="do not draw the QR code")
     p = sub.add_parser("screen", help="share this computer's whole screen, with sound; the guest's keyboard and mouse control it")
     p.add_argument("--monitor", default="", help="which monitor (a connector name such as eDP-1); default: the main one")
-    p.add_argument("--quality", choices=["text", "balanced", "smooth"], default="balanced", help="text = sharpest (most data), smooth = for a weak connection")
+    p.add_argument("--quality", choices=["auto", "ultra", "high", "text", "fast", "balanced", "smooth", "low"], default="auto",
+                   help="auto (default) = as sharp and smooth as this computer and the guest's connection allow, adjusting itself; "
+                        "ultra / high = up to 1440p / 1080p at 60 pictures a second; text = sharpest small print at 30; fast = 720p at 60; balanced; smooth / low = for a weak computer or connection")
+    p.add_argument("--fps", type=int, default=None, metavar="N", help="pictures a second, 5 to 60 (default: what the quality says, 60 for ultra, high and fast)")
     p.add_argument("--no-sound", dest="sound", action="store_false", help="do not send this computer's sound")
     p.add_argument("--view-only", action="store_true", help="the guest can watch but not type or click (change later: meshd share viewonly on|off)")
     p.add_argument("--lock-on-end", action="store_true", help="lock this computer's screen when the share ends")

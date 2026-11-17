@@ -173,7 +173,7 @@ def test_pipeline_software_fallback_and_nothing_available():
     assert [n for n, _, _ in candidates] == ["x264enc (software)"]
     text = " ".join(candidates[0][1])
     assert "tune=zerolatency" in text and "format=I420" in text and "vbv-buf-capacity=300" in text and "n-threads=2" in text
-    assert candidates[0][2]["quality"] == "smooth" and "width=1280,height=720" in text          # software encoder: the lighter preset by itself
+    assert candidates[0][2]["quality"] == "fast" and "width=1280,height=720" in text and "framerate=60/1" in text      # software encoder: 720p at 60 by itself
     assert text.index("videoscale") < text.index("videoconvert")                                 # fewer pixels to convert
     assert st.video_candidates(FakeGst({}).probe(), 9, (1280, 720), "auto") == []
     assert st.video_candidates(FakeGst({k: v for k, v in COMMON.items() if k != "h264parse"}).probe(), 9, (1, 1), "auto") == []
@@ -186,8 +186,9 @@ def test_pipeline_uses_target_object_when_this_pipewiresrc_has_no_path():
 
 def test_picture_settings_follow_encoder_monitor_window_and_fps():
     f = st.settings_for
-    assert f("auto", True, (1920, 1080)) == {"quality": "balanced", "width": 1600, "height": 900, "fps": 30, "kbps": 3500}      # hardware: balanced
-    assert f("auto", False, (1920, 1080))["quality"] == "smooth" and f("auto", False, (1920, 1080))["width"] == 1280               # software: smooth
+    assert f("auto", True, (1920, 1080)) == {"quality": "high", "width": 1920, "height": 1080, "fps": 60, "kbps": 9000}         # hardware: 1080p at 60
+    c = f("auto", False, (1920, 1080))
+    assert (c["quality"], c["width"], c["height"], c["fps"], c["kbps"]) == ("fast", 1280, 720, 60, 4500)                           # software: 720p at 60
     assert f("text", False, (1920, 1080))["width"] == 1920 and f("text", False, (1366, 768))["width"] == 1366                      # never enlarged
     # the picture keeps the monitor's shape exactly, whatever the monitor is
     for native in ((1920, 1080), (1920, 1200), (1366, 768), (2560, 1600), (3440, 1440), (1280, 1024), (1080, 1920)):
@@ -476,7 +477,8 @@ def test_gst_source_falls_through_to_the_next_encoder_and_explains_total_failure
     with pytest.raises(st.StreamError, match="GStreamer is not installed"):
         st.GstSource(str(tmp_path), which=lambda n: None).start(lambda *a: None, lambda p: None, lambda r: None)
     with pytest.raises(st.StreamError):
-        st.GstSource(str(tmp_path), quality="ultra")
+        st.GstSource(str(tmp_path), quality="insane")                       # not a preset
+    st.GstSource(str(tmp_path), quality="ultra")                            # a preset since the 60 fps work
 
 
 # ---------------------------------------------------------------- latency limits, mirror detection, stats, adapting to the window
@@ -582,6 +584,155 @@ def test_hub_applies_the_guests_window_size_before_starting_and_when_it_changes(
     infos = [json.loads(m) for m in ws.sent if isinstance(m, str) and '"info"' in m]
     assert infos[0]["mirror"] is True and infos[-1]["width"] == 1900
     assert any("stream:" in line for line in says) or True
+
+
+def test_presets_reach_60_fps_and_big_pictures_and_every_step_down_the_ladder_costs_less():
+    f = st.settings_for
+    assert f("ultra", True, (2560, 1440)) == {"quality": "ultra", "width": 2560, "height": 1440, "fps": 60, "kbps": 15000}
+    c = f("ultra", True, (1920, 1080))
+    assert (c["width"], c["height"], c["fps"]) == (1920, 1080, 60) and 9000 < c["kbps"] < 10000                  # never enlarged, so less data
+    assert f("high", True, (3840, 2160))["width"] == 1920 and f("fast", False, (1920, 1080))["fps"] == 60
+    assert f("high", True, (1920, 1080), fps=30)["kbps"] == 4500                                                  # half the pictures, half the data
+    cost = [st.PRESETS[name][0] * st.PRESETS[name][1] * st.PRESETS[name][2] for name in st.LADDER]
+    assert cost == sorted(cost, reverse=True) and len(set(cost)) == len(cost)                                     # each step down really is cheaper
+    assert set(st.LADDER) <= set(st.PRESETS) and st.AUTO_HARDWARE in st.LADDER and st.AUTO_SOFTWARE in st.LADDER
+
+
+def test_pipeline_for_60_fps_asks_for_60_pictures_and_a_key_frame_every_second():
+    gst = FakeGst({**COMMON, "x264enc": ["bitrate", "key-int-max", "bframes", "tune", "speed-preset"]})
+    ((name, argv, cfg),) = st.video_candidates(gst.probe(), 9, (1920, 1080), "high")
+    text = " ".join(argv)
+    assert name == "x264enc (software)" and cfg == {"quality": "high", "width": 1920, "height": 1080, "fps": 60, "kbps": 9000}
+    assert "framerate=60/1" in text and "key-int-max=60" in text and "bitrate=9000" in text and "width=1920,height=1080" in text
+
+
+class Clock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+    def tick(self, seconds):
+        self.t += seconds
+
+
+def governor(start="fast", **kw):
+    clock = Clock()
+    return clock, st.QualityGovernor(start, clock=clock, **{"settle": 0.0, "down_after": 2, "up_after": 4, "retry_after": 100.0, **kw})
+
+
+def look(g, clock, fps=60, target=60, behind=0.0, stalls=0, cpu=80.0, cores=8, after=3.0):
+    clock.tick(after)
+    return g.observe(fps, target, behind, stalls, cpu, cores)
+
+
+def test_governor_waits_for_a_restarted_encoder_and_steps_down_when_it_cannot_make_the_pictures():
+    clock, g = governor("fast", settle=6.0)
+    assert look(g, clock, fps=5) is None and g.bad == 0                       # 3 s after the start: the numbers mean nothing yet
+    assert look(g, clock, fps=20) is None                                     # first bad look
+    move = look(g, clock, fps=20)                                             # second bad look in a row: one step down
+    assert move is not None and move[0] == "balanced" and "20 of 60" in move[1] and g.rung == "balanced"
+    assert look(g, clock, fps=5) is None                                      # settling again after the change
+
+
+def test_governor_does_not_mistake_an_idle_screen_for_a_slow_encoder():
+    clock, g = governor("fast", up_after=99)
+    assert all(look(g, clock, fps=8, cpu=3.0) is None for _ in range(6))      # few pictures, encoder idle: nothing is wrong
+    assert g.rung == "fast" and g.bad == 0
+
+
+def test_governor_steps_down_when_the_guests_connection_falls_behind():
+    clock, g = governor("high")
+    assert look(g, clock, behind=0.9) is None
+    move = look(g, clock, behind=0.9)
+    assert move == ("fast", "the guest's connection cannot keep up")
+    clock2, g2 = governor("high")
+    assert look(g2, clock2, stalls=3) is None and look(g2, clock2, stalls=1)[0] == "fast"       # dropped frames count the same
+
+
+def test_governor_goes_up_slowly_only_with_room_and_never_straight_back_to_a_rung_that_failed():
+    clock, g = governor("balanced")
+    assert [look(g, clock, cpu=300.0, cores=4) for _ in range(6)] == [None] * 6                  # comfortable, but no room: the next rung costs about twice as much
+    assert look(g, clock, cpu=60.0, cores=4) == ("fast", "it has been running comfortably for a while")
+    assert look(g, clock, fps=10, cpu=200.0) is None and look(g, clock, fps=10, cpu=200.0)[0] == "balanced"   # it did not hold: back down
+    assert [look(g, clock, cpu=40.0, cores=8) for _ in range(8)] == [None] * 8                   # comfortable again, but "fast" failed a moment ago
+    clock.tick(100.0)
+    assert look(g, clock, cpu=40.0, cores=8)[0] == "fast"                                        # after a few minutes it may try again
+
+
+def test_governor_stays_inside_the_ladder():
+    clock, g = governor("low")
+    assert all(look(g, clock, fps=1) is None for _ in range(5)) and g.rung == "low"
+    clock, g = governor("ultra")
+    assert all(look(g, clock, cpu=5.0) is None for _ in range(8)) and g.rung == "ultra"
+
+
+def test_governor_never_goes_above_the_best_rung_it_was_allowed():
+    clock, g = governor("high", top="high")
+    assert all(look(g, clock, cpu=5.0) is None for _ in range(8)) and g.rung == "high" and g.ladder[0] == "high"
+
+
+def test_source_retune_only_applies_to_auto_quality(tmp_path):
+    auto = st.GstSource(str(tmp_path), "", "auto", sound=False)
+    assert auto.can_retune and auto._quality() == "auto"
+    auto.retune("balanced")
+    auto.retune("nonsense")
+    assert auto._quality() == "balanced"
+    fixed = st.GstSource(str(tmp_path), "", "high", sound=False)
+    fixed.retune("low")
+    assert not fixed.can_retune and fixed._quality() == "high"
+
+
+class RetunableSource(AdaptiveSource):
+    can_retune = True
+
+    def __init__(self):
+        super().__init__()
+        self.info = {**self.info, "quality": "fast", "fps": 60}
+        self.rungs = []
+
+    def retune(self, rung):
+        self.rungs.append(rung)
+        self.info = {**self.info, "quality": rung, "fps": 60 if rung in ("ultra", "high", "fast") else 30}
+
+    def pids(self):
+        return {}                                   # no encoder process to measure: its load is unknown, so a shortfall counts
+
+    def restart_video(self, view):
+        self.restarts.append(view)                  # the guest may not have reported its window yet: view can be None
+        self.view = view
+
+
+def test_hub_with_auto_quality_steps_down_by_itself_when_the_encoder_makes_too_few_pictures():
+    src = RetunableSource()
+    says = []
+    hub = st.StreamHub(src, lambda: mi.RecordingInjector(), say=says.append, quality="auto", health_every=100, adapt_every=0.05,
+                       adapt_kwargs={"settle": 0.0, "down_after": 2})
+    ws = FakeWs([])
+    done = []
+    deadline = time.time() + 4
+    t = threading.Thread(target=lambda: done.append(hub.serve(ws, lambda: time.time() < deadline, lambda: None, "127.0.0.1")), daemon=True)
+    t.start()
+    end = time.time() + 3
+    while time.time() < end and not src.rungs:
+        time.sleep(0.02)
+    assert src.rungs and src.rungs[0] == "balanced"                                # no pictures at all against 60 asked for: one step down
+    assert any(line.startswith("  Quality balanced:") and "0 of 60" in line for line in says)
+    assert src.restarts and t.is_alive()                                           # the encoder was restarted, the guest is still connected
+    t.join(6)
+
+
+def test_hub_with_a_fixed_quality_never_retunes():
+    src = RetunableSource()
+    hub = st.StreamHub(src, lambda: mi.RecordingInjector(), say=lambda _line: None, quality="high", health_every=100, adapt_every=0.05)
+    ws = FakeWs([])
+    deadline = time.time() + 1
+    t = threading.Thread(target=lambda: hub.serve(ws, lambda: time.time() < deadline, lambda: None, "127.0.0.1"), daemon=True)
+    t.start()
+    time.sleep(0.6)
+    assert hub.governor is None and src.rungs == []
+    t.join(3)
 
 
 class BrokenRestartSource(AdaptiveSource):
