@@ -684,6 +684,41 @@ def test_source_retune_only_applies_to_auto_quality(tmp_path):
     assert not fixed.can_retune and fixed._quality() == "high"
 
 
+def test_encoder_runs_at_a_lower_priority_than_the_desktop(monkeypatch):
+    calls = []
+    monkeypatch.setattr(st.os, "nice", lambda n: calls.append(n))
+    st._encoder_start()
+    assert calls == [10]
+
+
+def test_the_video_encoder_is_started_at_low_priority(tmp_path):
+    seen = {}
+
+    def popen(argv, **kw):
+        seen[argv[0]] = kw.get("preexec_fn")
+        read_end, write_end = os.pipe()
+        os.write(write_end, b"\x00\x00\x00\x01data")
+
+        class Proc:
+            stdout = os.fdopen(read_end, "rb")
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+        return Proc()
+    src = st.GstSource(str(tmp_path), "", "auto", sound=False, popen=popen)
+    src._first_working([("video", ["video-cmd"])], "video")
+    assert seen["video-cmd"] is st._encoder_start
+
+
 class RetunableSource(AdaptiveSource):
     can_retune = True
 

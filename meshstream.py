@@ -455,6 +455,16 @@ def _die_with_parent() -> None:
         _prctl(1, signal.SIGTERM)       # PR_SET_PDEATHSIG
 
 
+def _encoder_start() -> None:
+    """The encoder is throughput work: it runs at a lower priority, so the desktop (and the guest's mouse and keys, which the desktop
+    has to handle) come first when the computer is busy. If the encoder then cannot keep up, the quality steps down instead."""
+    _die_with_parent()
+    try:
+        os.nice(10)
+    except OSError:
+        pass
+
+
 def _terminate(proc, wait: float = 3.0) -> None:
     if proc is None or proc.poll() is not None:
         return
@@ -644,7 +654,7 @@ class GstSource:
             with open(self.log_path, "ab") as log:
                 log.write(f"\n--- {what}: {name}\n{' '.join(argv)}\n".encode())
                 try:
-                    proc = self.popen(argv, stdout=subprocess.PIPE, stderr=log, stdin=subprocess.DEVNULL, env=self._env(), preexec_fn=_die_with_parent)
+                    proc = self.popen(argv, stdout=subprocess.PIPE, stderr=log, stdin=subprocess.DEVNULL, env=self._env(), preexec_fn=_encoder_start if first_bytes else _die_with_parent)
                 except OSError:
                     continue
             self.procs.append(proc)
