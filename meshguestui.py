@@ -9,7 +9,7 @@ SCREEN_HTML = r"""<!doctype html>
 <div id="stage"><canvas id="screen" tabindex="0"></canvas></div>
 <div id="start"><div><h1>Mesh</h1><p id="note">The owner is sharing their screen with you.</p><button id="go">Start</button>
 <p class="dim">Sound and the keyboard and mouse start when you click Start.</p></div></div>
-<div id="bar" hidden><span id="stat"></span><button id="fs" type="button">Full screen</button><button id="fit" type="button">Fit</button><button id="snd" type="button">Sound on</button><button id="cur" type="button">My cursor</button><button id="leave" type="button">Leave</button><button id="close" type="button">Close</button></div>
+<div id="bar" hidden><span id="stat"></span><button id="fs" type="button">Full screen</button><button id="fit" type="button">Fit</button><button id="snd" type="button">Sound on</button><button id="cur" type="button">Hide my cursor</button><button id="leave" type="button">Leave</button><button id="close" type="button">Close</button></div>
 <div id="mirror" hidden></div>
 <div id="over" hidden><div><h1>Mesh</h1><p id="why"></p><button id="again" type="button" hidden>Reconnect</button></div></div>
 <script src="/_mesh/screen.js"></script>
@@ -18,7 +18,8 @@ SCREEN_HTML = r"""<!doctype html>
 
 SCREEN_CSS = r"""html,body{margin:0;height:100%;background:#000;color:#fff;font-family:ui-monospace,Menlo,Consolas,monospace;overflow:hidden}
 #stage{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#000}
-canvas{display:block;background:#000;outline:none;cursor:none;touch-action:none}
+canvas{display:block;background:#000;outline:none;touch-action:none;cursor:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24'%3E%3Cpath d='M3 2v17l4.5-4 3 7 3-1.3-3-6.7h6z' fill='%235ab0ff' stroke='%23000' stroke-width='1.5' stroke-linejoin='round'/%3E%3C/svg%3E") 3 2,default}
+canvas.hidecursor{cursor:none}
 #start,#over{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;background:#000;z-index:5}
 #over[hidden],#start[hidden],#bar[hidden]{display:none}
 h1{font-size:1.1rem;letter-spacing:.3em;text-transform:uppercase;margin:0 0 1.5rem}
@@ -217,10 +218,14 @@ SCREEN_JS = r"""(function () {
   // ---- the guest's keyboard and mouse
   function clamp(v) { return Math.max(0, Math.min(65535, Math.round(v))); }
   function pos(e) { var r = canvas.getBoundingClientRect(); return {x: clamp((e.clientX - r.left) / r.width * 65535), y: clamp((e.clientY - r.top) / r.height * 65535)}; }
-  var lastMove = null, moveTimer = 0;
-  function flushMove() { moveTimer = 0; if (lastMove) { send({t: 'm', x: lastMove.x, y: lastMove.y}); lastMove = null; } }
+  var lastMove = null, moveTimer = 0, lastSent = 0;
+  function flushMove() { moveTimer = 0; if (lastMove) { send({t: 'm', x: lastMove.x, y: lastMove.y}); lastMove = null; lastSent = performance.now(); } }
   function btn(b) { return b === 0 ? 1 : b === 1 ? 2 : b === 2 ? 3 : b === 3 ? 4 : 5; }
-  canvas.addEventListener('pointermove', function (e) { lastMove = pos(e); if (!moveTimer) { moveTimer = setTimeout(flushMove, 8); } });
+  canvas.addEventListener('pointermove', function (e) {      // the first move goes out at once; the ones right behind it are merged into one every 8 ms
+    lastMove = pos(e);
+    var wait = 8 - (performance.now() - lastSent);
+    if (wait <= 0) { flushMove(); } else if (!moveTimer) { moveTimer = setTimeout(flushMove, wait); }
+  });
   canvas.addEventListener('pointerdown', function (e) {
     lastMove = pos(e); flushMove();
     try { canvas.setPointerCapture(e.pointerId); } catch (x) { /* not capturable */ }
@@ -282,7 +287,13 @@ SCREEN_JS = r"""(function () {
     fit();
   });
   $('mirror').addEventListener('click', function () { $('mirror').hidden = true; });
-  $('cur').addEventListener('click', function () { canvas.style.cursor = canvas.style.cursor === 'default' ? 'none' : 'default'; });
+  function showCursor(on) {      // the guest's own pointer, drawn by their computer: it follows the hand at once instead of after the picture's round trip
+    canvas.classList.toggle('hidecursor', !on);
+    $('cur').textContent = on ? 'Hide my cursor' : 'Show my cursor';
+    try { localStorage.setItem('mesh-cursor', on ? '1' : '0'); } catch (e) { /* storage may be blocked */ }
+  }
+  try { if (localStorage.getItem('mesh-cursor') === '0') { showCursor(false); } } catch (e) { /* storage may be blocked */ }
+  $('cur').addEventListener('click', function () { showCursor(canvas.classList.contains('hidecursor')); });
   $('leave').addEventListener('click', function () {
     fetch('/_mesh/leave', {method: 'POST', credentials: 'same-origin'}).catch(function () {}).then(function () { finish('You left. Ask the owner for a new link if you need to come back.'); });
   });
@@ -296,7 +307,7 @@ SCREEN_JS = r"""(function () {
     if (dt <= 0) { return; }
     st.fps = Math.round((st.frames - st.tf) / dt); st.kbps = Math.round((st.bytes - st.tb) * 8 / 1000 / dt);
     st.tf = st.frames; st.tb = st.bytes; st.tick = now;
-    if (st.shown && !(st.info && st.info.paused)) { status(st.fps + ' fps  ' + st.kbps + ' kbps  ' + st.rtt + ' ms  late ' + Math.round(st.late) + ' ms'); }
+    if (st.shown && !(st.info && st.info.paused)) { status((st.info && st.info.width ? st.info.width + 'x' + st.info.height + (st.info.quality ? ' ' + st.info.quality : '') + '  ' : '') + st.fps + ' fps  ' + st.kbps + ' kbps  ' + st.rtt + ' ms  late ' + Math.round(st.late) + ' ms'); }
     send({t: 'p', ts: now});
   }, 1000);
   if (!window.isSecureContext || !window.VideoDecoder) { $('note').textContent = 'This browser cannot show the shared screen. Open the link in a recent Chrome, Edge, Firefox or Safari.'; $('go').hidden = true; }

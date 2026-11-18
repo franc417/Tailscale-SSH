@@ -1095,3 +1095,26 @@ def test_screen_command_takes_quality_auto_by_default_and_fps(tmp_path):
     assert args.quality == "ultra" and args.fps == 60
     for name in ("auto", "ultra", "high", "text", "fast", "balanced", "smooth", "low"):
         assert parser.parse_args(["screen", "--quality", name]).quality == name
+
+
+def test_guest_page_shows_the_guests_own_cursor_and_sends_pointer_moves_without_waiting():
+    import meshguestui as ui
+    canvas_rule = next(line for line in ui.SCREEN_CSS.splitlines() if line.startswith("canvas{"))
+    assert "cursor:none" not in canvas_rule and "cursor:url(" in canvas_rule                  # their own pointer at once, not only the one inside the delayed picture
+    assert "canvas.hidecursor{cursor:none}" in ui.SCREEN_CSS and "Hide my cursor" in ui.SCREEN_HTML
+    assert "performance.now() - lastSent" in ui.SCREEN_JS and "setTimeout(flushMove, 8);" not in ui.SCREEN_JS     # the first move is not held back
+    assert "st.info.width + 'x'" in ui.SCREEN_JS                                              # the bar says what size is arriving
+
+
+def test_guest_page_javascript_parses(tmp_path):
+    import shutil
+    import subprocess
+    import meshguestui as ui
+    node = shutil.which("node")
+    if not node:
+        import pytest
+        pytest.skip("node is not installed")
+    path = tmp_path / "screen.js"
+    path.write_text(ui.SCREEN_JS, encoding="utf-8")
+    done = subprocess.run([node, "--check", str(path)], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
