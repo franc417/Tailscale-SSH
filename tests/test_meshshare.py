@@ -512,6 +512,46 @@ class FakeTailscale:
         return subprocess.CompletedProcess(args, 0, "", "")
 
 
+WARNING = 'Warning: client version "1.104.7" != tailscaled server version "1.104.5"'
+
+
+class FakeTailscaleWarning(FakeTailscale):
+    """The tailscale program was updated but its service was not restarted: every command also prints a version warning (found on a real laptop)."""
+
+    def __init__(self, before=False, **kw):
+        super().__init__(**kw)
+        self.before = before
+
+    def __call__(self, args, capture_output=True, text=True, timeout=None):
+        done = super().__call__(args, capture_output=capture_output, text=text, timeout=timeout)
+        if self.before:
+            return subprocess.CompletedProcess(args, done.returncode, WARNING + "\n" + (done.stdout or ""), done.stderr)
+        return subprocess.CompletedProcess(args, done.returncode, done.stdout, WARNING + "\n")
+
+
+def test_funnel_start_works_when_tailscale_prints_a_version_warning_and_says_how_to_remove_it():
+    for fake in (FakeTailscaleWarning(), FakeTailscaleWarning(before=True)):
+        tunnel = ms.FunnelTunnel(443, runner=fake, which=lambda n: "/usr/bin/tailscale")
+        said = []
+        tunnel.say = said.append
+        assert tunnel.start(5555) == "https://mkz.tail1234.ts.net"
+        assert len([line for line in said if "systemctl restart tailscaled" in line]) == 1       # said once, not on every call
+        tunnel.stop()
+
+
+def test_funnel_error_for_an_unreadable_status_is_short():
+    with pytest.raises(ms.TunnelError) as err:
+        ms.FunnelTunnel(443, runner=FakeTailscale(status="x" * 5000), which=lambda n: "tailscale").start(1)
+    assert "did not answer" in str(err.value) and len(str(err.value)) < 400                     # not the whole output
+
+
+def test_parse_json_prefix_ignores_text_around_the_answer():
+    assert ms.parse_json_prefix('{"a": 1}Warning: x') == {"a": 1}
+    assert ms.parse_json_prefix('Warning: x\n{"a": {"b": 2}}\ntrailing') == {"a": {"b": 2}}
+    with pytest.raises(ValueError):
+        ms.parse_json_prefix("no answer here")
+
+
 def test_funnel_start_and_stop_commands():
     fake = FakeTailscale()
     tunnel = ms.FunnelTunnel(443, runner=fake, which=lambda n: "/usr/bin/tailscale")

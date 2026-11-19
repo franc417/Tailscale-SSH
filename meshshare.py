@@ -1071,6 +1071,16 @@ def run_live(argv: List[str], timeout: float, on_line: Callable[[str], None]) ->
     return code, "".join(lines).strip()
 
 
+def parse_json_prefix(text: str):
+    """The first JSON object in text, ignoring anything around it: a command line program may print a warning before or after its answer
+    (tailscale does when its program and its background service are different versions, which happens after a system update)."""
+    start = text.find("{")
+    if start < 0:
+        raise ValueError("no JSON object in the output")
+    value, _end = json.JSONDecoder().raw_decode(text[start:])
+    return value
+
+
 class FunnelTunnel:
     """Tailscale Funnel: https://<this computer>.<tailnet>.ts.net, TLS ends on this computer, open only while a share is."""
     kind = "funnel"
@@ -1088,6 +1098,7 @@ class FunnelTunnel:
         self.say: Callable[[str], None] = lambda text: None
         self.live = runner is subprocess.run         # a real run shows tailscale's output as it comes; a test's fake runner is called as before
         self.shown_link = False
+        self.warned_version = False
 
     def on_line(self, line: str) -> None:
         if not line.strip():
@@ -1185,9 +1196,13 @@ class FunnelTunnel:
         if code == 127:
             raise TunnelError("Tailscale is not installed here. Run:  meshd install")
         try:
-            data = json.loads(text)
+            data = parse_json_prefix(text)
         except ValueError:
-            raise TunnelError(f"Tailscale did not answer: {text or 'no output'}") from None
+            raise TunnelError(f"Tailscale did not answer: {text[:300] or 'no output'}") from None
+        if "tailscaled server version" in text and not self.warned_version:
+            self.warned_version = True
+            self.say("  Note: tailscale was updated but its background service still runs the old version, so every command prints a version warning. "
+                     "It works; to remove the warning (this drops Tailscale connections for a moment):  sudo systemctl restart tailscaled")
         if data.get("BackendState") != "Running":
             raise TunnelError(f"Tailscale is {data.get('BackendState') or 'not running'} here. Run:  sudo tailscale up")
         dns = ((data.get("Self") or {}).get("DNSName") or "").rstrip(".")
