@@ -12,6 +12,7 @@ crash in either one ends the stream, never the share. Capture runs only while a 
 import ipaddress
 import json
 import os
+import queue
 import re
 import select
 import shutil
@@ -465,6 +466,49 @@ def _encoder_start() -> None:
         pass
 
 
+class Spawner:
+    """Starts child processes from ONE long-lived thread. Linux ties a child's parent-death signal (see _die_with_parent) to the *thread*
+    that started it, not to the process: a child started from a short-lived thread (the one that restarts the encoder when the guest's
+    window changes, or the one that served the first guest) is stopped the moment that thread ends. That is how the stream died right
+    after a phone was rotated."""
+
+    def __init__(self) -> None:
+        self.jobs: "queue.Queue" = queue.Queue()
+        self.lock = threading.Lock()
+        self.thread: Optional[threading.Thread] = None
+
+    def call(self, fn: Callable, *args, **kwargs):
+        with self.lock:
+            if self.thread is None or not self.thread.is_alive():
+                self.thread = threading.Thread(target=self._run, daemon=True, name="mesh-spawner")
+                self.thread.start()
+        done: threading.Event = threading.Event()
+        box: list = []
+        self.jobs.put((fn, args, kwargs, box, done))
+        done.wait()
+        ok, value = box[0]
+        if not ok:
+            raise value
+        return value
+
+    def _run(self) -> None:
+        while True:
+            fn, args, kwargs, box, done = self.jobs.get()
+            try:
+                box.append((True, fn(*args, **kwargs)))
+            except BaseException as exc:  # noqa: BLE001 - handed to the caller, which raises it there
+                box.append((False, exc))
+            done.set()
+
+
+SPAWNER = Spawner()
+
+
+def spawn(popen: Callable, argv, **kwargs):
+    """popen(argv, **kwargs), run on the spawner thread."""
+    return SPAWNER.call(popen, argv, **kwargs)
+
+
 def _terminate(proc, wait: float = 3.0) -> None:
     if proc is None or proc.poll() is not None:
         return
@@ -497,8 +541,8 @@ class ScreenCapture:
             f.write(HOLDER_JS)
         env = {**self.environ, **mi.graphical_environment(self.environ)}
         try:
-            self.proc = self.popen(["gjs", "-m", script, connector], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                   env=env, text=True, bufsize=1, preexec_fn=_die_with_parent)
+            self.proc = spawn(self.popen, ["gjs", "-m", script, connector], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                              env=env, text=True, bufsize=1, preexec_fn=_die_with_parent)
         except OSError as exc:
             raise StreamError(f"could not start gjs: {exc}") from None
         threading.Thread(target=self._read, daemon=True, name="mesh-holder-out").start()
@@ -654,7 +698,7 @@ class GstSource:
             with open(self.log_path, "ab") as log:
                 log.write(f"\n--- {what}: {name}\n{' '.join(argv)}\n".encode())
                 try:
-                    proc = self.popen(argv, stdout=subprocess.PIPE, stderr=log, stdin=subprocess.DEVNULL, env=self._env(), preexec_fn=_encoder_start if first_bytes else _die_with_parent)
+                    proc = spawn(self.popen, argv, stdout=subprocess.PIPE, stderr=log, stdin=subprocess.DEVNULL, env=self._env(), preexec_fn=_encoder_start if first_bytes else _die_with_parent)
                 except OSError:
                     continue
             self.procs.append(proc)
@@ -707,6 +751,13 @@ class GstSource:
         except (OSError, ValueError):
             pass
         if not self.stopping and gen == self.gen:
+            if reason == "the screen stream stopped":
+                try:
+                    status = proc.wait(0.5)
+                except Exception:  # noqa: BLE001 - only used for the message
+                    status = proc.poll()
+                if status is not None:
+                    reason += f" (the encoder process ended, status {status})"
             on_end(reason)
 
     def _pump_audio(self, proc, on_audio) -> None:
@@ -1053,6 +1104,24 @@ class StreamHub:
                 sub.offer_audio(data)
 
     def on_end(self, reason: str) -> None:
+        if self._recover(reason):
+            return
+        self._finish(reason)
+
+    def _recover(self, reason: str) -> bool:
+        """The encoder process ended by itself (not because GNOME ended the capture): start it again, at most twice a minute, before giving up."""
+        if not reason.startswith("the screen stream stopped") or not self.running or not hasattr(self.source, "restart_video"):
+            return False
+        now = self.clock()
+        self.recoveries = [t for t in getattr(self, "recoveries", []) if now - t < 60.0]
+        if len(self.recoveries) >= 2:
+            return False
+        self.recoveries.append(now)
+        self.say(f"  The picture stopped ({reason}); starting the encoder again.")
+        threading.Thread(target=self._restart, args=(getattr(self.source, "view", None), "Encoder restarted", True), daemon=True, name="mesh-restart").start()
+        return True
+
+    def _finish(self, reason: str) -> None:
         self.end_reason = reason
         self.say(f"  The screen stream stopped: {reason}")
         with self.lock:
@@ -1184,7 +1253,7 @@ class StreamHub:
         self.source.retune(rung)
         self._restart(getattr(self.source, "view", None), why=f"Quality {rung}")
 
-    def _restart(self, view: Optional[Tuple[int, int]], why: str = "The guest's window changed") -> None:
+    def _restart(self, view: Optional[Tuple[int, int]], why: str = "The guest's window changed", recovering: bool = False) -> None:
         with self.restart_lock:
             try:
                 with self.lock:
@@ -1196,8 +1265,12 @@ class StreamHub:
                 self.say(f"  {why}: now sending {info.get('width')}x{info.get('height')} at {info.get('fps')} fps ({getattr(self.source, 'encoder', '')}).")
                 self.broadcast_info()
             except StreamError as exc:
+                if recovering:
+                    return self._finish(f"the encoder could not be started again: {exc}")
                 self.say(f"  Could not change the picture size: {exc}")
             except Exception as exc:  # noqa: BLE001 - whatever else goes wrong must be said, not end this thread without a word
+                if recovering:
+                    return self._finish(f"the encoder could not be started again ({type(exc).__name__}: {exc})")
                 self.say(f"  Could not change the picture size ({type(exc).__name__}: {exc}).")
 
     def serve(self, ws, still_valid: Callable[[], bool], on_activity: Callable[[], None], client_ip: str = "") -> str:

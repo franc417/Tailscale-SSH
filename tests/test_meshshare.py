@@ -1118,3 +1118,132 @@ def test_guest_page_javascript_parses(tmp_path):
     path.write_text(ui.SCREEN_JS, encoding="utf-8")
     done = subprocess.run([node, "--check", str(path)], capture_output=True, text=True)
     assert done.returncode == 0, done.stderr
+
+
+def _guest_js_part(begin, end):
+    import meshguestui as ui
+    return ui.SCREEN_JS.split(begin + "\n")[1].split(end)[0]
+
+
+def _node_json(tmp_path, code):
+    import json
+    import shutil
+    import subprocess
+    node = shutil.which("node")
+    if not node:
+        import pytest
+        pytest.skip("node is not installed")
+    path = tmp_path / "t.js"
+    path.write_text(code, encoding="utf-8")
+    done = subprocess.run([node, str(path)], capture_output=True, text=True, timeout=30)
+    assert done.returncode == 0, done.stderr
+    return json.loads(done.stdout)
+
+
+def test_phone_touchpad_taps_clicks_scrolls_and_drags_like_a_laptop_touchpad(tmp_path):
+    engine = _guest_js_part("// @touchpad-begin", "// @touchpad-end")
+    driver = """
+function run(steps) {
+  var t = 0, log = [];
+  var tp = makeTouchpad({now: function () { return t; },
+    move: function (dx, dy) { log.push(['move', Math.round(dx), Math.round(dy)]); },
+    button: function (b, d) { log.push(['button', b, d]); },
+    scroll: function (sx, sy) { log.push(['scroll', Math.round(sx), Math.round(sy)]); }});
+  steps.forEach(function (s) { t = s[0]; tp[s[1]](s[2], s[3], s[4]); });
+  return log;
+}
+console.log(JSON.stringify({
+  tap: run([[0, 'down', 1, 100, 100], [90, 'up', 1]]),
+  jitter: run([[0, 'down', 1, 100, 100], [20, 'move', 1, 103, 102], [90, 'up', 1]]),
+  slow_press: run([[0, 'down', 1, 100, 100], [400, 'up', 1]]),
+  slide: run([[0, 'down', 1, 100, 100], [16, 'move', 1, 120, 100], [32, 'move', 1, 140, 100], [200, 'up', 1]]),
+  slow_slide: run([[0, 'down', 1, 100, 100], [100, 'move', 1, 120, 100], [200, 'move', 1, 140, 100], [400, 'up', 1]]),
+  right: run([[0, 'down', 1, 100, 100], [0, 'down', 2, 160, 100], [80, 'up', 1], [90, 'up', 2]]),
+  middle: run([[0, 'down', 1, 100, 100], [0, 'down', 2, 150, 100], [0, 'down', 3, 200, 100], [80, 'up', 1], [85, 'up', 2], [90, 'up', 3]]),
+  scroll_up: run([[0, 'down', 1, 100, 100], [0, 'down', 2, 160, 100], [16, 'move', 1, 100, 60], [16, 'move', 2, 160, 60], [300, 'up', 1], [300, 'up', 2]]),
+  drag: run([[0, 'down', 1, 100, 100], [60, 'up', 1], [150, 'down', 1, 100, 100], [166, 'move', 1, 130, 100], [182, 'move', 1, 160, 100], [400, 'up', 1]]),
+  double: run([[0, 'down', 1, 100, 100], [60, 'up', 1], [150, 'down', 1, 100, 100], [210, 'up', 1]]),
+  late_second_tap: run([[0, 'down', 1, 100, 100], [60, 'up', 1], [500, 'down', 1, 100, 100], [560, 'up', 1]]),
+  cancelled_drag: run([[0, 'down', 1, 100, 100], [60, 'up', 1], [150, 'down', 1, 100, 100], [200, 'cancel']])
+}));
+"""
+    r = _node_json(tmp_path, engine + driver)
+    click = [["button", 0, True], ["button", 0, False]]
+    assert r["tap"] == click                                              # a short tap is a left click
+    assert r["jitter"] == click                                           # a few pixels of finger wobble are still a tap
+    assert r["slow_press"] == []                                          # a long press without moving is not a click
+    assert [m[0] for m in r["slide"]] == ["move", "move"] and all(m[1] > 20 and m[2] == 0 for m in r["slide"])    # sliding moves the pointer, further than the finger
+    assert not any(e[0] == "button" for e in r["slide"])                  # and does not click
+    fast, slow = r["slide"][1][1], r["slow_slide"][1][1]
+    assert fast > slow > 20                                               # a quick swipe goes further than a slow one
+    assert r["right"] == [["button", 2, True], ["button", 2, False]]     # two fingers tap = right click
+    assert r["middle"] == [["button", 1, True], ["button", 1, False]]     # three = middle click
+    assert r["scroll_up"] == [["scroll", 0, 20], ["scroll", 0, 20]]       # two fingers sliding up scroll the page down, like on a phone
+    assert r["drag"][:2] == click and r["drag"][2] == ["button", 0, True] and r["drag"][-1] == ["button", 0, False]
+    assert sum(1 for e in r["drag"] if e[0] == "move") == 2               # tap, then touch and hold and slide = drag with the button down
+    assert r["double"] == click + click                                   # tap, tap = double click
+    assert r["late_second_tap"] == click + click                          # two separate clicks, not a drag
+    assert r["cancelled_drag"][-1] == ["button", 0, False]                # a cancelled touch never leaves the button pressed
+
+
+def test_phone_keyboard_offers_only_keys_the_host_accepts_and_all_the_usual_ones(tmp_path):
+    import mesh_input as mi
+    keys = _guest_js_part("// @keys-begin", "// @keys-end")
+    layers = _node_json(tmp_path, keys + "console.log(JSON.stringify(KB_LAYERS));")
+    codes = {k["code"] for rows in layers.values() for row in rows for k in row}
+    pseudo = {k["code"] for rows in layers.values() for row in rows for k in row if k["kind"] in ("layer", "hide")}
+    assert pseudo == {"Fn", "Main", "Hide"}
+    assert codes - pseudo <= set(mi.KEY_CODES)                            # nothing the host would ignore
+    want = {f"Key{c}" for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"} | {f"Digit{n}" for n in range(10)} | {f"F{n}" for n in range(1, 13)}
+    want |= {"Space", "Enter", "Backspace", "Tab", "Escape", "ShiftLeft", "ControlLeft", "AltLeft", "MetaLeft", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
+             "Delete", "Home", "End", "PageUp", "PageDown", "Minus", "Equal", "Comma", "Period", "Slash", "Semicolon", "Quote", "BracketLeft", "BracketRight", "Backslash", "Backquote"}
+    assert want <= codes
+    for row in layers["main"]:
+        assert 12 <= sum(k["flex"] for k in row) <= 17                    # the rows come out about equally wide
+    shifted = {k["code"]: k["shift"] for row in layers["main"] for k in row}
+    assert shifted["KeyA"] == "A" and shifted["Digit1"] == "!" and shifted["Slash"] == "?"
+
+
+def test_guest_page_is_wired_for_phones():
+    import meshguestui as ui
+    for ident in ('id="lc"', 'id="kb"', 'id="kbtog"', 'id="menu"'):
+        assert ident in ui.SCREEN_HTML
+    assert "user-scalable=no" in ui.SCREEN_HTML and "viewport-fit=cover" in ui.SCREEN_HTML
+    js = ui.SCREEN_JS
+    assert "e.pointerType === 'touch'" in js and "makeTouchpad({" in js                    # fingers go to the touchpad, a mouse stays absolute
+    assert "screen.orientation.lock('landscape')" in js and "requestFullscreen({navigationUI: 'hide'})" in js
+    assert "if (android) { goFull(); }" in js                                              # Start on an Android phone: full screen and landscape
+    assert "matchMedia('(pointer: coarse)')" in js and "KB_LAYERS[kb.layer]" in js
+    assert "#bar.touch" in ui.SCREEN_CSS and "#kb{" in ui.SCREEN_CSS and "#lc{" in ui.SCREEN_CSS
+
+
+def test_guest_page_runs_in_a_fake_phone_browser_and_sends_what_a_phone_user_does(tmp_path):
+    """The whole page script against a small fake browser (tests/guest_page_harness.js): fingers, the on-screen keyboard, the menu and Start on Android."""
+    import meshguestui as ui
+    page = tmp_path / "screen.js"
+    page.write_text(ui.SCREEN_JS, encoding="utf-8")
+    import json
+    import os
+    import shutil
+    import subprocess
+    node = shutil.which("node")
+    if not node:
+        import pytest
+        pytest.skip("node is not installed")
+    harness = os.path.join(os.path.dirname(__file__), "guest_page_harness.js")
+    done = subprocess.run([node, harness, str(page)], capture_output=True, text=True, timeout=30)
+    assert done.returncode == 0, done.stderr
+    out = json.loads(done.stdout)
+    assert out["errors"] == [] and out["touchUiOnLoad"]                   # a touch screen gets the touch controls without being asked
+    assert [e["t"] for e in out["tap"]] == ["m", "b", "m", "b"] and [e.get("d") for e in out["tap"] if e["t"] == "b"] == [1, 0]
+    assert out["tap"][0]["x"] == out["tap"][0]["y"] == 32768              # a tap clicks where the own pointer is (the middle at first)
+    assert [e["t"] for e in out["slide"]] == ["m", "m"] and out["slide"][0]["x"] > 32768 and out["slide"][1]["x"] > out["slide"][0]["x"] and out["slide"][0]["y"] == 32768
+    assert out["lcShown"]                                                 # and the own pointer is drawn
+    assert out["scroll"] and all(e["t"] == "w" and e["v"] < 0 for e in out["scroll"])     # two fingers up: the wheel turns down
+    assert out["kbOpen"] and out["rows"] == 5
+    assert out["typeA"] == [{"t": "k", "c": "KeyA", "d": 1}, {"t": "k", "c": "KeyA", "d": 0}]
+    assert out["shiftOn"] == [{"t": "k", "c": "ShiftLeft", "d": 1}] and out["upper"] and out["lowerAgain"]
+    assert [(e["c"], e["d"]) for e in out["typeShiftA"]] == [("ShiftLeft", 1), ("KeyA", 1), ("KeyA", 0), ("ShiftLeft", 0)]      # Shift applies to the next key only
+    assert out["fnHasF5"] and [(e["c"], e["d"]) for e in out["f5"]] == [("F5", 1), ("F5", 0)] and out["kbClosed"] and out["menuOpens"]
+    assert out["mouse"] == [{"t": "m", "x": 16384, "y": 16384}]           # a real mouse still points absolutely
+    assert out["fullscreen"] == [{"navigationUI": "hide"}] and out["lock"] == ["landscape"]       # Start on Android: full screen, landscape

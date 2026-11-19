@@ -145,3 +145,15 @@ uncompressed (so their links can be rewritten).
   same control socket `meshd share` uses (`share.sock`, owner-only), so no new rules are needed.
 - **Guest screen of a virtual monitor** (share only a second, virtual monitor so the main screen is never in the stream).
 - **WebRTC + relay** for networks where WebSocket over Funnel is too slow.
+
+## From a phone or tablet
+
+Open the link in Chrome on Android. Tapping Start goes full screen and turns the phone to landscape (Android only lets a page do that from a tap). The screen then works like a laptop touchpad:
+
+- one finger moves the pointer (further when you swipe faster); a tap clicks; a two-finger tap right-clicks; three fingers tap = middle click;
+- two fingers sliding scroll (up scrolls down, like on a phone);
+- a tap followed at once by a touch that you hold and slide drags; tap twice = double click.
+
+Your own pointer is drawn on the phone at once (a blue arrow), so it follows your finger without waiting for the picture. The Keyboard button (bottom right) opens an on-screen keyboard that sends the same key names as a real one: Shift, Ctrl, Alt and Win apply to the next key (tap twice to hold, a third time to release), Fn gives F1 to F12, Esc, Home, End, PgUp, PgDn, Ins, Del and the arrows. Menu (top right) holds Full screen, Fit, Sound, Hide my cursor and Leave. A mouse or keyboard connected to the phone works as on a laptop.
+
+If the picture stops, the owner's terminal says why (it now includes the encoder's exit status) and the encoder is started again by itself, twice a minute at most.

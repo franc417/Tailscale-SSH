@@ -719,6 +719,63 @@ def test_the_video_encoder_is_started_at_low_priority(tmp_path):
     assert seen["video-cmd"] is st._encoder_start
 
 
+def test_a_child_started_through_the_spawner_outlives_the_short_lived_thread_that_asked_for_it():
+    if st._prctl is None:
+        pytest.skip("no prctl here")
+
+    def from_a_short_lived_thread(starter):
+        box = []
+        thread = threading.Thread(target=lambda: box.append(starter()))
+        thread.start()
+        thread.join()
+        time.sleep(0.5)
+        return box[0]
+    kw = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, preexec_fn=st._die_with_parent)
+    plain = from_a_short_lived_thread(lambda: subprocess.Popen(["sleep", "30"], **kw))
+    through = from_a_short_lived_thread(lambda: st.spawn(subprocess.Popen, ["sleep", "30"], **kw))
+    try:
+        if plain.poll() is None:
+            pytest.skip("this kernel does not end a child when the thread that started it ends")
+        assert through.poll() is None                       # the encoder started when the guest's window changed would have died here
+    finally:
+        for proc in (plain, through):
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+
+
+def test_spawner_passes_a_failure_back_to_the_caller():
+    def boom():
+        raise OSError("no such program")
+    with pytest.raises(OSError, match="no such program"):
+        st.SPAWNER.call(boom)
+    assert st.SPAWNER.call(lambda: 42) == 42                # and keeps working afterwards
+
+
+def test_hub_starts_the_encoder_again_when_it_stops_by_itself_and_gives_up_after_two_tries():
+    src = AdaptiveSource()
+    says = []
+    hub = st.StreamHub(src, lambda: mi.RecordingInjector(), say=says.append, health_every=100)
+    ws = FakeWs([("text", json.dumps({"t": "v", "w": 1280, "h": 720}))])
+    deadline = time.time() + 6
+    t = threading.Thread(target=lambda: hub.serve(ws, lambda: time.time() < deadline, lambda: None, "127.0.0.1"), daemon=True)
+    t.start()
+    end = time.time() + 3
+    while time.time() < end and src.cb is None:
+        time.sleep(0.02)
+    ended = "the screen stream stopped (the encoder process ended, status -15)"
+    src.cb[2](ended)                                         # the first time: started again
+    end = time.time() + 3
+    while time.time() < end and not src.restarts:
+        time.sleep(0.02)
+    assert src.restarts and hub.running and any("starting the encoder again" in line for line in says)
+    src.cb[2](ended)                                         # the second: again
+    src.cb[2](ended)                                         # the third within a minute: now it is over
+    assert not hub.running and any(line.startswith("  The screen stream stopped:") for line in says)
+    src.cb[2]("GNOME ended the screen capture (screen locked or monitor removed?)")     # never retried: the capture is gone
+    t.join(8)
+
+
 class RetunableSource(AdaptiveSource):
     can_retune = True
 
