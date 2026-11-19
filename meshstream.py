@@ -44,8 +44,8 @@ LADDER = ("ultra", "high", "fast", "balanced", "smooth", "low")        # --quali
 DEFAULT_QUALITY = "auto"        # starts at "high" with a hardware encoder and "fast" with a software one, then follows what the computer and the connection can do
 AUTO_HARDWARE, AUTO_SOFTWARE = "high", "fast"
 ADAPT_EVERY = 3.0               # seconds between looks at how the stream is doing (auto quality)
-MIN_BACKLOG = 120_000          # bytes: a guest's queue is never trimmed below this
-MAX_LATENCY = 0.6              # seconds of video a guest's queue may hold; more and frames are dropped until the next key frame
+MIN_BACKLOG = 60_000           # bytes: a guest's queue is never trimmed below this (about one key frame)
+MAX_LATENCY = 0.35             # seconds of video a guest's queue may hold; more and frames are dropped until the next key frame
 MAX_GOP_FRAMES = 150
 HEALTH_EVERY = 10.0            # seconds between the stream-health lines on the owner's terminal
 INPUT_RATE = 600               # input events per second one guest may send (a bucket, so bursts are fine)
@@ -252,14 +252,15 @@ class QualityGovernor:
         self.bad = self.good = 0
         self.failed: Dict[str, float] = {}          # rung -> when it had to be left
 
-    def observe(self, fps: float, target: float, behind: float, stalls: int, cpu: Optional[float] = None, cores: int = 1) -> Optional[Tuple[str, str]]:
+    def observe(self, fps: float, target: float, behind: float, stalls: int, cpu: Optional[float] = None, cores: int = 1,
+                guest_late: float = 0.0) -> Optional[Tuple[str, str]]:
         """One look at the stream: pictures made a second against the target, how far behind the slowest guest is (seconds), frames
         dropped since the last look, the encoder's load (percent of one core) and the number of cores. -> (new rung, why) to change now."""
         now = self.clock()
         if now - self.changed < self.settle:            # a restarted encoder needs a moment before its numbers mean anything
             return None
         slow = bool(target) and fps < target * 0.85 and (cpu is None or cpu >= 30.0)     # an idle screen sends few pictures too, but then the encoder is not busy
-        late = behind > 0.4 or stalls > 0
+        late = behind > 0.4 or stalls > 0 or guest_late > 0.6          # the guest's own page sees the pictures this many seconds late
         self.bad, self.good = (self.bad + 1, 0) if (slow or late) else (0, self.good + 1)
         i = self.ladder.index(self.rung)
         if self.bad >= self.down_after and i + 1 < len(self.ladder):
@@ -457,13 +458,18 @@ def _die_with_parent() -> None:
 
 
 def _encoder_start() -> None:
-    """The encoder is throughput work: it runs at a lower priority, so the desktop (and the guest's mouse and keys, which the desktop
-    has to handle) come first when the computer is busy. If the encoder then cannot keep up, the quality steps down instead."""
+    """The video encoder runs at normal priority: the guest is the one using this computer, so the picture must not be starved when the
+    desktop is busy (at nice 10 a busy laptop made 6 pictures a second). MESH_ENCODER_NICE=10 gives the desktop priority instead."""
     _die_with_parent()
     try:
-        os.nice(10)
-    except OSError:
-        pass
+        nice = int(os.environ.get("MESH_ENCODER_NICE", "0"))
+    except ValueError:
+        nice = 0
+    if nice:
+        try:
+            os.nice(nice)
+        except OSError:
+            pass
 
 
 class Spawner:
@@ -920,6 +926,7 @@ class Subscriber:
         self.dead = False
         self.dropped = 0
         self.sent = 0
+        self.reported: Dict[str, float] = {}               # what the guest's page says it sees: fps, late (ms), rtt (ms)
         self.thread = threading.Thread(target=self._run, daemon=True, name="mesh-guest-send")
 
     def start(self) -> None:
@@ -989,7 +996,10 @@ class Subscriber:
                         self.cond.wait(0.5)
                     if self.dead:
                         return
+                    pick = next((i for i, item in enumerate(self.items) if item[0] != 1), 0)      # text and sound go first: a pong or a sound frame must not wait behind pictures
+                    self.items.rotate(-pick)
                     kind, data = self.items.popleft()
+                    self.items.rotate(pick)
                     self.bytes -= len(data)
                 if kind == 0:
                     self.ws.send_text(data.decode("utf-8"))
@@ -1242,7 +1252,8 @@ class StreamHub:
                 if t is not None:
                     ticks[pid] = t
             target = (getattr(self.source, "info", {}) or {}).get("fps") or 0
-            move = governor.observe((n - last_n) / dt, target, max(sub.backlog_seconds() for sub in subs), max(0, dropped - last_drop), cpu, cores)
+            guest_late = max(sub.reported.get("late", 0.0) for sub in subs) / 1000.0
+            move = governor.observe((n - last_n) / dt, target, max(sub.backlog_seconds() for sub in subs), max(0, dropped - last_drop), cpu, cores, guest_late)
             last, last_n, last_drop = now, n, dropped
             if move:
                 self.say(f"  Quality {move[0]}: {move[1]}.")
@@ -1324,6 +1335,10 @@ class StreamHub:
                 if not isinstance(data, dict):
                     continue
                 if data.get("t") == "p":
+                    for key in ("fps", "late", "rtt"):
+                        value = data.get(key)
+                        if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value < 100000:
+                            sub.reported[key] = float(value)
                     ts = data.get("ts")
                     sub.put_text(json.dumps({"t": "pong", "ts": ts if isinstance(ts, (int, float)) and not isinstance(ts, bool) else 0}))
                 elif data.get("t") == "v":

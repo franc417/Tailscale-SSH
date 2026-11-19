@@ -43,10 +43,13 @@ button:hover{background:#fff;color:#000}
 #bar.touch{display:none;top:2.9rem;left:.4rem;right:.4rem;transform:none;opacity:1;white-space:normal;max-width:none}
 #bar.touch.open{display:block}
 #bar.touch button{padding:.6rem .8rem;margin:.2rem}
-#kb{position:fixed;left:0;right:0;bottom:0;z-index:6;padding:4px;background:rgba(8,8,8,.94);border-top:1px solid #555;touch-action:none;user-select:none;-webkit-user-select:none}
+#kb{position:fixed;left:0;top:0;width:900px;z-index:6;padding:4px;background:rgba(8,8,8,.9);border:1px solid #666;border-radius:6px;transform-origin:0 0;touch-action:none;user-select:none;-webkit-user-select:none}
+#kb .bar{display:flex;gap:4px;margin-bottom:4px}
+#kb .grip{flex:1 1 auto;display:flex;align-items:center;justify-content:center;font-size:.85rem;color:#aaa;border:1px dashed #666;touch-action:none}
+#kb .bar button{flex:0 0 auto;width:3.2rem;height:2.4rem}
 #kb[hidden]{display:none}
 #kb .row{display:flex;gap:3px;margin-bottom:3px}
-#kb button{flex:1 1 0;min-width:0;height:clamp(30px,9.5vh,46px);margin:0;padding:0;font-size:clamp(.7rem,2.6vh,1rem);border:1px solid #666;background:#111;color:#fff;touch-action:none}
+#kb button{flex:1 1 0;min-width:0;height:44px;margin:0;padding:0;font-size:1rem;border:1px solid #666;background:#111;color:#fff;touch-action:none}
 #kb button:hover{background:#111;color:#fff}
 #kb button:active{background:#333}
 #kb button.on{background:#5ab0ff;color:#000}
@@ -398,6 +401,14 @@ SCREEN_JS = r"""(function () {
   function kbRender() {
     var box = $('kb'), shift = (kb.mods.ShiftLeft || 0) > 0;
     box.textContent = '';
+    var bar = document.createElement('div'), grip = document.createElement('div');      // a floating keyboard: drag it by the grip, smaller or bigger with A- and A+
+    bar.className = 'bar'; grip.className = 'grip'; grip.textContent = 'drag to move'; bar.appendChild(grip);
+    [['A\u2212', -1], ['A+', 1], ['\u2715', 0]].forEach(function (d) {
+      var b = document.createElement('button'); b.type = 'button'; b.textContent = d[0];
+      b.addEventListener('click', function () { if (d[1]) { kbSize(d[1]); } else { kbShow(false); } });
+      bar.appendChild(b);
+    });
+    box.appendChild(bar); kbDrag(grip);
     KB_LAYERS[kb.layer].forEach(function (keys) {
       var row = document.createElement('div'); row.className = 'row';
       keys.forEach(function (k) {
@@ -408,10 +419,38 @@ SCREEN_JS = r"""(function () {
       box.appendChild(row);
     });
   }
+  var kbView = {x: null, y: null, s: 0.75}, KB_SCALES = [0.45, 0.6, 0.75, 0.9, 1.1];      // top-left corner in px (null: bottom centre) and size
+  try { var savedKb = JSON.parse(localStorage.getItem('mesh-kb') || 'null'); if (savedKb && typeof savedKb.s === 'number') { kbView = savedKb; } } catch (e) { /* storage may be blocked */ }
+  function kbSave() { try { localStorage.setItem('mesh-kb', JSON.stringify(kbView)); } catch (e) { /* storage may be blocked */ } }
+  function kbPlace() {
+    var box = $('kb');
+    if (box.hidden) { return; }
+    var vw = window.innerWidth, vh = window.innerHeight, s = Math.min(kbView.s, (vw - 8) / box.offsetWidth), w = box.offsetWidth * s, h = box.offsetHeight * s;
+    var x = kbView.x === null ? (vw - w) / 2 : kbView.x, y = kbView.y === null ? vh - h - 6 : kbView.y;
+    box.style.left = Math.round(Math.max(0, Math.min(Math.max(0, vw - w), x))) + 'px';
+    box.style.top = Math.round(Math.max(0, Math.min(Math.max(0, vh - h), y))) + 'px';
+    box.style.transform = 'scale(' + s + ')';
+  }
+  function kbSize(step) {
+    var i = 0, best = 1e9;
+    KB_SCALES.forEach(function (v, j) { if (Math.abs(v - kbView.s) < best) { best = Math.abs(v - kbView.s); i = j; } });
+    kbView.s = KB_SCALES[Math.max(0, Math.min(KB_SCALES.length - 1, i + step))]; kbPlace(); kbSave();
+  }
+  function kbDrag(grip) {
+    var off = null;
+    grip.addEventListener('pointerdown', function (e) {
+      try { grip.setPointerCapture(e.pointerId); } catch (x) { /* not capturable */ }
+      var box = $('kb'); kbPlace(); off = {x: e.clientX - parseFloat(box.style.left), y: e.clientY - parseFloat(box.style.top)}; e.preventDefault();
+    });
+    grip.addEventListener('pointermove', function (e) { if (off) { kbView.x = e.clientX - off.x; kbView.y = e.clientY - off.y; kbPlace(); e.preventDefault(); } });
+    var end = function (e) { if (off) { off = null; kbSave(); e.preventDefault(); } };
+    grip.addEventListener('pointerup', end); grip.addEventListener('pointercancel', end);
+  }
+  window.addEventListener('resize', kbPlace);
   function kbShow(on) {
     if (!on) { Object.keys(kb.mods).forEach(function (c) { if (kb.mods[c]) { kbSend(c, false); } }); kb.mods = {}; }
     kb.open = on; $('kb').hidden = !on; $('kbtog').hidden = on || !touchUi;
-    if (on) { kb.layer = 'main'; kbRender(); }
+    if (on) { kb.layer = 'main'; kbRender(); kbPlace(); }
   }
   $('kbtog').addEventListener('click', function () { kbShow(true); });
   $('menu').addEventListener('click', function () { $('bar').classList.toggle('open'); });
@@ -489,7 +528,7 @@ SCREEN_JS = r"""(function () {
     st.fps = Math.round((st.frames - st.tf) / dt); st.kbps = Math.round((st.bytes - st.tb) * 8 / 1000 / dt);
     st.tf = st.frames; st.tb = st.bytes; st.tick = now;
     if (st.shown && !(st.info && st.info.paused)) { status((st.info && st.info.width ? st.info.width + 'x' + st.info.height + (st.info.quality ? ' ' + st.info.quality : '') + '  ' : '') + st.fps + ' fps  ' + st.kbps + ' kbps  ' + st.rtt + ' ms  late ' + Math.round(st.late) + ' ms'); }
-    send({t: 'p', ts: now});
+    send({t: 'p', ts: now, fps: st.fps, late: Math.round(st.late), rtt: st.rtt});
   }, 1000);
   if (!window.isSecureContext || !window.VideoDecoder) { $('note').textContent = 'This browser cannot show the shared screen. Open the link in a recent Chrome, Edge, Firefox or Safari.'; $('go').hidden = true; }
 })();

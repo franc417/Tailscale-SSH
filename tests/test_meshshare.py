@@ -1281,6 +1281,9 @@ def test_guest_page_runs_in_a_fake_phone_browser_and_sends_what_a_phone_user_doe
     assert out["lcShown"]                                                 # and the own pointer is drawn
     assert out["scroll"] and all(e["t"] == "w" and e["v"] < 0 for e in out["scroll"])     # two fingers up: the wheel turns down
     assert out["kbOpen"] and out["rows"] == 5
+    assert out["kbStart"] == {"left": "163px", "top": "284px", "transform": "scale(0.75)"}      # a floating keyboard: small, at the bottom centre at first
+    assert out["kbBigger"] == "scale(0.9)" and out["kbSmaller"] == "scale(0.6)"                # A+ and A- change its size
+    assert out["kbDragged"] == {"left": "30px", "top": "126px"}                                # and the grip moves it out of the way of what is being typed into
     assert out["typeA"] == [{"t": "k", "c": "KeyA", "d": 1}, {"t": "k", "c": "KeyA", "d": 0}]
     assert out["shiftOn"] == [{"t": "k", "c": "ShiftLeft", "d": 1}] and out["upper"] and out["lowerAgain"]
     assert [(e["c"], e["d"]) for e in out["typeShiftA"]] == [("ShiftLeft", 1), ("KeyA", 1), ("KeyA", 0), ("ShiftLeft", 0)]      # Shift applies to the next key only

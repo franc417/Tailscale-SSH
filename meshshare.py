@@ -765,6 +765,7 @@ class GatewayHandler(http.server.BaseHTTPRequestHandler):
         try:
             self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)      # small pictures must not wait for each other
             self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 196608)       # the kernel must not hold seconds of pictures unseen by our own queue limit
         except OSError:
             pass
         ws = meshws.WebSocket(self.connection)

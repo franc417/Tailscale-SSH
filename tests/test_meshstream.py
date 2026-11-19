@@ -371,7 +371,7 @@ def test_subscriber_sender_thread_sends_in_order_and_stops():
     deadline = time.time() + 3
     while len(ws.sent) < 3 and time.time() < deadline:
         time.sleep(0.01)
-    assert ws.sent == ["hello", b"k", b"a"]
+    assert ws.sent == ["hello", b"a", b"k"]                              # text and sound jump ahead of a queued picture
     sub.stop()
 
 
@@ -622,9 +622,9 @@ def governor(start="fast", **kw):
     return clock, st.QualityGovernor(start, clock=clock, **{"settle": 0.0, "down_after": 2, "up_after": 4, "retry_after": 100.0, **kw})
 
 
-def look(g, clock, fps=60, target=60, behind=0.0, stalls=0, cpu=80.0, cores=8, after=3.0):
+def look(g, clock, fps=60, target=60, behind=0.0, stalls=0, cpu=80.0, cores=8, after=3.0, guest_late=0.0):
     clock.tick(after)
-    return g.observe(fps, target, behind, stalls, cpu, cores)
+    return g.observe(fps, target, behind, stalls, cpu, cores, guest_late)
 
 
 def test_governor_waits_for_a_restarted_encoder_and_steps_down_when_it_cannot_make_the_pictures():
@@ -684,14 +684,21 @@ def test_source_retune_only_applies_to_auto_quality(tmp_path):
     assert not fixed.can_retune and fixed._quality() == "high"
 
 
-def test_encoder_runs_at_a_lower_priority_than_the_desktop(monkeypatch):
+def test_encoder_runs_at_normal_priority_unless_told_otherwise(monkeypatch):
     calls = []
     monkeypatch.setattr(st.os, "nice", lambda n: calls.append(n))
+    monkeypatch.delenv("MESH_ENCODER_NICE", raising=False)
+    st._encoder_start()
+    assert calls == []                                      # the guest is the one using this computer: the picture is not starved
+    monkeypatch.setenv("MESH_ENCODER_NICE", "10")
+    st._encoder_start()
+    assert calls == [10]
+    monkeypatch.setenv("MESH_ENCODER_NICE", "nonsense")
     st._encoder_start()
     assert calls == [10]
 
 
-def test_the_video_encoder_is_started_at_low_priority(tmp_path):
+def test_the_video_encoder_is_started_through_the_encoder_start_hook(tmp_path):
     seen = {}
 
     def popen(argv, **kw):
@@ -774,6 +781,72 @@ def test_hub_starts_the_encoder_again_when_it_stops_by_itself_and_gives_up_after
     assert not hub.running and any(line.startswith("  The screen stream stopped:") for line in says)
     src.cb[2]("GNOME ended the screen capture (screen locked or monitor removed?)")     # never retried: the capture is gone
     t.join(8)
+
+
+class RecordingWs:
+    def __init__(self):
+        self.sent = []
+
+    def send_text(self, text):
+        self.sent.append(("text", json.loads(text).get("t")))
+
+    def send_binary(self, data):
+        self.sent.append(("binary", data[:1]))
+
+
+def test_sound_and_text_are_sent_before_queued_pictures():
+    ws = RecordingWs()
+    sub = st.Subscriber(ws)
+    sub.offer_video(b"\x01key", True)
+    sub.offer_video(b"\x01d1", False)
+    sub.offer_video(b"\x01d2", False)
+    sub.offer_audio(b"\x02a")
+    sub.put_text(json.dumps({"t": "pong"}))
+    sub.thread.start()
+    end = time.time() + 3
+    while time.time() < end and len(ws.sent) < 5:
+        time.sleep(0.01)
+    sub.stop()
+    kinds = [kind for kind, _ in ws.sent]
+    assert kinds[:2] == ["binary", "text"] or kinds[:2] == ["text", "binary"]            # the pong and the sound frame first (in their own order) ...
+    assert ws.sent[0] == ("binary", b"\x02") and ws.sent[1] == ("text", "pong")
+    assert [d for k, d in ws.sent[2:]] == [b"\x01"] * 3 and len(ws.sent) == 5            # ... then the pictures, still in order
+
+
+def test_governor_steps_down_when_the_guests_own_page_sees_the_pictures_late():
+    clock, g = governor("high")
+    assert look(g, clock, fps=60, guest_late=0.9) is None
+    move = look(g, clock, fps=60, guest_late=0.9)
+    assert move is not None and move[0] == "fast"                                       # the connection or the phone cannot keep up
+    clock2, g2 = governor("high")
+    assert all(look(g2, clock2, fps=60, guest_late=0.3) is None for _ in range(3)) and g2.rung == "high"      # a little lateness is normal
+
+
+def test_hub_keeps_what_the_guests_page_reports_with_each_ping():
+    src = AdaptiveSource()
+    hub = st.StreamHub(src, lambda: mi.RecordingInjector(), say=lambda _l: None, health_every=100)
+    ws = FakeWs([("text", json.dumps({"t": "v", "w": 1280, "h": 720})),              # the first message is the window size
+                 ("text", json.dumps({"t": "p", "ts": 5, "fps": 7, "late": 812, "rtt": 1319, "bogus": 1})),
+                 ("text", json.dumps({"t": "p", "ts": 6, "fps": "x", "late": True, "rtt": -3}))])
+    deadline = time.time() + 2
+    seen = []
+    orig = st.Subscriber.__init__
+
+    def spy(self, *a, **k):
+        orig(self, *a, **k)
+        seen.append(self)
+    st.Subscriber.__init__ = spy
+    try:
+        t = threading.Thread(target=lambda: hub.serve(ws, lambda: time.time() < deadline, lambda: None, "127.0.0.1"), daemon=True)
+        t.start()
+        end = time.time() + 2
+        while time.time() < end and not (seen and seen[0].reported):
+            time.sleep(0.02)
+        time.sleep(0.2)
+    finally:
+        st.Subscriber.__init__ = orig
+    assert seen and seen[0].reported == {"fps": 7.0, "late": 812.0, "rtt": 1319.0}       # numbers only; nonsense is ignored
+    t.join(4)
 
 
 class RetunableSource(AdaptiveSource):

@@ -5,7 +5,7 @@ const sent = [], fullscreenCalls = [], lockCalls = [], sockets = [];
 function makeEl(id) {
   const listeners = {}, cls = new Set();
   const el = {
-    id, hidden: false, style: {}, children: [], _text: '', className: '', type: '', clientWidth: 1000, clientHeight: 500, width: 0, height: 0,
+    id, hidden: false, style: {}, children: [], _text: '', className: '', type: '', clientWidth: 1000, clientHeight: 500, offsetWidth: 900, offsetHeight: 280, width: 0, height: 0,
     classList: { add: c => cls.add(c), remove: c => cls.delete(c), contains: c => cls.has(c),
                  toggle: (c, f) => { const on = f === undefined ? !cls.has(c) : !!f; if (on) cls.add(c); else cls.delete(c); return on; } },
     addEventListener(n, f) { (listeners[n] = listeners[n] || []).push(f); },
@@ -59,7 +59,9 @@ sent.length = 0; touch('down', 1, 300, 300, 3000); touch('down', 2, 360, 300, 30
 out.scroll = sent.slice();
 // 4 keyboard
 els.kbtog.fire('click');
-out.kbOpen = els.kb.hidden === false; out.rows = els.kb.children.length;
+out.kbOpen = els.kb.hidden === false; out.rows = els.kb.children.filter(r => r.className === 'row').length;
+const bar = els.kb.children.find(r => r.className === 'bar'), grip = bar.children[0];
+out.kbStart = {left: els.kb.style.left, top: els.kb.style.top, transform: els.kb.style.transform};
 const find = (label) => { for (const row of els.kb.children) { for (const b of row.children) { if (b.textContent === label) { return b; } } } return null; };
 sent.length = 0;
 const a = find('a'); a.fire('pointerdown', {pointerId: 5}); a.fire('pointerup', {pointerId: 5});
@@ -71,7 +73,14 @@ const A = find('A'); A.fire('pointerdown', {pointerId: 6}); A.fire('pointerup', 
 out.typeShiftA = sent.slice(); out.lowerAgain = find('a') !== null;
 sent.length = 0; find('Fn').fire('click'); out.fnHasF5 = find('F5') !== null; const f5 = find('F5'); f5.fire('pointerdown', {pointerId: 7}); f5.fire('pointerup', {pointerId: 7});
 out.f5 = sent.slice();
-find('ABC').fire('click'); find('Hide').fire('click'); out.kbClosed = els.kb.hidden === true;
+find('ABC').fire('click');
+// the floating keyboard: bigger, smaller, dragged
+find('A+').fire('click'); out.kbBigger = els.kb.style.transform;
+find('A\u2212').fire('click'); find('A\u2212').fire('click'); out.kbSmaller = els.kb.style.transform;
+{ const g = els.kb.children.find(r => r.className === 'bar').children[0];
+  g.fire('pointerdown', {pointerId: 8, clientX: 500, clientY: 300}); g.fire('pointermove', {pointerId: 8, clientX: 300, clientY: 100}); g.fire('pointerup', {pointerId: 8, clientX: 300, clientY: 100});
+  out.kbDragged = {left: els.kb.style.left, top: els.kb.style.top}; }
+find('Hide').fire('click'); out.kbClosed = els.kb.hidden === true;
 // 5 menu
 els.menu.fire('click'); out.menuOpens = els.bar.classList.contains('open');
 // 6 a mouse still works absolutely
