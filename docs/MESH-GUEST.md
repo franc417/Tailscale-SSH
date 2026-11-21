@@ -177,6 +177,8 @@ manages and how much of a processor core it uses (100% is one whole core, so 400
 3. plus the encoder (hardware first when there is one, then x264, then openh264), for three qualities: `fast` (720p at 60), `balanced`
    (900p at 30) and `smooth` (720p at 30).
 
+Keep something moving on the screen while it runs (scroll a long page, or play a video): a still screen makes every stage look cheaper than it is.
+
 Rows marked `<- slow` could not make the pictures a second they were asked for. In a test with a made-up picture, scale and convert cost
 about three times what the x264 encoder did, so the encoder is usually not the slow part. The report ends with the best quality that
 keeps up with a third of the machine to spare. With `--save` that result is remembered (`~/.cache/mesh/quality.json`) and

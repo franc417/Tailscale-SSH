@@ -262,6 +262,7 @@ def main(argv: List[str], environ=os.environ, say: Callable[[str], None] = print
         native = tuple(info.get("size") or (1920, 1080))
         head_for = lambda fps: st.capture_head(probe, node, fps)    # noqa: E731
         say(f"  screen capture started: {native[0]}x{native[1]}")
+        say("  TIP: keep something moving on the screen while this runs (scroll a long page, or play a video); a still screen makes every stage look cheaper than it is.")
     try:
         rows, pick = run_bench(probe, head_for, native, seconds, say)
     finally:
