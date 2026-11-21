@@ -302,23 +302,33 @@ def _opts(probe: GstProbe, element: str, wanted: List[Tuple[str, str]]) -> List[
     return [f"{name}={value}" for name, value in wanted if name in known]
 
 
-def video_candidates(probe: GstProbe, node: int, native: Tuple[int, int], quality: str = DEFAULT_QUALITY, fps: Optional[int] = None,
-                     view: Optional[Tuple[int, int]] = None) -> List[Tuple[str, List[str], dict]]:
-    """Pipelines to try, best first: (encoder name, gst-launch arguments, the picture settings that pipeline uses)."""
+def capture_head(probe: GstProbe, node: int, fps: int) -> List[str]:
+    """The screen source, as the stream and the bench both run it: PipeWire node -> small leaky queue -> the asked-for number of pictures a second."""
     source = ["pipewiresrc", *_opts(probe, "pipewiresrc", [("path", str(node)), ("do-timestamp", "true"), ("keepalive-time", "100")])]
     if "path=" not in " ".join(source):
         source += _opts(probe, "pipewiresrc", [("target-object", str(node))])
+    return [*source, "!", "queue", "max-size-buffers=3", "leaky=downstream", "!", "videorate", "!", f"video/x-raw,framerate={fps}/1"]
+
+
+def video_candidates(probe: GstProbe, node: int, native: Tuple[int, int], quality: str = DEFAULT_QUALITY, fps: Optional[int] = None,
+                     view: Optional[Tuple[int, int]] = None, prefer: str = "") -> List[Tuple[str, List[str], dict]]:
+    """Pipelines to try, best first: (encoder name, gst-launch arguments, the picture settings that pipeline uses).
+    prefer="gl": scale and convert on the graphics card (OpenGL) before the software encoder, when the bench found that cheaper."""
     tail = ["!", "h264parse", "config-interval=-1", "!", "video/x-h264,stream-format=byte-stream,alignment=au", "!", "fdsink", "fd=1", "sync=false"]
     out: List[Tuple[str, List[str], dict]] = []
     if not probe.has("h264parse"):
         return out
 
     def head(cfg: dict) -> List[str]:
-        return ["gst-launch-1.0", "-q", *source, "!", "queue", "max-size-buffers=3", "leaky=downstream", "!", "videorate", "!", f"video/x-raw,framerate={cfg['fps']}/1", "!"]
+        return ["gst-launch-1.0", "-q", *capture_head(probe, node, cfg["fps"]), "!"]
 
     def software_chain(cfg: dict) -> List[str]:       # scale first (fewer pixels to convert), then to the encoder's format
         return ["videoscale", *_opts(probe, "videoscale", [("n-threads", "2")]), "!", f"video/x-raw,width={cfg['width']},height={cfg['height']}", "!",
                 "videoconvert", *_opts(probe, "videoconvert", [("n-threads", "2")]), "!", "video/x-raw,format=I420", "!"]
+
+    def gl_chain(cfg: dict) -> List[str]:             # scale first, then convert, both on the graphics card; only the small picture comes back
+        return ["glupload", "!", "glcolorscale", "!", f"video/x-raw(memory:GLMemory),width={cfg['width']},height={cfg['height']}", "!",
+                "glcolorconvert", "!", "video/x-raw(memory:GLMemory),format=I420", "!", "gldownload", "!", "video/x-raw,format=I420", "!"]
 
     if probe.has("vah264enc") and probe.has("vapostproc"):
         cfg = settings_for(quality, True, native, fps, view)
@@ -329,10 +339,16 @@ def video_candidates(probe: GstProbe, node: int, native: Tuple[int, int], qualit
         cfg = settings_for(quality, True, native, fps, view)
         enc = ["vaapih264enc", *_opts(probe, "vaapih264enc", [("bitrate", str(cfg["kbps"])), ("keyframe-period", str(cfg["fps"])), ("max-bframes", "0"), ("rate-control", "cbr")])]
         out.append(("vaapih264enc (VA-API hardware)", head(cfg) + ["vaapipostproc", "!", f"video/x-raw,format=NV12,width={cfg['width']},height={cfg['height']}", "!"] + enc + tail, cfg))
+    if probe.has("nvh264enc") and probe.has("videoconvert") and probe.has("videoscale"):
+        cfg = settings_for(quality, True, native, fps, view)
+        enc = ["nvh264enc", *_opts(probe, "nvh264enc", [("bitrate", str(cfg["kbps"])), ("gop-size", str(cfg["fps"])), ("zerolatency", "true"), ("rc-mode", "cbr"), ("bframes", "0")])]
+        out.append(("nvh264enc (NVIDIA hardware)", head(cfg) + software_chain(cfg) + enc + tail, cfg))
     if probe.has("x264enc") and probe.has("videoconvert") and probe.has("videoscale"):
         cfg = settings_for(quality, False, native, fps, view)
         enc = ["x264enc", *_opts(probe, "x264enc", [("bitrate", str(cfg["kbps"])), ("key-int-max", str(cfg["fps"])), ("bframes", "0"), ("tune", "zerolatency"),
                                                       ("speed-preset", "ultrafast"), ("aud", "true"), ("byte-stream", "true"), ("vbv-buf-capacity", "300")])]
+        if prefer == "gl" and all(probe.has(e) for e in ("glupload", "glcolorscale", "glcolorconvert", "gldownload")):
+            out.append(("x264enc (software, GPU scale/convert)", head(cfg) + gl_chain(cfg) + enc + tail, cfg))
         out.append(("x264enc (software)", head(cfg) + software_chain(cfg) + enc + tail, cfg))
     if probe.has("openh264enc") and probe.has("videoconvert") and probe.has("videoscale"):
         cfg = settings_for(quality, False, native, fps, view)
@@ -600,11 +616,12 @@ class GstSource:
 
     def __init__(self, directory: str, connector: str = "", quality: str = DEFAULT_QUALITY, sound: bool = True, environ=os.environ,
                  runner=subprocess.run, popen=subprocess.Popen, which=shutil.which, capture: Optional[ScreenCapture] = None,
-                 probe: Optional[GstProbe] = None, fps: Optional[int] = None) -> None:
+                 probe: Optional[GstProbe] = None, fps: Optional[int] = None, rung: Optional[str] = None, prefer: str = "") -> None:
         if quality != "auto" and quality not in PRESETS:
             raise StreamError(f"quality is one of auto, {', '.join(PRESETS)}")
         self.directory, self.connector, self.quality, self.sound, self.fps = directory, connector, quality, sound, fps
-        self.rung: Optional[str] = None            # with quality auto: the rung of LADDER in use (None: the starting one)
+        self.rung: Optional[str] = rung            # with quality auto: the rung of LADDER in use (None: the starting one)
+        self.prefer = prefer                       # "gl": scale and convert on the graphics card (the bench found that cheaper)
         self.can_retune = quality == "auto"
         self.environ, self.runner, self.popen, self.which = environ, runner, popen, which
         self.capture = capture or ScreenCapture(directory, environ, popen, which)
@@ -647,7 +664,7 @@ class GstSource:
             raise
 
     def _hardware(self) -> bool:
-        return bool(self.encoder) and "VA-API" in self.encoder or (not self.encoder and self.probe.has("vah264enc"))
+        return bool(self.encoder) and "hardware" in self.encoder or (not self.encoder and (self.probe.has("vah264enc") or self.probe.has("nvh264enc")))
 
     def _quality(self) -> str:
         return self.rung if self.quality == "auto" and self.rung else self.quality
@@ -658,7 +675,7 @@ class GstSource:
             self.rung = rung
 
     def _launch_video(self) -> None:
-        candidates = video_candidates(self.probe, int(self.cap["node"]), self.native, self._quality(), self.fps, self.view)
+        candidates = video_candidates(self.probe, int(self.cap["node"]), self.native, self._quality(), self.fps, self.view, self.prefer)
         if not candidates:
             raise StreamError("no H.264 encoder is available to GStreamer. Run  meshd share doctor  to see what to install.")
         found = self._first_working([(name, argv) for name, argv, _ in candidates], "video")
@@ -1212,7 +1229,7 @@ class StreamHub:
             threading.Thread(target=self._health, args=(self._generation,), daemon=True, name="mesh-health").start()
             self.governor = None
             if self.quality == "auto" and getattr(self.source, "can_retune", False) and info.get("quality") in LADDER:
-                hardware = "VA-API" in (getattr(self.source, "encoder", "") or "")
+                hardware = "hardware" in (getattr(self.source, "encoder", "") or "")
                 self.governor = QualityGovernor(info["quality"], clock=self.clock, **{"top": "ultra" if hardware else "high", **self.adapt_kwargs})
                 threading.Thread(target=self._adapt, args=(self._generation,), daemon=True, name="mesh-adapt").start()
 

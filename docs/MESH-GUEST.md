@@ -159,3 +159,30 @@ Your own pointer is drawn on the phone at once (a blue arrow), so it follows you
 The page tells the owner's computer how late the pictures arrive; if they are more than about half a second late, the quality steps down by itself. Sound and replies are sent ahead of waiting pictures, so sound is not delayed by a backlog of video.
 
 If the picture stops, the owner's terminal says why (it now includes the encoder's exit status) and the encoder is started again by itself, twice a minute at most.
+
+## When it is slow: `meshd share bench`
+
+```
+meshd share bench            # about a minute, with a desktop session: it uses the real screen capture
+meshd share bench --save     # and remember the best starting quality for `meshd share screen`
+meshd share bench --synthetic   # a made-up moving picture instead of the screen
+```
+
+It runs the same capture and encoder pipelines the share runs, one stage at a time, and prints how many pictures a second each stage
+manages and how much of a processor core it uses (100% is one whole core, so 400% is four cores):
+
+1. capture only: the screen coming out of GNOME through PipeWire, at its full size;
+2. plus scale and convert (what turns the full-size picture into the smaller I420 picture the encoder wants), on the processor and, when
+   GStreamer's OpenGL elements are installed, on the graphics card;
+3. plus the encoder (hardware first when there is one, then x264, then openh264), for three qualities: `fast` (720p at 60), `balanced`
+   (900p at 30) and `smooth` (720p at 30).
+
+Rows marked `<- slow` could not make the pictures a second they were asked for. In a test with a made-up picture, scale and convert cost
+about three times what the x264 encoder did, so the encoder is usually not the slow part. The report ends with the best quality that
+keeps up with a third of the machine to spare. With `--save` that result is remembered (`~/.cache/mesh/quality.json`) and
+`meshd share screen` with `--quality auto` starts there instead of at a guess, and uses the graphics card for scaling if that was cheaper.
+It is only applied when the same kind of encoder (hardware or software) is found again, and never with a named quality or `--fps`.
+
+The top of the report also says what graphics card was found and, when there is no hardware H.264 encoder for GStreamer, what to install
+(Arch: `sudo pacman -Syu`, never `-Sy` alone, then `gst-plugin-va` and `libva-utils`, plus `intel-media-driver` for Intel or `mesa` for AMD;
+NVIDIA's `nvh264enc` is used automatically when GStreamer has it).

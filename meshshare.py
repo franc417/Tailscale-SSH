@@ -1628,7 +1628,12 @@ def _run(args, kind: str, environ, tunnel, say, interactive, source=None, inject
             import mesh_input as mi
             import meshstream
             try:
-                source = source or meshstream.GstSource(directory, args.monitor or "", args.quality, args.sound, environ=environ, fps=getattr(args, "fps", None))
+                if source is None:
+                    source = meshstream.GstSource(directory, args.monitor or "", args.quality, args.sound, environ=environ, fps=getattr(args, "fps", None))
+                    import meshbench
+                    applied = meshbench.apply_saved(source, args.quality, getattr(args, "fps", None), meshbench.save_path(environ))
+                    if applied:
+                        say(f"  Starting at quality {applied['rung']} (what `meshd share bench --save` found works on this computer).")
             except meshstream.StreamError as exc:
                 say(f"error: {exc}")
                 return 2
@@ -1766,6 +1771,10 @@ def build_parser(default_dir: str) -> argparse.ArgumentParser:
     p.add_argument("--no-wait", dest="wait", action="store_false", help="print the link at once instead of waiting until the public address answers")
     p.add_argument("--no-qr", dest="qr", action="store_false", help="do not draw the QR code")
     sub.add_parser("doctor", help="check what the screen share needs (GStreamer, encoder, sound, keyboard access) and what to install")
+    p = sub.add_parser("bench", help="measure where the time goes when this computer streams its screen (capture, scale and convert, encode) and what to change")
+    p.add_argument("--save", action="store_true", help="remember the best starting quality for meshd share screen")
+    p.add_argument("--synthetic", action="store_true", help="use a made-up moving picture instead of the real screen")
+    p.add_argument("--seconds", type=float, default=5.0, help="how long to time each stage (default 5)")
     sub.add_parser("pause", help="freeze the guest's picture and ignore their keys until resumed")
     sub.add_parser("resume", help="undo pause")
     p = sub.add_parser("viewonly", help="turn the guest's keyboard and mouse off or on")
@@ -1788,6 +1797,9 @@ def main(argv: Optional[List[str]] = None, environ=os.environ, say: Callable[[st
         return run_web(args, environ=environ, say=say)
     if args.action == "screen":
         return run_screen(args, environ=environ, say=say)
+    if args.action == "bench":
+        import meshbench
+        return meshbench.main((["--save"] if args.save else []) + (["--synthetic"] if args.synthetic else []) + ["--seconds", str(args.seconds)], environ, say)
     if args.action == "doctor":
         import meshstream
         ok, lines = meshstream.doctor(environ=environ)
